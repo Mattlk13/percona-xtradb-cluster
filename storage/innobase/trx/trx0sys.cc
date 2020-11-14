@@ -2,13 +2,21 @@
 
 Copyright (c) 1996, 2017, Oracle and/or its affiliates. All Rights Reserved.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -373,7 +381,17 @@ trx_sys_update_wsrep_checkpoint(
                 }
                 else
                 {
-                    ut_ad(xid_seqno > trx_sys_cur_xid_seqno);
+                    /* We have the case when REPLACE INTO ... SELECT or
+                    INSERT INTO ... SELECT is executed as TOI. This is done by 
+                    pt-table-checksum tool. In such case statement execution
+                    causes InnoDB commit and storing of xid_seqno 
+                    (wsrep_apply_cb) and then because of TOI, storing of 
+                    xid_seqno is requested again from wsrep_commit_cb with the 
+                    same xid_seqno. 
+                    Allow current and new values be the same, without 
+                    introducing new flags and logic to prevent double storing
+                    of the same value */ 
+                    ut_ad(xid_seqno >= trx_sys_cur_xid_seqno);
                     trx_sys_cur_xid_seqno = xid_seqno;
                 }
             }
@@ -429,33 +447,30 @@ trx_sys_read_wsrep_checkpoint(XID* xid)
 
 	sys_header = trx_sysf_get(&mtr);
 
-	if ((magic = mach_read_from_4(sys_header + TRX_SYS_WSREP_XID_INFO
-		+ TRX_SYS_WSREP_XID_MAGIC_N_FLD))
-		!= TRX_SYS_WSREP_XID_MAGIC_N) {
+        if ((magic = mach_read_from_4(sys_header + TRX_SYS_WSREP_XID_INFO
+                                      + TRX_SYS_WSREP_XID_MAGIC_N_FLD))
+            != TRX_SYS_WSREP_XID_MAGIC_N) {
+				xid->reset();
+                trx_sys_update_wsrep_checkpoint(xid, sys_header, &mtr);
+                mtr_commit(&mtr);
+                return;
+        }
 
-		memset(static_cast<void*>(xid), 0, sizeof(*xid));
-		xid->set_format_id(-1);
-		trx_sys_update_wsrep_checkpoint(xid, sys_header, &mtr);
-		mtr_commit(&mtr);
-		return;
-
-	}
-
-	/* Make sure we first load it to int32_t so the sign bit is preserved.*/
-	int32_t format_id = mach_read_from_4(sys_header + TRX_SYS_WSREP_XID_INFO
-					     + TRX_SYS_WSREP_XID_FORMAT);
-	xid->set_format_id(format_id);
-
-	xid->set_gtrid_length(mach_read_from_4(sys_header
-				+ TRX_SYS_WSREP_XID_INFO
-				+ TRX_SYS_WSREP_XID_GTRID_LEN));
-
-	xid->set_bqual_length(mach_read_from_4(sys_header
-				+ TRX_SYS_WSREP_XID_INFO
-				+ TRX_SYS_WSREP_XID_BQUAL_LEN));
-
-	xid->set_data(sys_header + TRX_SYS_WSREP_XID_INFO
-			+ TRX_SYS_WSREP_XID_DATA, XIDDATASIZE);
+        xid->set_format_id((long)mach_read_from_4(
+                sys_header
+                + TRX_SYS_WSREP_XID_INFO + TRX_SYS_WSREP_XID_FORMAT));
+        xid->set_gtrid_length((long)mach_read_from_4(
+                sys_header
+                + TRX_SYS_WSREP_XID_INFO + TRX_SYS_WSREP_XID_GTRID_LEN));
+        xid->set_bqual_length((long)mach_read_from_4(
+                sys_header
+                + TRX_SYS_WSREP_XID_INFO + TRX_SYS_WSREP_XID_BQUAL_LEN));
+        //ut_memcpy(xid->data,
+        //          sys_header + TRX_SYS_WSREP_XID_INFO + TRX_SYS_WSREP_XID_DATA,
+        //          XIDDATASIZE);
+        xid->set_data(
+                      sys_header + TRX_SYS_WSREP_XID_INFO + TRX_SYS_WSREP_XID_DATA, 
+                      XIDDATASIZE);
 
 	mtr_commit(&mtr);
 }

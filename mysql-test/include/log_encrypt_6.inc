@@ -1,3 +1,7 @@
+# innodb_redo_log_encrypt is read only for PXC, 
+# so no way to proceed with this test
+--skip innodb_redo_log_encrypt is read-only for PXC
+
 # Test tries restart after redo log encryption is enabled
 # - Error   :restart without keyring plugin
 # - Pass    :restart without keyring plugin and --innodb_force_recovery=6
@@ -93,8 +97,6 @@ let NEW_CMD = $MYSQLD --no-defaults --innodb_undo_tablespaces=2 --innodb_page_si
 --echo # Search for error message
 let SEARCH_FILE= $MYSQL_TMP_DIR/wl9290.err;
 let SEARCH_PATTERN= InnoDB: Redo log was encrypted, but keyring plugin is not loaded;
---source include/search_pattern.inc
-let SEARCH_PATTERN= Aborting;
 --source include/search_pattern.inc
 
 --echo # Restart without keyring plugin possible if redo files removed

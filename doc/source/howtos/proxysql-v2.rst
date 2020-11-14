@@ -45,7 +45,7 @@ Changed Features
 Removed Features
 --------------------------------------------------------------------------------
 
-- Asynchronous slave reader support has been removed: the ``--include-slaves`` option is not supported.
+- Asynchronous replica reader support has been removed: the ``--include-slaves`` option is not supported.
 - A list of nodes in the priority order is not supported in |proxysql| v2. Only a single node is supported at this time.
 - Since the galera_proxysql_checker and galera_node_monitor scripts are no longer run in the scheduler, automatic cluster membership updates are not supported.
 - Checking the pxc_maint_mode variable is no longer supported
@@ -223,6 +223,11 @@ To view the usage information, run ``proxysql-admin`` without any options:
    --force                            This option will skip existing configuration checks in mysql_servers, 
                                       mysql_users and mysql_galera_hostgroups tables. This option will only 
 				      work with ``proxysql-admin --enable``.
+   --disable-updates                  Disable admin updates for ProxySQL cluster for the
+                                      current operation. The default is to not change the
+                                      admin variable settings.  If this option is specifed,
+                                      these options will be set to false.
+                                      (default: updates are not disabled)
    --version, -v                      Prints the version info
  
 Preparing Configuration File
@@ -473,15 +478,17 @@ It also deletes ProxySQL users not in Percona XtraDB Cluster from the ProxySQL d
 
 .. admonition:: Output
 
-   +---------------+
-   | username      |
-   +---------------+
-   | monitor       |
-   | one           |
-   | proxysql_user |
-   | two           |
-   +---------------+
-   4 rows in set (0.00 sec)
+   .. code-block:: text
+
+      +---------------+
+      | username      |
+      +---------------+
+      | monitor       |
+      | one           |
+      | proxysql_user |
+      | two           |
+      +---------------+
+      4 rows in set (0.00 sec)
 
 .. rubric:: From PXC
 
@@ -491,15 +498,17 @@ It also deletes ProxySQL users not in Percona XtraDB Cluster from the ProxySQL d
 
 .. admonition:: Output
 
-   +---------------+-------+
-   | user          | host  |
-   +---------------+-------+
-   | monitor       | 192.% |
-   | proxysql_user | 192.% |
-   | two           | %     |
-   | one           | %     |
-   +---------------+-------+
-   4 rows in set (0.00 sec)
+   .. code-block:: text
+
+      +---------------+-------+
+      | user          | host  |
+      +---------------+-------+
+      | monitor       | 192.% |
+      | proxysql_user | 192.% |
+      | two           | %     |
+      | one           | %     |
+      +---------------+-------+
+      4 rows in set (0.00 sec)
 
 .. _pxc.proxysql.v2.admin-tool.sync-multi-cluster-users:
 
@@ -853,14 +862,38 @@ is `singlewrite`.  This option can be used with `--enable` and `--update-cluster
 A single IP address and port combination is expected.  For instance,
 "--write-node=127.0.0.1:3306"
 
-ProxySQL Status
+The |proxysql-status| script
 ================================================================================
 
-Simple script to dump ProxySQL config and stats
+|proxysql-status| is a simple script to dump |proxysql| configuration
+and statistics. 
 
 .. code-block:: bash
 
    $ proxysql-status admin admin 127.0.0.1 6032
 
+The default behaviour is to display all tables and files. By using the following
+options, you can retrieve more specific information:
+
+======================  =========================================================================
+Option                  Use to display
+======================  =========================================================================
+--files                 The contents of proxysql-admin related files
+--main                  Main tables (both on-disk and runtime)
+--monitor               Monitor tables
+--runtime               Runtime-related data (implies --main)
+--stats                 Stats tables
+--table=<table_name>    Only tables that contain the table name (this is a case-sensitive match)
+--with-stats-reset      ``_reset`` tables, by default _reset tables will not be queried.
+
+======================  =========================================================================
+
+.. note::
+
+   If no credentials are specified the credentials in
+   ``/etc/proxysql-admin.cnf`` are used.
+
+
 .. |proxysql| replace:: ProxySQL
 .. |proxysql-admin| replace:: ``proxysql-admin``
+.. |proxysql-status| replace:: ``proxysql-status``

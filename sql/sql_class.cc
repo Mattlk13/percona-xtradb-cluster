@@ -1,15 +1,22 @@
 /*
-   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
    Copyright (c) 2016, Percona Inc. All Rights Reserved.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -51,6 +58,7 @@
 #ifdef HAVE_REPLICATION
 #include "rpl_rli_pdb.h"                     // Slave_worker
 #include "rpl_slave_commit_order_manager.h"
+#include "rpl_master.h"                      // unregister_slave
 #endif
 
 #ifdef WITH_WSREP
@@ -74,6 +82,7 @@ using std::min;
 using std::max;
 
 ulong kill_idle_transaction_timeout= 0;
+PSI_mutex_key key_LOCK_bloom_filter;
 
 /*
   The following is used to initialise Table_ident with a internal
@@ -840,6 +849,19 @@ extern "C" void wsrep_thd_set_exec_mode(THD *thd, enum wsrep_exec_mode mode)
 extern "C" void wsrep_thd_set_query_state(
 	THD *thd, enum wsrep_query_state state)
 {
+  if (!WSREP(thd)) return;
+  /* async slave thread should never flag IDLE state, as it may
+     give rollbacker thread chance to interfere and rollback async slave
+     transaction.
+     in fact, async slave thread is never idle as it reads complete
+     transactions from relay log and applies them, as a whole.
+     BF abort happens voluntarily by async slave thread.
+  */
+  if (thd->slave_thread && state == QUERY_IDLE) {
+    WSREP_DEBUG("Skipping IDLE state change for slave SQL");
+    return;
+  }
+
   thd->wsrep_query_state= state;
 }
 extern "C" void wsrep_thd_set_conflict_state(
@@ -1943,7 +1965,7 @@ void THD::init(void)
 #ifdef WITH_WSREP
   wsrep_exec_mode= wsrep_applier ? REPL_RECV :  LOCAL_STATE;
   wsrep_conflict_state= NO_CONFLICT;
-  wsrep_query_state= QUERY_IDLE;
+  wsrep_thd_set_query_state(this, QUERY_IDLE);
   wsrep_last_query_id= 0;
   wsrep_trx_meta.gtid= WSREP_GTID_UNDEFINED;
   wsrep_trx_meta.depends_on= WSREP_SEQNO_UNDEFINED;
@@ -1967,6 +1989,7 @@ void THD::init(void)
   wsrep_skip_SE_checkpoint = false;
   wsrep_skip_wsrep_hton   = false;
 #endif /* WITH_WSREP */
+  status_var_aggregated= false;
   binlog_row_event_extra_data= 0;
 
   if (variables.sql_log_bin)
@@ -2431,6 +2454,12 @@ THD::~THD()
   }
   if (rli_slave)
     rli_slave->cleanup_after_session();
+  /*
+    As slaves can be added in one mysql command like COM_REGISTER_SLAVE
+    but then need to be removed on error scenarios, we call this method
+    here.
+  */
+  unregister_slave(this, true, true);
 #endif
 
   free_root(&main_mem_root, MYF(0));
@@ -3160,26 +3189,6 @@ const char *get_client_host(THD *client)
     client->security_context()->host().length ?
     client->security_context()->host().str : "";
 }
-
-char *THD::get_client_host_port(THD *client)
-{
-  Security_context *client_sctx= client->security_context();
-  char *client_host= NULL;
-
-  if (client->peer_port && (client_sctx->host().length
-                            || client_sctx->ip().length) &&
-      security_context()->host_or_ip().length)
-  {
-    if ((client_host= (char *) this->alloc(LIST_PROCESS_HOST_LEN+1)))
-      my_snprintf((char *) client_host, LIST_PROCESS_HOST_LEN,
-                  "%s:%u", client_sctx->host_or_ip().str, client->peer_port);
-  }
-  else
-    client_host= this->mem_strdup(get_client_host(client));
-
-  return client_host;
-}
-
 
 /*
   Register an item tree tree transformation, performed by the query
@@ -5092,10 +5101,38 @@ void THD::set_query(const LEX_CSTRING& query_arg)
   mysql_mutex_lock(&LOCK_thd_query);
   m_query_string= query_arg;
   mysql_mutex_unlock(&LOCK_thd_query);
+}
 
-#ifdef HAVE_PSI_THREAD_INTERFACE
-  PSI_THREAD_CALL(set_thread_info)(query_arg.str, query_arg.length);
-#endif
+
+/**
+  Set the rewritten query (with passwords obfuscated etc.) on the THD.
+  Wraps this in the LOCK_thd_query mutex to protect against race conditions
+  with SHOW PROCESSLIST inspecting that string.
+
+  This uses swap() and therefore "steals" the argument from the caller;
+  the caller MUST take care not to try to use its own string after calling
+  this function! This is an optimization for mysql_rewrite_query() so we
+  don't copy its temporary string (which may get very long, up to
+  @@max_allowed_packet).
+
+  Using this outside of mysql_rewrite_query() is almost certainly wrong;
+  please check with the runtime team!
+
+  @param query_arg  The rewritten query to use for slow/bin/general logging.
+                    The value will be released in the caller and MUST NOT
+                    be used there after calling this function.
+*/
+void THD::swap_rewritten_query(String& query_arg)
+{
+  DBUG_ASSERT(this == current_thd);
+
+  mysql_mutex_lock(&LOCK_thd_query);
+  m_rewritten_query.mem_free();
+  m_rewritten_query.swap(query_arg);
+  // The rewritten query should always be a valid C string, just in case.
+  DBUG_EVALUATE_IF("simulate_out_of_memory",
+                    (void) NULL, (void) m_rewritten_query.c_ptr_safe());
+  mysql_mutex_unlock(&LOCK_thd_query);
 }
 
 

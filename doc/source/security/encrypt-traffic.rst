@@ -249,7 +249,7 @@ in a running cluster:
 
    .. code-block:: guess
 
-      mysql> CREATE USER 'sst_user'$'%' IDENTIFIED BY PASSWORD 'sst_password';
+      mysql> CREATE USER 'sstuser'$'%' IDENTIFIED BY PASSWORD 'sst_password';
 
    .. note:: This user must have the same name and password on all nodes
       where you want to use ``mysqldump`` for SST.
@@ -258,19 +258,19 @@ in a running cluster:
 
    .. code-block:: guess
 
-      mysql> GRANT USAGE ON *.* TO 'sst_user' REQUIRE SSL;
+      mysql> GRANT USAGE ON *.* TO 'sstuser' REQUIRE SSL;
 
 #. To make sure that the SST user replicated across the cluster,
    run the following query on another node:
 
    .. code-block:: guess
 
-      mysql> SELECT User, Host, ssl_type FROM mysql.user WHERE User='sst_user';
+      mysql> SELECT User, Host, ssl_type FROM mysql.user WHERE User='sstuser';
 
       +----------+------+----------+
       | User     | Host | ssl_type |
       +----------+------+----------+
-      | sst_user | %    | Any      |
+      | sstuser | %    | Any      |
       +----------+------+----------+
 
    .. note:: If the :variable:`wsrep_OSU_method` is set to ROI,
@@ -296,7 +296,7 @@ in a running cluster:
    in the :variable:`wsrep_sst_auth` variable on each node::
 
     [mysqld]
-    wsrep_sst_auth = sst_user:sst_password
+    wsrep_sst_auth = sstuser:sst_password
 
 #. Restart the cluster with the new configuration.
 
@@ -434,6 +434,43 @@ If the verification is successful, you should see the following output::
 
  server-cert.pem: OK
  client-cert.pem: OK
+
+.. rubric:: Failed validation caused by matching CN
+
+Sometimes, an SSL configuration may fail if the certificate and the CA files contain the same :abbr:`CN (SSL Certificate Common Name)`.
+
+To check if this is the case run ``openssl`` command as follows and verify that the **CN** field differs for the *Subject* and *Issuer* lines.
+
+.. code-block:: bash
+
+   $ openssl x509 -in server-cert.pem -text -noout
+
+.. admonition:: Incorrect values
+
+   .. code-block:: text
+
+      Certificate:
+      Data:
+      Version: 1 (0x0)
+      Serial Number: 1 (0x1)
+      Signature Algorithm: sha256WithRSAEncryption
+      Issuer: CN=www.percona.com, O=Database Performance., C=US
+      ...
+      Subject: CN=www.percona.com, O=Database Performance., C=AU
+      ...
+
+To obtain a more compact output run ``openssl`` specifying `-subject` and `-issuer` parameters:
+
+.. code-block:: bash
+
+   $ openssl x509 -in server-cert.pem -subject -issuer -noout
+
+.. admonition:: Output
+
+   .. code-block:: text
+
+      subject= /CN=www.percona.com/O=Database Performance./C=AU
+      issuer= /CN=www.percona.com/O=Database Performance./C=US
 
 Deploying Keys and Certificates
 -------------------------------

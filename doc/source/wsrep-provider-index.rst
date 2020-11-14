@@ -233,7 +233,7 @@ up (total rounds will be :variable:`evs.max_install_timeouts` + 2).
    :conf: Yes
    :scope: Global
    :dyn: No
-   :default: 4
+   :default: 10
 
 This variable defines the maximum number of data packets in replication at a
 time. For WAN setups, the variable can be set to a considerably higher value
@@ -278,7 +278,7 @@ When this variable is enabled, smaller packets will be aggregated into one.
    :conf: Yes
    :scope: Global
    :dyn: Yes
-   :default: 2
+   :default: 4
 
 This variable defines the maximum number of data packets in replication at a
 time. For WAN setups, the variable can be set to a considerably higher value
@@ -318,6 +318,43 @@ history.
 This variable can be used to define the location of the :file:`galera.cache`
 file.
 
+.. variable:: gcache.freeze_purge_at_seqno
+
+   :cli: Yes
+   :conf: Yes
+   :scope: Local, Global
+   :dyn: Yes
+   :default: 0
+
+This variable controls the purging of the gcache and enables retaining
+more data in it. This variable makes it possible to use :term:`IST
+(Incremental State Transfer) <IST>` when the node rejoins instead of
+:term:`SST (State Snapshot Transfer) <SST>`.
+
+Set this variable on an existing node of the cluster (that will
+continue to be part of the cluster and can act as a potential
+:term:`donor node`). This node continues to retain the write-sets and
+allows restarting the node to rejoin by using :term:`IST`.
+
+.. seealso::
+
+   Percona Database Performance Blog:
+      - `All You Need to Know About GCache (Galera-Cache) <https://www.percona.com/blog/2016/11/16/all-you-need-to-know-about-gcache-galera-cache/>`_
+      - `Want IST Not SST for Node Rejoins? We Have a Solution! <https://www.percona.com/blog/2018/02/13/no-sst-node-rejoins/>`_
+   
+The :variable:`gcache.freeze_purge_at_seqno` variable takes three values:
+
+-1 (default)
+   No freezing of gcache, the purge operates as normal.
+A valid seqno in gcache
+   The freeze purge of write-sets may not be smaller than the selected seqno.
+   The best way to select an optimal value is to use the value of the
+   variable :variable:`wsrep_last_applied` from the node that you plan to shut down.
+*now*
+   The freeze purge of write-sets is no less than the smallest seqno currently
+   in gcache. Using this value results in freezing the gcache-purge instantly.
+   Use this value if selecting a valid seqno in gcache is difficult.
+   
 .. variable:: gcache.keep_pages_count
 
    :cli: Yes
@@ -390,8 +427,16 @@ This variable can be used to specify the name of the Galera cache file.
    :dyn: No
    :default: 128M
 
-This variable can be used to specify the size of the page files in the page
-storage.
+Size of the page files in page storage. The limit on overall page storage is the
+size of the disk. Pages are prefixed by gcache.page.
+
+.. seealso::
+
+   |galera| Documentation: gcache.page_size
+      https://galeracluster.com/library/documentation/galera-parameters.html#gcache-page-size
+   |percona| Database Performance Blog: All You Need to Know About GCache (Galera-Cache)
+      https://www.percona.com/blog/2016/11/16/all-you-need-to-know-about-gcache-galera-cache/
+
 
 .. variable:: gcache.size
 
@@ -426,7 +471,7 @@ flow control will be posted.
    :default: 1
 
 This variable is used for replication flow control. Replication is resumed when
-the slave queue drops below :variable:`gcs.fc_factor` *
+the replica queue drops below :variable:`gcs.fc_factor` *
 :variable:`gcs.fc_limit`.
 
 .. variable:: gcs.fc_limit
@@ -439,7 +484,7 @@ the slave queue drops below :variable:`gcs.fc_factor` *
    :default: 100
 
 This variable is used for replication flow control. Replication is paused when
-the slave queue exceeds this limit. In the default operation mode, flow control
+the replica queue exceeds this limit. In the default operation mode, flow control
 limit is dynamically recalculated based on the amount of nodes in the
 cluster, but this recalculation can be turned off with use of the
 :variable:`gcs.fc_master_slave` variable to make manual setting of the :variable:`gcs.fc_limit` having an effect  (e.g. for configurations
@@ -453,7 +498,7 @@ when writing is done to a single node in |PXC|).
    :dyn: No
    :default: NO
 
-This variable is used to specify if there is only one master node in the
+This variable is used to specify if there is only one source node in the
 cluster. It affects whether flow control limit is recalculated dynamically
 (when ``NO``) or not (when ``YES``).
 
@@ -631,8 +676,8 @@ not.
    :default: false
 
 When this variable is set to ``TRUE``, the node will completely ignore quorum
-calculations. This should be used with extreme caution even in master-slave
-setups, because slaves won't automatically reconnect to master in this case.
+calculations. This should be used with extreme caution even in source-replica
+setups, because replicas won't automatically reconnect to source in this case.
 
 .. variable::  pc.ignore_sb
 
@@ -644,7 +689,7 @@ setups, because slaves won't automatically reconnect to master in this case.
 
 When this variable is set to ``TRUE``, the node will process updates even in
 the case of a split brain. This should be used with extreme caution in
-multi-master setup, but should simplify things in master-slave cluster
+multi-source setup, but should simplify things in source-replica cluster
 (especially if only 2 nodes are used).
 
 .. variable::  pc.linger
@@ -892,3 +937,5 @@ This variable is used to specify if the SSL compression is to be used.
    :default: AES128-SHA
 
 This variable is used to specify what cypher will be used for encryption.
+
+.. include:: .res/replace.txt

@@ -1,13 +1,20 @@
-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -703,13 +710,21 @@ find_files(THD *thd, List<LEX_STRING> *files, const char *db,
     }
 
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
+    char tname[NAME_LEN + 1];
     /* Don't show tables where we don't have any privileges */
     if (db && !(col_access & TABLE_ACLS))
     {
       table_list.db= (char*) db;
       table_list.db_length= strlen(db);
-      table_list.table_name= uname;
       table_list.table_name_length= file_name_len;
+      if (lower_case_table_names == 2)
+      {
+        strcpy(tname, uname);
+        my_casedn_str(files_charset_info, tname);
+        table_list.table_name= tname;
+      }
+      else
+        table_list.table_name= uname;
       table_list.grant.privilege=col_access;
       if (check_grant(thd, TABLE_ACLS, &table_list, TRUE, 1, TRUE))
         continue;
@@ -2342,9 +2357,24 @@ public:
     /* INFO */
     mysql_mutex_lock(&inspect_thd->LOCK_thd_query);
     {
-      const char *query_str= inspect_thd->query().str;
-      size_t query_length= inspect_thd->query().length;
+      const char *query_str= NULL;
+      size_t query_length= 0;
+
+      /* If a rewritten query exists, use that. */
+      if (inspect_thd->rewritten_query().length() > 0) {
+        query_length = inspect_thd->rewritten_query().length();
+        query_str = inspect_thd->rewritten_query().ptr();
+      }
+      /*
+        Otherwise, use the original query.
+      */
+      else {
+        query_length = inspect_thd->query().length;
+        query_str = inspect_thd->query().str;
+      }
+
 #ifndef EMBEDDED_LIBRARY
+      /* In the stand-alone server, add "PLUGIN" as needed. */
       String buf;
       if (inspect_thd->is_a_srv_session())
       {
@@ -2358,6 +2388,7 @@ public:
       }
       /* No else. We need fall-through */
 #endif
+      /* If we managed to create query info, set a copy on thd_info. */
       if (query_str)
       {
         const size_t width= min<size_t>(m_max_query_length, query_length);
@@ -2572,9 +2603,24 @@ public:
     /* INFO */
     mysql_mutex_lock(&inspect_thd->LOCK_thd_query);
     {
-      const char *query_str= inspect_thd->query().str;
-      size_t query_length= inspect_thd->query().length;
+      const char *query_str= NULL;
+      size_t query_length= 0;
+
+      /* If a rewritten query exists, use that. */
+      if (inspect_thd->rewritten_query().length() > 0) {
+        query_length = inspect_thd->rewritten_query().length();
+        query_str = inspect_thd->rewritten_query().ptr();
+      }
+      /*
+        Otherwise, use the original query.
+      */
+      else {
+        query_length = inspect_thd->query().length;
+        query_str = inspect_thd->query().str;
+      }
+
 #ifndef EMBEDDED_LIBRARY
+      /* In the stand-alone server, add "PLUGIN" as needed. */
       String buf;
       if (inspect_thd->is_a_srv_session())
       {
@@ -2588,6 +2634,7 @@ public:
       }
       /* No else. We need fall-through */
 #endif
+      /* If we managed to create query info, set a copy on thd_info. */
       if (query_str)
       {
         const size_t width= min<size_t>(PROCESS_LIST_INFO_WIDTH, query_length);
@@ -3001,7 +3048,7 @@ const char* get_one_variable_ext(THD *running_thd, THD *target_thd,
       break;
 
     case SHOW_SIGNED_INT:
-      end= int10_to_str((long) *(uint32*) value, buff, -10);
+      end= int10_to_str((long) *(int32*) value, buff, -10);
       value_charset= system_charset_info;
       break;
 
@@ -3136,6 +3183,19 @@ static bool show_status_array(THD *thd, const char *wild,
         const char *pos;
         size_t length;
 
+        DBUG_EXECUTE_IF("catch_show_gtid_mode", {
+          String gtid_mode;
+          static const char *gm= "gtid\\_mode";
+          unsigned int errors;
+          gtid_mode.copy(gm, strlen(gm), &my_charset_latin1, system_charset_info,
+                         &errors);
+
+          if (!my_strcasecmp(system_charset_info, wild,
+                             gtid_mode.c_ptr_safe())) {
+            DEBUG_SYNC_C("before_show_gtid_executed");
+          }
+        });
+
         mysql_mutex_lock(&LOCK_global_system_variables);
         pos= get_one_variable(thd, var, value_type, show_type, status_var,
                               &charset, buff, &length);
@@ -3180,6 +3240,7 @@ end:
      0 - OK
      1 - error
 */
+static
 int send_user_stats(THD* thd, HASH *all_user_stats, TABLE *table)
 {
   DBUG_ENTER("send_user_stats");
@@ -3219,6 +3280,7 @@ int send_user_stats(THD* thd, HASH *all_user_stats, TABLE *table)
   DBUG_RETURN(0);
 }
 
+static
 int send_thread_stats(THD* thd, HASH *all_thread_stats, TABLE *table)
 {
   DBUG_ENTER("send_thread_stats");
@@ -3272,7 +3334,7 @@ int send_thread_stats(THD* thd, HASH *all_thread_stats, TABLE *table)
      1 - error
 */
 
-
+static
 int fill_schema_user_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 {
   TABLE *table= tables->table;
@@ -3312,7 +3374,7 @@ int fill_schema_user_stats(THD* thd, TABLE_LIST* tables, Item* cond)
      1 - error
 */
 
-
+static
 int fill_schema_client_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 {
   TABLE *table= tables->table;
@@ -3339,6 +3401,7 @@ int fill_schema_client_stats(THD* thd, TABLE_LIST* tables, Item* cond)
   DBUG_RETURN(1);
 }
 
+static
 int fill_schema_thread_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 {
   TABLE *table= tables->table;
@@ -3365,6 +3428,7 @@ int fill_schema_thread_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 }
 
 // Sends the global table stats back to the client.
+static
 int fill_schema_table_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 {
   TABLE *table= tables->table;
@@ -3409,6 +3473,7 @@ int fill_schema_table_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 }
 
 // Sends the global index stats back to the client.
+static
 int fill_schema_index_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 {
   TABLE *table= tables->table;
@@ -4525,6 +4590,7 @@ uint get_table_open_method(TABLE_LIST *tables,
     @retval       0                        success
     @retval       1                        error
 */
+static
 int make_temporary_tables_old_format(THD *thd, ST_SCHEMA_TABLE *schema_table)
 {
   char tmp[128];
@@ -4675,12 +4741,12 @@ static int store_temporary_table_record(THD *thd, TABLE *table,
 class Fill_global_temporary_tables : public Do_THD_Impl
 {
 private:
-  THD* m_client_thd;
+  THD* const m_client_thd;
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
-  Security_context* m_sctx;
+  Security_context* const m_sctx;
 #endif
   bool m_failed;
-  TABLE_LIST *m_tables;
+  TABLE_LIST * const m_tables;
 
 public:
   Fill_global_temporary_tables(THD* client_thd, TABLE_LIST* tables)
@@ -4765,7 +4831,7 @@ static int fill_global_temporary_tables(THD *thd, TABLE_LIST *tables,
     @retval       0                        success
     @retval       1                        error
 */
-
+static
 int fill_temporary_tables(THD *thd, TABLE_LIST *tables, Item *cond)
 {
   DBUG_ENTER("fill_temporary_tables");
@@ -5018,6 +5084,13 @@ static int fill_schema_table_from_frm(THD *thd, TABLE_LIST *tables,
 
     if (!view_open_result)
     {
+      if (table_list.is_view())
+      {
+        // See comments in tdc_open_view() for explanation.
+        if (!table_list.prelocking_placeholder &&
+            table_list.prepare_security(thd))
+          goto end;
+      }
       // Actual view query is not needed, just indicate that this is a view:
       table_list.set_view_query((LEX *) 1);
       res= schema_table->process_table(thd, &table_list, table,
@@ -8978,6 +9051,9 @@ int hton_fill_schema_table(THD *thd, TABLE_LIST *tables, Item *cond)
   args.tables= tables;
   args.cond= cond;
 
+  if (check_global_access(thd, PROCESS_ACL))
+    DBUG_RETURN(1);
+
   plugin_foreach(thd, run_hton_fill_schema_table,
                  MYSQL_STORAGE_ENGINE_PLUGIN, &args);
 
@@ -9038,7 +9114,7 @@ ST_FIELD_INFO tables_fields_info[]=
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, SKIP_OPEN_TABLE}
 };
 
-ST_FIELD_INFO temporary_table_fields_info[]=
+static ST_FIELD_INFO temporary_table_fields_info[]=
 {
   {"SESSION_ID", 4, MYSQL_TYPE_LONGLONG, 0, 0, "Session", SKIP_OPEN_TABLE},
   {"TABLE_SCHEMA", NAME_CHAR_LEN, MYSQL_TYPE_STRING, 0, 0, "Db", SKIP_OPEN_TABLE},
@@ -9482,7 +9558,7 @@ ST_FIELD_INFO variables_fields_info[]=
 };
 
 
-ST_FIELD_INFO user_stats_fields_info[]=
+static ST_FIELD_INFO user_stats_fields_info[]=
 {
   {"USER", USERNAME_LENGTH, MYSQL_TYPE_STRING, 0, 0, "User", SKIP_OPEN_TABLE},
   {"TOTAL_CONNECTIONS", MY_INT64_NUM_DECIMAL_DIGITS, MYSQL_TYPE_LONGLONG, 0,
@@ -9530,7 +9606,7 @@ ST_FIELD_INFO user_stats_fields_info[]=
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, 0}
 };
 
-ST_FIELD_INFO client_stats_fields_info[]=
+static ST_FIELD_INFO client_stats_fields_info[]=
 {
   {"CLIENT", LIST_PROCESS_HOST_LEN, MYSQL_TYPE_STRING, 0, 0, "Client",
    SKIP_OPEN_TABLE},
@@ -9579,7 +9655,7 @@ ST_FIELD_INFO client_stats_fields_info[]=
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, 0}
 };
 
-ST_FIELD_INFO thread_stats_fields_info[]=
+static ST_FIELD_INFO thread_stats_fields_info[]=
 {
   {"THREAD_ID", MY_INT64_NUM_DECIMAL_DIGITS, MYSQL_TYPE_LONGLONG, 0,
    MY_I_S_UNSIGNED, "Thread_id", SKIP_OPEN_TABLE},
@@ -9628,7 +9704,7 @@ ST_FIELD_INFO thread_stats_fields_info[]=
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, 0}
 };
 
-ST_FIELD_INFO table_stats_fields_info[]=
+static ST_FIELD_INFO table_stats_fields_info[]=
 {
   {"TABLE_SCHEMA", NAME_LEN, MYSQL_TYPE_STRING, 0, 0, "Table_schema",
    SKIP_OPEN_TABLE},
@@ -9643,7 +9719,7 @@ ST_FIELD_INFO table_stats_fields_info[]=
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, 0}
 };
 
-ST_FIELD_INFO index_stats_fields_info[]=
+static ST_FIELD_INFO index_stats_fields_info[]=
 {
   {"TABLE_SCHEMA", NAME_LEN, MYSQL_TYPE_STRING, 0, 0, "Table_schema",
    SKIP_OPEN_TABLE},

@@ -1060,7 +1060,8 @@ static inline int tokudb_generate_row(DB* dest_db,
         }
 
         buff = (uchar *)dest_key->data;
-        assert_always(buff != NULL && max_key_len > 0);
+        assert_always(buff != nullptr);
+        assert_always(max_key_len > 0);
     } else {
         assert_unreachable();
     }
@@ -1315,7 +1316,7 @@ int ha_tokudb::open_main_dictionary(
             NULL,
             DB_BTREE,
             open_flags,
-            0);
+            is_read_only ? 0 : S_IWUSR);
     if (error) {
         goto exit;
     }
@@ -1378,7 +1379,7 @@ int ha_tokudb::open_secondary_dictionary(
     }
 
 
-    error = (*ptr)->open(*ptr, txn, newname, NULL, DB_BTREE, open_flags, 0);
+    error = (*ptr)->open(*ptr, txn, newname, NULL, DB_BTREE, open_flags, is_read_only ? 0 : S_IWUSR);
     if (error) {
         set_my_errno(error);
         goto cleanup;
@@ -1564,6 +1565,7 @@ exit:
 }
 
 int ha_tokudb::initialize_share(const char* name, int mode) {
+
     int error = 0;
     uint64_t num_rows = 0;
     DB_TXN* txn = NULL;
@@ -1617,6 +1619,7 @@ int ha_tokudb::initialize_share(const char* name, int mode) {
             hidden_primary_key,
             primary_key);
     if (error) { goto exit; }
+
 
     error = open_main_dictionary(name, mode == O_RDONLY, txn);
     if (error) {
@@ -1765,7 +1768,6 @@ int ha_tokudb::open(const char *name, int mode, uint test_if_locked) {
 
     transaction = NULL;
     cursor = NULL;
-
 
     /* Open primary key */
     hidden_primary_key = 0;
@@ -6171,8 +6173,6 @@ int ha_tokudb::info(uint flag) {
     }
     if ((flag & HA_STATUS_CONST)) {
         stats.max_data_file_length = 9223372036854775807ULL;
-    }
-    if (flag & (HA_STATUS_VARIABLE | HA_STATUS_CONST)) {
         share->set_cardinality_counts_in_table(table);
     }
 

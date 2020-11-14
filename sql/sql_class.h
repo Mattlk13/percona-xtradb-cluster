@@ -1,13 +1,20 @@
-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -74,6 +81,7 @@ struct wsrep_thd_shadow {
   LEX_CSTRING          db;
   struct timeval       user_time;
   longlong             row_count_func;
+  Relay_log_info       * rli_slave;
 };
 #endif /* WITH_WSREP */
 
@@ -87,6 +95,7 @@ typedef struct st_mysql_lex_string LEX_STRING;
 typedef struct user_conn USER_CONN;
 
 extern ulong kill_idle_transaction_timeout;
+extern PSI_mutex_key key_LOCK_bloom_filter;
 
 /**
   The meat of thd_proc_info(THD*, char*), a macro that packs the last
@@ -1732,26 +1741,32 @@ class Bloom_filter {
 
   typedef std::bitset<SIZE> Bit_set;
 
-  /** The bit set, which is allocated in a MEM_ROOT */
-  Bit_set *bit_set;
+
+  Bit_set* bit_set;
+  // Protects the bit set from concurrent assignment
+  mysql_mutex_t LOCK_bit_set;
 
   // Non-copyable
   Bloom_filter (const Bloom_filter &);
   Bloom_filter & operator = (const Bloom_filter &);
 
  public:
-  Bloom_filter() : bit_set(NULL) {}
+  Bloom_filter() : bit_set(NULL) {
+    mysql_mutex_init(key_LOCK_bloom_filter,
+                     &LOCK_bit_set, MY_MUTEX_INIT_FAST);
+  }
 
-  ~Bloom_filter()
-  {
-    // Do not delete, just destruct, due to MEM_ROOT allocation
-    bit_set->~bitset();
+  ~Bloom_filter() {
+    clear();
+    mysql_mutex_destroy(&LOCK_bit_set);
   }
 
   void clear()
   {
-    // Do not delete, just force new MEM_ROOT allocation on the next use
+    mysql_mutex_lock(&LOCK_bit_set);
+    delete bit_set;
     bit_set= NULL;
+    mysql_mutex_unlock(&LOCK_bit_set);
   }
 
   /**
@@ -1764,23 +1779,22 @@ class Bloom_filter {
      @return if true, the key might be a member of the set. If false, the key
      is definitely not a member of the set.
   */
-  bool test_and_set(MEM_ROOT *mem_root, ulong key)
+  bool test_and_set(ulong key)
   {
-    if (!bit_set)
+    mysql_mutex_lock(&LOCK_bit_set);
+    if (bit_set == NULL)
     {
-      void *bit_set_place= alloc_root(mem_root, sizeof(Bit_set));
-      // FIXME: memory allocation failure is eaten silently. Nonexact stats are
-      // the least of the concerns then.
-      if (!bit_set_place)
-        return false;
-      bit_set= new (bit_set_place) Bit_set();
+      bit_set= new Bit_set();
     }
     // Duplicating ut_hash_ulint calculation
     const ulong pos= (key ^ 1653893711) % SIZE;
     DBUG_ASSERT(pos < SIZE);
-    if (bit_set->test(pos))
+    if (bit_set->test(pos)) {
+      mysql_mutex_unlock(&LOCK_bit_set);
       return false;
+    }
     bit_set->set(pos);
+    mysql_mutex_unlock(&LOCK_bit_set);
     return true;
   }
 };
@@ -1871,8 +1885,6 @@ private:
   */
   LEX_CSTRING m_db;
 
-public:
-
   /**
     In some cases, we may want to modify the query (i.e. replace
     passwords with their hashes before logging the statement etc.).
@@ -1887,8 +1899,17 @@ public:
     may follow at a later date, both pre- and post parsing of the query.
     Rewriting of binloggable statements must preserve all pertinent
     information.
+
+    Similar restrictions as for m_query_string (see there) hold for locking:
+    - Value may only be (re)set from owning thread (current_thd)
+    - Value must be modified using (reset|swap)_rewritten_query().
+      Doing so will protect the update with LOCK_thd_query.
+    - The owner (current_thd) may read the value without holding the lock.
+    - Other threads may read the value, but must hold LOCK_thd_query to do so.
   */
-  String      rewritten_query;
+  String      m_rewritten_query;
+
+public:
 
   /* Used to execute base64 coded binlog events in MySQL server */
   Relay_log_info* rli_fake;
@@ -2379,7 +2400,7 @@ public:
 
   void access_distinct_page(ulong page_id)
   {
-    if (approx_distinct_pages.test_and_set(&main_mem_root, page_id))
+    if (approx_distinct_pages.test_and_set(page_id))
       innodb_page_access++;
   }
 
@@ -3907,7 +3928,7 @@ public:
     PSI_THREAD_CALL(set_thread_start_time)(start_time.tv_sec);
 #endif
   }
-  void get_time(QUERY_START_TIME_INFO *time_info)
+  void get_time(QUERY_START_TIME_INFO *time_info) const
   {
     time_info->start_time= start_time;
     time_info->start_utime= start_utime;
@@ -4823,15 +4844,6 @@ public:
   }
   thd_scheduler event_scheduler;
 
-  /* Returns string as 'IP:port' for the client-side
-     of the connnection represented
-     by 'client' as displayed by SHOW PROCESSLIST.
-     Allocates memory from the heap of
-     this THD and that is not reclaimed
-     immediately, so use sparingly. May return NULL.
-  */
-  char *get_client_host_port(THD *client);
-
 public:
   /**
     Save the performance schema thread instrumentation
@@ -5002,6 +5014,21 @@ public:
   }
 
   /**
+    Set query to be displayed in performance schema (threads table etc.).
+  */
+  void set_query_for_display(const char *query_arg, size_t query_length_arg) {
+    // Set in pfs events statements table
+    MYSQL_SET_STATEMENT_TEXT(m_statement_psi, query_arg, query_length_arg);
+#ifdef HAVE_PSI_THREAD_INTERFACE
+    // Set in pfs threads table
+    PSI_THREAD_CALL(set_thread_info)(query_arg, query_length_arg);
+#endif
+  }
+  void reset_query_for_display(void) {
+    set_query_for_display(NULL, 0);
+  }
+
+  /**
     Assign a new value to thd->m_query_string.
     Protected with the LOCK_thd_query mutex.
   */
@@ -5011,7 +5038,50 @@ public:
     set_query(tmp);
   }
   void set_query(const LEX_CSTRING& query_arg);
-  void reset_query() { set_query(LEX_CSTRING()); }
+  void reset_query() {
+    set_query(LEX_CSTRING());
+  }
+
+  /**
+    Set the rewritten query (with passwords obfuscated etc.) on the THD.
+    Wraps this in the LOCK_thd_query mutex to protect against race conditions
+    with SHOW PROCESSLIST inspecting that string.
+
+    This uses swap() and therefore "steals" the argument from the caller;
+    the caller MUST take care not to try to use its own string after calling
+    this function! This is an optimization for mysql_rewrite_query() so we
+    don't copy its temporary string (which may get very long, up to
+    @@max_allowed_packet).
+
+    Using this outside of mysql_rewrite_query() is almost certainly wrong;
+    please check with the runtime team!
+
+    @param query_arg  The rewritten query to use for slow/bin/general logging.
+                      The value will be released in the caller and MUST NOT
+                      be used there after calling this function.
+  */
+  void swap_rewritten_query(String& query_arg);
+
+  /**
+    Get the rewritten query (with passwords obfuscated etc.) from the THD.
+    If done from a different thread (from the one that the rewritten_query
+    is set on), the caller must hold LOCK_thd_query while calling this!
+  */
+  const String &rewritten_query() const {
+#ifndef DBUG_OFF
+    if (current_thd != this)
+      mysql_mutex_assert_owner(&LOCK_thd_query);
+#endif
+    return m_rewritten_query;
+  }
+
+  /**
+    Reset thd->rewritten_query. Protected with the LOCK_thd_query mutex.
+  */
+  void reset_rewritten_query() {
+    String empty;
+    swap_rewritten_query(empty);
+  }
 
   /**
     Assign a new value to thd->query_id.
@@ -6120,7 +6190,6 @@ public:
 
 class Query_dumpvar :public Query_result_interceptor {
   ha_rows row_count;
-  Item_func_set_user_var **set_var_items;
 public:
   List<PT_select_var> var_list;
   Query_dumpvar()  { var_list.empty(); row_count= 0;}
@@ -6339,8 +6408,6 @@ static inline bool is_engine_substitution_allowed(THD* thd)
 }
 
 /*************************************************************************/
-
-extern pthread_attr_t *get_connection_attrib(void);
 
 #endif /* MYSQL_SERVER */
 

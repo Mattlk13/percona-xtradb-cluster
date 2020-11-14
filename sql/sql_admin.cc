@@ -1,13 +1,20 @@
 /* Copyright (c) 2010, 2017, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -688,6 +695,11 @@ static bool mysql_admin_table(THD* thd, TABLE_LIST* tables,
         table->mdl_request.ticket= NULL;
 
         tmp_disable_binlog(thd); // binlogging is done by caller if wanted
+#ifdef WITH_WSREP
+        /* Re-create table should run with wsrep_on = ON that got disabled
+        by tmp_disable_binlog as it takes MDL lock that can force abort. */
+        reenable_wsrep(thd);
+#endif /* WITH_WSREP */
         result_code= mysql_recreate_table(thd, table, false);
         reenable_binlog(thd);
         /*
@@ -858,6 +870,11 @@ send_result_message:
                  *save_next_global= table->next_global;
       table->next_local= table->next_global= 0;
       tmp_disable_binlog(thd); // binlogging is done by caller if wanted
+#ifdef WITH_WSREP
+        /* Re-create table should run with wsrep_on = ON that got disabled
+        by tmp_disable_binlog as it takes MDL lock that can force abort. */
+        reenable_wsrep(thd);
+#endif /* WITH_WSREP */
       /* Don't forget to pre-open temporary tables. */
       result_code= (open_temporary_tables(thd, table) ||
                     mysql_recreate_table(thd, table, false));

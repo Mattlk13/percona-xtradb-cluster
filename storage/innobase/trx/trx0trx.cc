@@ -2,13 +2,21 @@
 
 Copyright (c) 1996, 2018, Oracle and/or its affiliates. All Rights Reserved.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -61,10 +69,6 @@ Created 3/26/1996 Heikki Tuuri
 #include <wsrep_mysqld.h>
 #endif /* WITH_WSREP */
 static const ulint MAX_DETAILED_ERROR_LEN = 256;
-
-#ifdef WITH_WSREP
-#include <wsrep_mysqld.h>
-#endif /* WITH_WSREP */
 
 /** Set of table_id */
 typedef std::set<
@@ -2434,7 +2438,6 @@ trx_commit_or_rollback_prepare(
 	switch (trx->state) {
 	case TRX_STATE_NOT_STARTED:
 	case TRX_STATE_FORCED_ROLLBACK:
-
 #ifdef WITH_WSREP
 		ut_d(trx->start_file = __FILE__);
 		ut_d(trx->start_line = __LINE__);
@@ -3318,9 +3321,18 @@ trx_get_trx_by_xid_low(
 		    && trx_state_eq(trx, TRX_STATE_PREPARED)
 		    && xid->eq(trx->xid)) {
 
+#ifdef WITH_WSREP
+			/* The commit of a prepared recovered Galera
+			transaction needs a valid trx->xid for
+			invoking trx_sys_update_wsrep_checkpoint(). */
+			if (!wsrep_is_wsrep_xid(trx->xid)) {
+#endif
 			/* Invalidate the XID, so that subsequent calls
 			will not find it. */
 			trx->xid->reset();
+#ifdef WITH_WSREP
+			}
+#endif /* WITH_WSREP */
 			break;
 		}
 	}
@@ -3578,8 +3590,9 @@ Kill all transactions that are blocking this transaction from acquiring locks.
 void
 trx_kill_blocking(trx_t* trx)
 {
+	DBUG_ENTER("trx_kill_blocking");
 	if (trx->hit_list.empty()) {
-		return;
+		DBUG_VOID_RETURN;
 	}
 
 	DEBUG_SYNC_C("trx_kill_blocking_enter");
@@ -3739,5 +3752,5 @@ trx_kill_blocking(trx_t* trx)
 
 		row_mysql_freeze_data_dictionary(trx);
 	}
-
+	DBUG_VOID_RETURN;
 }

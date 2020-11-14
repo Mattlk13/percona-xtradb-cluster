@@ -1,13 +1,20 @@
 /* Copyright (c) 2010, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -348,6 +355,26 @@ bool Sql_cmd_alter_table::execute(THD *thd)
 
 
 #ifdef WITH_WSREP
+  /* Check if foreign keys are accessible.
+  1. Transaction is replicated first, then is done locally.
+  2. Replicated node applies write sets in context
+  of root user.
+  Above two conditions may cause that even if we have no access to FKs,
+  transactions will replicate with success, but fail locally.
+
+  Here we check only for FK access, not if the engine supports FKs.
+  That's enough, because right now we need only to know if transaction
+  should be rolled back because of lack of access and not replicated,
+  or we can replicate it and let replicated node do the rest of the job. */
+  if (alter_info.flags & Alter_info::ADD_FOREIGN_KEY)
+  {
+    if (check_fk_parent_table_access(thd, select_lex->db,
+                                     &create_info, &alter_info, false))
+    {
+      DBUG_RETURN(TRUE);
+    }
+  }
+
   /* PXC doesn't recommend/allow ALTER operation on table created using
   non-transactional storage engine (like MyISAM, HEAP/MEMORY, etc....)
   except ALTER operation to change storage engine to transactional storage

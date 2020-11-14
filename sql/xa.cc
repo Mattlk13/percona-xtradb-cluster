@@ -1,13 +1,20 @@
 /* Copyright (c) 2013, 2018, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software Foundation,
@@ -39,6 +46,31 @@ static const int MAX_XID_LIST_SIZE= 1024*128;
 
 static mysql_mutex_t LOCK_transaction_cache;
 static HASH transaction_cache;
+#ifdef WITH_WSREP
+static my_xid wsrep_order_and_check_continuity(XID *list, int len)
+{
+  wsrep_sort_xid_array(list, len);
+  wsrep_uuid_t uuid;
+  wsrep_seqno_t seqno;
+  wsrep_get_SE_checkpoint(uuid, seqno);
+
+  long long cur_seqno= seqno;
+  for (int i= 0; i < len; ++i)
+  {
+    if (!wsrep_is_wsrep_xid(list + i) ||
+        wsrep_xid_seqno(*(list + i)) != cur_seqno + 1)
+    {
+      WSREP_WARN("Discovered discontinuity in recovered wsrep "
+                 "transaction XIDs. Truncating the recovery list to "
+                 "%d entries", i);
+      break;
+    }
+    ++cur_seqno;
+  }
+  WSREP_INFO("Last wsrep seqno to be recovered %lld", cur_seqno);
+  return (cur_seqno < 0 ? 0 : cur_seqno);
+}
+#endif /* WITH_WSREP */
 
 static my_bool xacommit_handlerton(THD *unused1, plugin_ref plugin,
                                    void *arg)
@@ -91,6 +123,18 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
     {
       sql_print_information("Found %d prepared transaction(s) in %s",
                             got, ha_resolve_storage_engine_name(hton));
+#ifdef WITH_WSREP
+      /* If wsrep_on=ON, XIDs are first ordered and then the range of
+         recovered XIDs is checked for continuity. All the XIDs which
+         are in continuous range can be safely committed if binlog
+         is off since they have already ordered and certified in the
+         cluster. */
+      my_xid wsrep_limit= 0;
+      if (WSREP_ON)
+      {
+        wsrep_limit= wsrep_order_and_check_continuity(info->list, got);
+      }
+#endif /* WITH_WSREP */
       for (int i= 0; i < got; i++)
       {
 #ifdef WITH_WSREP
@@ -112,15 +156,30 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
           info->found_foreign_xids++;
           continue;
         }
+#ifdef WITH_WSREP
+        if (!(wsrep_emulate_bin_log &&
+              wsrep_is_wsrep_xid(info->list + i) &&
+              x <= wsrep_limit) && info->dry_run)
+#else
         if (info->dry_run)
+#endif /* WITH_WSREP */
         {
           info->found_my_xids++;
           continue;
         }
         // recovery mode
+#ifdef WITH_WSREP
+        if ((wsrep_emulate_bin_log &&
+             wsrep_is_wsrep_xid(info->list + i) &&
+             x <= wsrep_limit) ||
+            (info->commit_list ?
+             my_hash_search(info->commit_list, (uchar *)&x, sizeof(x)) != 0 :
+             tc_heuristic_recover == TC_HEURISTIC_RECOVER_COMMIT))
+#else
         if (info->commit_list ?
             my_hash_search(info->commit_list, (uchar *)&x, sizeof(x)) != 0 :
             tc_heuristic_recover == TC_HEURISTIC_RECOVER_COMMIT)
+#endif /* WITH_WSREP */
         {
 #ifndef DBUG_OFF
           char buf[XIDDATASIZE * 4 + 6]; // see xid_to_str

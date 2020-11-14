@@ -1,13 +1,20 @@
-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -42,6 +49,11 @@
 #endif
 #ifdef HAVE_ARPA_INET_H
 # include <arpa/inet.h>
+#endif
+
+#include <sys/types.h>
+#ifdef HAVE_SYS_MMAN_H
+#include <sys/mman.h>
 #endif
 
 #include "sql_parse.h"    // test_if_data_home_dir
@@ -154,7 +166,7 @@
 #include "item_strfunc.h"               // Item_func_uuid
 #include "handler.h"
 
-#if defined(HAVE_OPENSSL) && !defined(HAVE_YASSL)
+#if defined(HAVE_OPENSSL)
 #include <openssl/crypto.h>
 #endif
 
@@ -173,11 +185,6 @@ using std::max;
 using std::vector;
 
 #define mysqld_charset &my_charset_latin1
-
-#if defined(HAVE_SOLARIS_LARGE_PAGES) && defined(__GNUC__)
-extern "C" int getpagesizes(size_t *, int);
-extern "C" int memcntl(caddr_t, size_t, int, caddr_t, int, int);
-#endif
 
 #ifdef HAVE_FPU_CONTROL_H
 # include <fpu_control.h>
@@ -337,6 +344,7 @@ my_bool locked_in_memory;
 bool opt_using_transactions;
 bool volatile abort_loop;
 ulong opt_tc_log_size;
+bool opt_libcoredumper, opt_corefile= 0;
 
 static enum_server_operational_state server_operational_state= SERVER_BOOTING;
 ulong log_warnings;
@@ -689,6 +697,8 @@ char* utility_user= NULL;
 char* utility_user_password= NULL;
 char* utility_user_schema_access= NULL;
 
+char* opt_libcoredumper_path= NULL;
+
 /* Plucking this from sql/sql_acl.cc for an array of privilege names */
 extern TYPELIB utility_user_privileges_typelib;
 ulonglong utility_user_privileges= 0;
@@ -792,7 +802,6 @@ char *opt_general_logname, *opt_slow_logname, *opt_bin_logname;
 
 static volatile sig_atomic_t kill_in_progress;
 
-
 static my_bool opt_myisam_log;
 static int cleanup_done;
 static ulong opt_specialflag;
@@ -819,7 +828,7 @@ static char **remaining_argv;
 int orig_argc;
 char **orig_argv;
 
-#if defined(HAVE_OPENSSL) && !defined(HAVE_YASSL)
+#if defined(HAVE_OPENSSL)
 bool init_rsa_keys(void);
 void deinit_rsa_keys(void);
 int show_rsa_public_key(THD *thd, SHOW_VAR *var, char *buff);
@@ -1117,6 +1126,29 @@ private:
 
 #ifdef WITH_WSREP
 /**
+  This class implements callback function used by
+  wsrep_close_client_connections() to set KILL_CONNECTION
+  flag on all client thds and awake the thread.
+*/
+class Set_wsrep_kill_client_conn : public Do_THD_Impl
+{
+ public:
+  Set_wsrep_kill_client_conn()
+  {}
+
+  virtual void operator()(THD *killing_thd)
+  {
+    if (killing_thd->get_protocol()->connection_alive() &&
+        (WSREP(killing_thd) || killing_thd->wsrep_exec_mode == LOCAL_STATE) &&
+        killing_thd != current_thd)
+    {
+      mysql_mutex_lock(&killing_thd->LOCK_thd_data);
+      killing_thd->awake(THD::KILL_CONNECTION);
+      mysql_mutex_unlock(&killing_thd->LOCK_thd_data);
+    }
+  }
+};
+/**
   This class implements callback function used by close_connections()
   to set KILL_CONNECTION flag on all thds in thd list.
   If m_kill_dump_thread_flag is not set it kills all other threads
@@ -1271,25 +1303,38 @@ public:
 
 enum wsrep_thd_type   {APPLIER, COMMITTING};
 
-class Find_wsrep_thd: public Find_THD_Impl
+class Count_wsrep_thd: public Do_THD_Impl
 {
 public:
-  Find_wsrep_thd(enum wsrep_thd_type type): m_type(type) {}
-  virtual bool operator()(THD *thd)
+  Count_wsrep_thd(enum wsrep_thd_type type)
+    : m_type(type)
+    , m_count(0) 
+  {}
+  virtual void operator()(THD *thd)
   {
-    if (WSREP(thd))
-    { 
-      switch (m_type) 
-        {
-        case APPLIER:    return thd->wsrep_applier;
-        case COMMITTING: return thd->wsrep_query_state == QUERY_COMMITTING;
-        }
+    switch (m_type)
+    {
+      case APPLIER:
+      {
+        if (thd->wsrep_applier)
+          m_count++;
+      }
+      break;
+      case COMMITTING:
+      {
+        if (thd->wsrep_query_state == QUERY_COMMITTING)
+          m_count++;
+      }
+      break;
     }
-    return false;
+  }
+  int get_thd_count() const
+  {
+    return m_count;
   }
 private:
   enum wsrep_thd_type m_type;
-  bool is_server_shutdown;
+  int m_count;
 };
 
 class Count_wsrep_applier_threads : public Do_THD_Impl
@@ -3573,6 +3618,9 @@ int init_common_variables()
 #endif /* WITH_WSREP */
 
 #ifdef WITH_WSREP
+  if (wsrep_setup_allowed_sst_methods())
+    return 1;
+
   /*
     We need to initialize auxiliary variables, that will be
     further keep the original values of auto-increment options
@@ -3854,6 +3902,11 @@ int init_common_variables()
     return 1;
   }
 
+  /* We set the atomic field m_opt_tracking_mode to the value of the sysvar
+     variable m_opt_tracking_mode_value here, as it now has the user given
+     value
+  */
+  set_mysqld_opt_tracking_mode();
   if (global_system_variables.transaction_write_set_extraction == HASH_ALGORITHM_OFF
       && mysql_bin_log.m_dependency_tracker.m_opt_tracking_mode != DEPENDENCY_TRACKING_COMMIT_ORDER)
   {
@@ -4165,7 +4218,6 @@ int warn_self_signed_ca()
     if (warn_one(opt_ssl_ca))
       return 1;
   }
-#ifndef HAVE_YASSL
   if (opt_ssl_capath && opt_ssl_capath[0])
   {
     /* We have ssl-capath. So search all files in the dir */
@@ -4203,7 +4255,6 @@ int warn_self_signed_ca()
     ca_dir= 0;
     memset(&file_path, 0, sizeof(file_path));
   }
-#endif /* HAVE_YASSL */
   return ret_val;
 }
 
@@ -4212,13 +4263,12 @@ int warn_self_signed_ca()
 static int init_ssl()
 {
 #ifdef HAVE_OPENSSL
-#ifndef HAVE_YASSL
   int fips_mode= FIPS_mode();
   if (fips_mode != 0)
   {
     /* FIPS is enabled, Log warning and Disable it now */
     sql_print_warning(
-        "Percona XtraDB Cluster cannot operate under OpenSSL FIPS mode."
+        "Percona Server cannot operate under OpenSSL FIPS mode."
         " Disabling FIPS.");
     FIPS_mode_set(0);
   }
@@ -4227,7 +4277,6 @@ static int init_ssl()
 #else /* OPENSSL_VERSION_NUMBER < 0x10100000L */
   OPENSSL_malloc_init();
 #endif /* OPENSSL_VERSION_NUMBER < 0x10100000L */
-#endif
   ssl_start();
 #ifndef EMBEDDED_LIBRARY
 
@@ -4239,10 +4288,8 @@ static int init_ssl()
                             "Trying to enable SSL support using them.",
                             DEFAULT_SSL_CA_CERT, DEFAULT_SSL_SERVER_CERT,
                             DEFAULT_SSL_SERVER_KEY);
-#ifndef HAVE_YASSL
     if (do_auto_cert_generation(auto_detection_status) == false)
       return 1;
-#endif
 
     enum enum_ssl_init_error error= SSL_INITERR_NOERROR;
     long ssl_ctx_flags= process_tls_version(opt_tls_version);
@@ -4261,26 +4308,10 @@ static int init_ssl()
         No real need for opt_use_ssl to be enabled in bootstrap mode,
         but we want the SSL materal generation and/or validation (if supplied).
         So we keep it on.
-
-        For yaSSL (since it can't auto-generate the certs from inside the
-        server) we need to hush the warning if in bootstrap mode, as in
-        that mode the server won't be listening for connections and thus
-        the lack of SSL material makes no real difference.
-        However if the user specified any of the --ssl options we keep the
-        warning as it's showing problems with the values supplied.
-
-        For openssl, we don't hush the option since it would indicate a failure
-        in auto-generation, bad key material explicitly specified or
-        auto-generation disabled explcitly while SSL is still on.
       */
-#ifdef HAVE_YASSL
-      if (!opt_bootstrap || SSL_ARTIFACTS_NOT_FOUND != auto_detection_status)
-#endif
-      {
-        sql_print_warning("Failed to set up SSL because of the"
-                          " following SSL library error: %s",
-                          sslGetErrString(error));
-      }
+      sql_print_warning("Failed to set up SSL because of the"
+                        " following SSL library error: %s",
+                        sslGetErrString(error));
       opt_use_ssl = 0;
       have_ssl= SHOW_OPTION_DISABLED;
     }
@@ -4303,10 +4334,8 @@ static int init_ssl()
 #endif /* ! EMBEDDED_LIBRARY */
   if (des_key_file)
     load_des_key_file(des_key_file);
-#ifndef HAVE_YASSL
   if (init_rsa_keys())
     return 1;
-#endif
 #endif /* HAVE_OPENSSL */
   return 0;
 }
@@ -4324,9 +4353,7 @@ static void end_ssl()
     ssl_acceptor_fd= 0;
   }
 #endif /* ! EMBEDDED_LIBRARY */
-#ifndef HAVE_YASSL
   deinit_rsa_keys();
-#endif
 #endif /* HAVE_OPENSSL */
 }
 
@@ -4576,8 +4603,9 @@ initialize_storage_engine(char *se_name, const char *se_kind,
       Need to unlock as global_system_variables.table_plugin
       was acquired during plugin_init()
     */
-    plugin_unlock(0, *dest_plugin);
-    *dest_plugin= plugin;
+    plugin_ref old_dest_plugin = *dest_plugin;
+    *dest_plugin = plugin;
+    plugin_unlock(0, old_dest_plugin);
   }
   return false;
 }
@@ -4674,9 +4702,6 @@ static int init_server_components()
     if (open_error_log(errorlog_filename_buff, false))
       unireg_abort(MYSQLD_ABORT_EXIT);
 
-#ifdef _WIN32
-    FreeConsole();        // Remove window
-#endif
   }
   else
   {
@@ -5102,6 +5127,29 @@ a file name for --log-bin-index option", opt_binlog_index_name);
   {
     sql_print_error("Unable to read errmsg.sys file");
     unireg_abort(MYSQLD_ABORT_EXIT);
+  }
+
+  if (opt_libcoredumper)
+  {
+#if HAVE_LIBCOREDUMPER
+    if (opt_corefile)
+    {
+      sql_print_warning(
+          "Started with --core-file and --coredumper. "
+          "--coredumper will take precedence.");
+    }
+    if (opt_libcoredumper_path != NULL)
+    {
+      if (!validate_libcoredumper_path(opt_libcoredumper_path))
+      {
+        unireg_abort(MYSQLD_ABORT_EXIT);
+      }
+    }
+#else
+    sql_print_warning(
+        "This version of MySQL has not been compiled with "
+        "libcoredumper support, ignoring --coredumper argument");
+#endif
   }
 
   /* We have to initialize the storage engines before CSV logging */
@@ -5882,6 +5930,15 @@ int mysqld_main(int argc, char **argv)
   Service.SetSlowStarting(slow_start_timeout);
 #endif
 
+#ifdef WITH_WSREP
+  /*
+    Make sure that SSL library gets initialized before WSREP provider
+    is loaded. This is to ensure that possible server side initialization
+    does not have any side effects while the provider is already running
+    with open SSL sessions.
+  */
+  ssl_start();
+#endif /* */
   if (init_server_components())
     unireg_abort(MYSQLD_ABORT_EXIT);
 
@@ -6880,6 +6937,11 @@ struct my_option my_long_early_options[]=
   {"core-file", OPT_WANT_CORE,
    "Write core on errors.",
    0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0},
+   {"coredumper", OPT_COREDUMPER,
+    "Use coredumper library to generate coredumps. Specify a path for coredump "
+    "otherwise it will be generated on datadir",
+    &opt_libcoredumper_path, &opt_libcoredumper_path, 0, GET_STR,
+    OPT_ARG, 0, 0, 0, 0, 0, 0},
   {"skip-stack-trace", OPT_SKIP_STACK_TRACE,
    "Don't print a stack trace on failure.", 0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0,
    0, 0, 0, 0},
@@ -7564,14 +7626,14 @@ static inline bool is_committing_connection(THD *thd)
    returns the number of wsrep appliers running.
    However, the caller (thd parameter) is not taken in account
  */
+MY_ATTRIBUTE((noinline))
 static int have_wsrep_appliers(THD *thd)
 {
-  Find_wsrep_thd find_wsrep_thd(APPLIER);
-  //Find_thd_with_bid find_thd_applier(10);
+  Global_THD_manager *thd_manager= Global_THD_manager::get_instance();
+  Count_wsrep_thd count_wsrep_applier_thd(APPLIER);
 
-  THD* tmp= Global_THD_manager::get_instance()->find_thd(&find_wsrep_thd);
-  if (tmp) return true;
-  return false;
+  thd_manager->do_for_all_thd(&count_wsrep_applier_thd);
+  return count_wsrep_applier_thd.get_thd_count();
 }
 #endif /* 0 */
 
@@ -7589,14 +7651,14 @@ static void wsrep_close_thread(THD *thd)
   mysql_mutex_unlock(&thd->LOCK_thd_data);
 }
 
+MY_ATTRIBUTE((noinline))
 static my_bool have_committing_connections()
 {
-  //Find_thd_committing find_thd_committing();
-  Find_wsrep_thd find_thd_committing(COMMITTING);
-
-  THD* tmp= Global_THD_manager::get_instance()->find_thd(&find_thd_committing);
-  if (tmp) return true;
-  return false;
+  Count_wsrep_thd count_thd_committing(COMMITTING);
+  Global_THD_manager *thd_manager= Global_THD_manager::get_instance();
+  
+  thd_manager->do_for_all_thd(&count_thd_committing);
+  return (count_thd_committing.get_thd_count() != 0);
 }
 
 int wsrep_wait_committing_connections_close(int wait_time)
@@ -7621,19 +7683,24 @@ void wsrep_close_client_connections(my_bool wait_to_end, bool server_shutdown)
 
   Global_THD_manager *thd_manager= Global_THD_manager::get_instance();
   /*
-    First signal all threads that it's time to die
-    This will give the threads some time to gracefully abort their
-    statements and inform their clients that the server is about to die.
-  */
+   * wsrep_close_client_connections can be used when there is a cluster
+   * reconfiguration or when we set wsrep_reject_queries=ALL_KILL
+   * on those cases if we are using thread pooling,
+   * we cannot close the connections abruptly otherwise the thread pool workers
+   * won't get signaled and will hang forever when we shutdown the server.
+   * Sending a kill signal and awaking the thread.
+   */
 
   sql_print_information("Giving %d client threads a chance to die gracefully",
                         static_cast<int>(thd_manager->get_thd_count()));
+  Set_wsrep_kill_client_conn set_wsrep_kill_client_conn;
+  thd_manager->do_for_all_thd(&set_wsrep_kill_client_conn);
+  if (thd_manager->get_thd_count() > 0)
+    sleep(2);  // Give threads time to die
 
   Call_wsrep_close_client_conn call_wsrep_close_client_conn(server_shutdown);
   thd_manager->do_for_all_thd(&call_wsrep_close_client_conn);
 
-  if (thd_manager->get_thd_count() > 0)
-    sleep(2);         // Give threads time to die
 
 }
 
@@ -7651,7 +7718,7 @@ static void wsrep_close_threads(THD *thd)
   thd_manager->do_for_all_thd(&call_wsrep_close_wsrep_threads);
 }
 
-void wsrep_close_applier_threads(int count)
+void wsrep_close_applier_threads()
 {
   Global_THD_manager *thd_manager= Global_THD_manager::get_instance();
 
@@ -8230,16 +8297,6 @@ static int show_ssl_get_cipher_list(THD *thd, SHOW_VAR *var, char *buff)
 }
 
 
-#ifdef HAVE_YASSL
-
-static char *
-my_asn1_time_to_string(ASN1_TIME *time, char *buf, size_t len)
-{
-  return yaSSL_ASN1_TIME_to_string(time, buf, len);
-}
-
-#else /* openssl */
-
 static char *
 my_asn1_time_to_string(ASN1_TIME *time, char *buf, size_t len)
 {
@@ -8265,8 +8322,6 @@ end:
   BIO_free(bio);
   return res;
 }
-
-#endif
 
 
 /**
@@ -8351,7 +8406,8 @@ show_ssl_get_server_not_after(THD *thd, SHOW_VAR *var, char *buff)
 #endif /* HAVE_OPENSSL && !EMBEDDED_LIBRARY */
 
 #ifdef HAVE_POOL_OF_THREADS
-int show_threadpool_idle_threads(THD *thd, SHOW_VAR *var, char *buff)
+static int
+show_threadpool_idle_threads(THD *thd, SHOW_VAR *var, char *buff)
 {
   var->type= SHOW_INT;
   var->value= buff;
@@ -8367,7 +8423,65 @@ static int show_slave_open_temp_tables(THD *thd, SHOW_VAR *var, char *buf)
   *((int *) buf)= slave_open_temp_tables.atomic_get();
   return 0;
 }
+bool validate_libcoredumper_path(char *libcoredumper_path)
+{
+  /* validate path */
+  if (!is_valid_log_name(libcoredumper_path, strlen(libcoredumper_path)))
+  {  //filename contain .cnf or .ini on it
+    sql_print_error("Variable --coredumper cannot be set to value %s",
+                    libcoredumper_path);
+    return false;
+  }
+  char   libcoredumper_dir[FN_REFLEN];
+  size_t libcoredumper_dir_length;
+  size_t opt_libcoredumper_path_length= strlen(libcoredumper_path);
+  (void)dirname_part(libcoredumper_dir, libcoredumper_path,
+                     &libcoredumper_dir_length);
 
+  if (!libcoredumper_dir_length)
+  {
+    sql_print_error("Error processing --coredumper path: %s",
+                    libcoredumper_path);
+    return false;
+  }
+  size_t libcoredumper_file_length=
+      opt_libcoredumper_path_length - libcoredumper_dir_length;
+  if (libcoredumper_file_length == 0)  //path is a directory
+  {
+    libcoredumper_file_length= 19;  //file is set to core.yyyymmddhhmmss
+  }
+  else
+  {
+    libcoredumper_file_length+= 15;  //file gets .yyyymmddhhmmss appended
+  }
+  if (opt_libcoredumper_path_length > FN_REFLEN)
+  {  // path is too long
+    sql_print_error("Variable --coredumper set to a too long path");
+    return false;
+  }
+  if (libcoredumper_file_length > FN_LEN)
+  {  // filename is too long
+    sql_print_error("Variable --coredumper set to a too long filename");
+    return false;
+  }
+  if (my_access(libcoredumper_dir, F_OK))
+  {
+    sql_print_error("Directory specified at --coredumper: %s does not exist",
+                    libcoredumper_dir);
+    return false;
+  }
+  if (my_access(libcoredumper_dir, (F_OK | W_OK)))
+  {
+    sql_print_error("Directory specified at --coredumper: %s is not writable",
+                    libcoredumper_dir);
+    return false;
+  }
+  if (libcoredumper_dir_length == strlen(libcoredumper_path))
+  {  //only dirname was specified, append core to libcoredumper_path
+    strcat(libcoredumper_path, "core");
+  }
+  return true;
+}
 /*
   Variables shown by SHOW STATUS in alphabetical order
 */
@@ -8516,9 +8630,7 @@ SHOW_VAR status_vars[]= {
   {"Ssl_version",              (char*) &show_ssl_get_version,                          SHOW_FUNC,              SHOW_SCOPE_ALL},
   {"Ssl_server_not_before",    (char*) &show_ssl_get_server_not_before,                SHOW_FUNC,              SHOW_SCOPE_ALL},
   {"Ssl_server_not_after",     (char*) &show_ssl_get_server_not_after,                 SHOW_FUNC,              SHOW_SCOPE_ALL},
-#ifndef HAVE_YASSL
   {"Rsa_public_key",           (char*) &show_rsa_public_key,                           SHOW_FUNC,              SHOW_SCOPE_GLOBAL},
-#endif
 #endif
 #endif /* HAVE_OPENSSL */
   {"Table_locks_immediate",    (char*) &locks_immediate,                               SHOW_LONG,              SHOW_SCOPE_GLOBAL},
@@ -8932,11 +9044,6 @@ mysqld_get_one_option(int optid,
       One can disable SSL later by using --skip-ssl or --ssl=0.
     */
     opt_use_ssl= true;
-#ifdef HAVE_YASSL
-    /* crl has no effect in yaSSL. */
-    opt_ssl_crl= NULL;
-    opt_ssl_crlpath= NULL;
-#endif /* HAVE_YASSL */   
     break;
 #endif /* HAVE_OPENSSL */
 #ifndef EMBEDDED_LIBRARY
@@ -9074,6 +9181,11 @@ mysqld_get_one_option(int optid,
     break;
   case (int) OPT_WANT_CORE:
     test_flags |= TEST_CORE_ON_SIGNAL;
+    opt_corefile= MY_TEST(argument != disabled_my_option);
+    break;
+  case (int) OPT_COREDUMPER:
+    test_flags |= TEST_CORE_ON_SIGNAL;
+    opt_libcoredumper= MY_TEST(argument != disabled_my_option);
     break;
   case (int) OPT_SKIP_STACK_TRACE:
     test_flags|=TEST_NO_STACKTRACE;
@@ -9383,11 +9495,6 @@ mysql_getopt_value(const char *keyname, size_t key_length,
 }
 
 C_MODE_END
-
-/* defined in sys_vars.cc */
-extern void init_log_slow_verbosity();
-extern void init_slow_query_log_use_global_control();
-extern void init_log_slow_sp_statements();
 
 /**
   Ensure all the deprecared options with 1 possible value are
@@ -10399,6 +10506,7 @@ static PSI_mutex_info all_server_mutexes[]=
   { &key_RELAYLOG_LOCK_xids, "MYSQL_RELAY_LOG::LOCK_xids", 0},
   { &key_hash_filo_lock, "hash_filo::lock", 0},
   { &Gtid_set::key_gtid_executed_free_intervals_mutex, "Gtid_set::gtid_executed::free_intervals_mutex", 0 },
+  { &key_LOCK_bloom_filter, "Bloom_filter", 0},
   { &key_LOCK_crypt, "LOCK_crypt", PSI_FLAG_GLOBAL},
   { &key_LOCK_error_log, "LOCK_error_log", PSI_FLAG_GLOBAL},
   { &key_LOCK_global_user_client_stats,
@@ -11418,3 +11526,8 @@ bool update_named_pipe_full_access_group(const char *new_group_name)
 #endif  /* _WIN32 && !EMBEDDED_LIBRARY */
 
 
+void set_mysqld_opt_tracking_mode()
+{
+  my_atomic_store64(&mysql_bin_log.m_dependency_tracker.m_opt_tracking_mode,
+          static_cast<int64>(mysql_bin_log.m_dependency_tracker.m_opt_tracking_mode_value));
+}

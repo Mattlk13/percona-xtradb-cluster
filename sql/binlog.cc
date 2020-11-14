@@ -1,13 +1,20 @@
-/* Copyright (c) 2009, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2009, 2020, Oracle and/or its affiliates. All rights reserved.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software Foundation,
@@ -42,6 +49,7 @@
 #include <list>
 #include <string>
 #include "my_rnd.h"
+#include <sstream>
 
 #ifdef WITH_WSREP
 #include "wsrep_xid.h"
@@ -113,6 +121,7 @@ static ulonglong binlog_global_snapshot_position;
 // Binlog position variables for SHOW STATUS
 static char binlog_snapshot_file[FN_REFLEN];
 static ulonglong binlog_snapshot_position;
+static std::string binlog_snapshot_gtid_executed;
 
 static SHOW_VAR binlog_status_vars_detail[]=
 {
@@ -122,42 +131,6 @@ static SHOW_VAR binlog_status_vars_detail[]=
    (char *)&binlog_snapshot_position, SHOW_LONGLONG, SHOW_SCOPE_GLOBAL},
   {NullS, NullS, SHOW_LONG, SHOW_SCOPE_GLOBAL}
 };
-
-/**
-  Helper class to hold a mutex for the duration of the
-  block.
-
-  Eliminates the need for explicit unlocking of mutexes on, e.g.,
-  error returns.  On passing a null pointer, the sentry will not do
-  anything.
- */
-class Mutex_sentry
-{
-public:
-  Mutex_sentry(mysql_mutex_t *mutex)
-    : m_mutex(mutex)
-  {
-    if (m_mutex)
-      mysql_mutex_lock(mutex);
-  }
-
-  ~Mutex_sentry()
-  {
-    if (m_mutex)
-      mysql_mutex_unlock(m_mutex);
-#ifndef DBUG_OFF
-    m_mutex= 0;
-#endif
-  }
-
-private:
-  mysql_mutex_t *m_mutex;
-
-  // It's not allowed to copy this object in any way
-  Mutex_sentry(Mutex_sentry const&);
-  void operator=(Mutex_sentry const&);
-};
-
 
 /**
   Helper class to switch to a new thread and then go back to the previous one,
@@ -1028,10 +1001,37 @@ public:
             !is_binlog_empty());
   }
 
+  /**
+    Check if manager contains consistent snapshot of log coordinates
+    and gtid_executed.
+
+    @return true  Consistent snapshot available
+    @return false Otherwise
+   */
+  bool has_consistent_snapshot() const
+  {
+    /**
+      snapshot_gtid_executed can be empty string
+      if gtid_mode=OFF.
+     */
+
+    return binlog_info.log_file_name[0] != '\0';
+  }
+
+  /**
+    Removes consistent snapshot from cache.
+   */
+  void drop_consistent_snapshot()
+  {
+    binlog_info.log_file_name[0]= '\0';
+    snapshot_gtid_executed.clear();
+  }
+
   binlog_stmt_cache_data stmt_cache;
   binlog_trx_cache_data trx_cache;
 
-  LOG_INFO binlog_info;
+  LOG_INFO    binlog_info;
+  std::string snapshot_gtid_executed;
 
   /*
     The bool flag is for preventing do_binlog_xa_commit_rollback()
@@ -2055,6 +2055,7 @@ static int binlog_start_consistent_snapshot(handlerton *hton, THD *thd)
 
   /* Server layer calls us with LOCK_log locked, so this is safe. */
   mysql_bin_log.raw_get_current_log(&cache_mngr->binlog_info);
+  gtid_state->get_snapshot_gtid_executed(cache_mngr->snapshot_gtid_executed);
 
   trans_register_ha(thd, true, hton, NULL);
 
@@ -2104,6 +2105,7 @@ static int binlog_clone_consistent_snapshot(handlerton *hton, THD *thd,
 
   mysql_mutex_lock(&thd->LOCK_thd_data);
 
+  cache_mngr->snapshot_gtid_executed= from_cache_mngr->snapshot_gtid_executed;
   cache_mngr->binlog_info.pos = pos;
   strmake(cache_mngr->binlog_info.log_file_name, log_file_name,
           sizeof(cache_mngr->binlog_info.log_file_name) - 1);
@@ -2651,7 +2653,7 @@ int MYSQL_BIN_LOG::rollback(THD *thd, bool all)
     if (cache_mngr != NULL)
     {
       mysql_mutex_lock(&thd->LOCK_thd_data);
-      cache_mngr->binlog_info.log_file_name[0]= '\0';
+      cache_mngr->drop_consistent_snapshot();
       mysql_mutex_unlock(&thd->LOCK_thd_data);
     }
 
@@ -2834,7 +2836,14 @@ int MYSQL_BIN_LOG::rollback(THD *thd, bool all)
       DBUG_ASSERT(0);
 #endif
 
-    error= ordered_commit(thd, all, /* skip_commit */ true);
+    error= prepare_ordered_commit(thd, all, /* skip_commit */ true);
+#ifdef WITH_WSREP
+    if (!error)
+      error= ordered_commit(thd, all);
+#else
+    if (!error)
+      error= ordered_commit(thd);
+#endif /* WITH_WSREP */
   }
 
 #ifdef WITH_WSREP
@@ -3124,7 +3133,7 @@ public:
     {
       if(!strncmp(m_log_name, linfo->log_file_name, m_log_name_len))
       {
-        sql_print_warning("file %s was not purged because it was being read"
+        sql_print_warning("file %s was not purged because it was being read "
                           "by thread number %u", m_log_name, thd->thread_id());
         m_count++;
       }
@@ -3288,6 +3297,18 @@ stmt_has_updated_trans_table(Ha_trx_info* ha_list)
   for (ha_info= ha_list; ha_info; ha_info= ha_info->next())
   {
     if (ha_info->is_trx_read_write() && ha_info->ht() != binlog_hton)
+      return (TRUE);
+  }
+  return (FALSE);
+}
+
+bool
+trans_has_noop_dml(Ha_trx_info* ha_list)
+{
+  const Ha_trx_info *ha_info;
+  for (ha_info= ha_list; ha_info; ha_info= ha_info->next())
+  {
+    if (ha_info->is_trx_noop_read_write())
       return (TRUE);
   }
   return (FALSE);
@@ -4923,6 +4944,7 @@ bool MYSQL_BIN_LOG::find_first_log_not_in_gtid_set(char *binlog_file_name,
   error= 0;
   while (rit != filename_list.rend())
   {
+    binlog_previous_gtid_set.clear();
     const char *filename= rit->c_str();
     DBUG_PRINT("info", ("Read Previous_gtids_log_event from filename='%s'",
                         filename));
@@ -4959,14 +4981,13 @@ bool MYSQL_BIN_LOG::find_first_log_not_in_gtid_set(char *binlog_file_name,
     case TRUNCATED:
       break;
     }
-    binlog_previous_gtid_set.clear();
 
     rit++;
   }
 
   if (rit == filename_list.rend())
   {
-    *errmsg= ER(ER_MASTER_HAS_PURGED_REQUIRED_GTIDS);
+    report_missing_gtids(&binlog_previous_gtid_set, gtid_set, errmsg);
     error= -5;
   }
 
@@ -5663,7 +5684,10 @@ bool MYSQL_BIN_LOG::open_binlog(const char *log_name,
     At every rotate memorize the last transaction counter state to use it as
     offset at logging the transaction logical timestamps.
   */
+  mysql_mutex_lock(&LOCK_slave_trans_dep_tracker);
   m_dependency_tracker.rotate();
+  mysql_mutex_unlock(&LOCK_slave_trans_dep_tracker);
+
 #ifdef HAVE_REPLICATION
   close_purge_index_file();
 #endif
@@ -7688,7 +7712,11 @@ int MYSQL_BIN_LOG::new_file_impl(bool need_lock_log, Format_description_log_even
     close_on_error= TRUE;
     goto end;
   }
-  else
+  /*
+    Make sure that the log_file is initialized before writing
+    Rotate_log_event into it.
+  */
+  if (log_file.alloced_buffer)
   {
     /*
       We log the whole file name for log file as the user may decide
@@ -8595,7 +8623,36 @@ bool MYSQL_BIN_LOG::write_incident(Incident_log_event *ev, THD *thd,
     DBUG_RETURN(error);
 
   // @todo make this work with the group log. /sven
-  binlog_cache_mngr *const cache_mngr= thd_get_cache_mngr(thd);
+  binlog_cache_mngr *cache_mngr= thd_get_cache_mngr(thd);
+
+  /*
+    thd->cache_mngr may be uninitialized when first transaction resulted in an
+    incident. If there is no cache manager exists for the session, then we
+    create one, so that a GTID is generated and is written prior to flushing
+    the stmt_cache.
+  */
+  if (cache_mngr == NULL)
+  {
+    if (thd->binlog_setup_trx_data() ||
+        DBUG_EVALUATE_IF("simulate_cache_creation_failure", 1, 0))
+    {
+      enum_gtid_mode gtid_mode= get_gtid_mode(GTID_MODE_LOCK_NONE);
+      if (gtid_mode == GTID_MODE_ON || gtid_mode == GTID_MODE_ON_PERMISSIVE)
+      {
+        const char *mode= gtid_mode == GTID_MODE_ON ? "ON" : "ON_PERMISSIVE";
+        std::ostringstream message;
+
+        message << "Could not create IO cache while writing an incident event "
+                   "to the binary log for query: '"<< thd->query().str <<
+                   "'. Since GTID_MODE= " << mode <<", server is unable "
+                   "to proceed with logging.";
+        handle_binlog_flush_or_sync_error(thd, true, message.str().c_str());
+        DBUG_RETURN(true);
+      }
+    }
+    else
+      cache_mngr= thd_get_cache_mngr(thd);
+  }
 
 #ifndef DBUG_OFF
   if (DBUG_EVALUATE_IF("simulate_write_incident_event_into_binlog_directly",
@@ -8687,14 +8744,13 @@ bool MYSQL_BIN_LOG::write_incident(Incident_log_event *ev, THD *thd,
   DBUG_RETURN(error);
 }
 
-bool MYSQL_BIN_LOG::write_dml_directly(THD* thd, const char *stmt, size_t stmt_len)
+bool MYSQL_BIN_LOG::write_dml_directly(THD* thd, const char *stmt, size_t stmt_len,
+                                       enum_sql_command sql_command)
 {
   bool ret= false;
   /* backup the original command */
   enum_sql_command save_sql_command= thd->lex->sql_command;
-
-  /* Fake it as a DELETE statement, so it can be binlogged correctly */
-  thd->lex->sql_command= SQLCOM_DELETE;
+  thd->lex->sql_command= sql_command;
 
   if (thd->binlog_query(THD::STMT_QUERY_TYPE, stmt, stmt_len,
                         FALSE, FALSE, FALSE, 0) ||
@@ -9373,7 +9429,7 @@ TC_LOG::enum_result MYSQL_BIN_LOG::commit(THD *thd, bool all)
   if (all)
   {
     mysql_mutex_lock(&thd->LOCK_thd_data);
-    cache_mngr->binlog_info.log_file_name[0]= '\0';
+    cache_mngr->drop_consistent_snapshot();
     mysql_mutex_unlock(&thd->LOCK_thd_data);
   }
 
@@ -9608,6 +9664,10 @@ TC_LOG::enum_result MYSQL_BIN_LOG::commit(THD *thd, bool all)
       DBUG_RETURN(RESULT_ABORTED);
     }
 
+    int rc= prepare_ordered_commit(thd, all, skip_commit);
+    if (rc)
+      DBUG_RETURN(RESULT_INCONSISTENT);
+
     /*
       Block binlog updates if there's an active BINLOG lock.
 
@@ -9622,7 +9682,34 @@ TC_LOG::enum_result MYSQL_BIN_LOG::commit(THD *thd, bool all)
 
       DBUG_PRINT("debug", ("Acquiring binlog protection lock"));
 
+#ifdef HAVE_REPLICATION
+      DBUG_EXECUTE_IF("delay_slave_worker_0", {
+        if (has_commit_order_manager(thd))
+        {
+          Slave_worker *worker= dynamic_cast<Slave_worker *>(thd->rli_slave);
+
+          if (worker->id == 0)
+          {
+            static bool skip_first_query= true;
+            if (!skip_first_query)
+            {
+              static const char act[]= "now WAIT_FOR signal.lock_binlog_for_backup";
+              DBUG_ASSERT(!debug_sync_set_action(thd, STRING_WITH_LEN(act)));
+
+              static const char act2[]= "now SIGNAL finished_delay_slave_worker_0";
+              DBUG_ASSERT(opt_debug_sync_timeout > 0);
+              DBUG_ASSERT(!debug_sync_set_action(thd, STRING_WITH_LEN(act2)));
+
+              DBUG_SET("-d,delay_slave_worker_0");
+            }
+            skip_first_query= !skip_first_query;
+          }
+        }
+      });
+#endif /* HAVE_REPLICATION */
+
 #ifndef WITH_WSREP
+
       if (thd->backup_binlog_lock.acquire_protection(thd, MDL_EXPLICIT,
                                                      timeout))
 #else
@@ -9672,7 +9759,11 @@ TC_LOG::enum_result MYSQL_BIN_LOG::commit(THD *thd, bool all)
       binlog_prot_acquired= true;
     }
 
-    int rc= ordered_commit(thd, all, skip_commit);
+#ifdef WITH_WSREP
+    rc= ordered_commit(thd, all);
+#else
+    rc= ordered_commit(thd);
+#endif /* WITH_WSREP */
 
     if (binlog_prot_acquired)
     {
@@ -10237,17 +10328,22 @@ static inline int call_after_sync_hook(THD *queue_head)
                        > Indicates false if LOCK_log is already acquired
                          by the thread (happens when we are handling flush
                          error)
+  @param message Message stating the reason of the failure
 
   @return void
 */
 void MYSQL_BIN_LOG::handle_binlog_flush_or_sync_error(THD *thd,
-                                                      bool need_lock_log)
+                                                      bool need_lock_log,
+                                                      const char* message)
 {
-  char errmsg[MYSQL_ERRMSG_SIZE];
-  sprintf(errmsg, "An error occurred during %s stage of the commit. "
-          "'binlog_error_action' is set to '%s'.",
-          thd->commit_error== THD::CE_FLUSH_ERROR ? "flush" : "sync",
-          binlog_error_action == ABORT_SERVER ? "ABORT_SERVER" : "IGNORE_ERROR");
+  char errmsg[MYSQL_ERRMSG_SIZE]= {0};
+  if (!message)
+    sprintf(errmsg, "An error occurred during %s stage of the commit. "
+            "'binlog_error_action' is set to '%s'.",
+            thd->commit_error== THD::CE_FLUSH_ERROR ? "flush" : "sync",
+            binlog_error_action == ABORT_SERVER ? "ABORT_SERVER" : "IGNORE_ERROR");
+  else
+    strncpy(errmsg, message, MYSQL_ERRMSG_SIZE-1);
   if (binlog_error_action == ABORT_SERVER)
   {
     char err_buff[MYSQL_ERRMSG_SIZE + 27];
@@ -10282,8 +10378,17 @@ void MYSQL_BIN_LOG::handle_binlog_flush_or_sync_error(THD *thd,
       binlog_error_action=IGNORE_ERROR, clear the error
       and allow the commit to happen in storage engine.
     */
-    if (check_write_error(thd))
-      thd->clear_error();
+    if (check_write_error(thd)) { /* we have DA_ERROR */
+      thd->clear_error(); /* sets thd->get_stmt_da()->status() to DA_EMPTY */
+      /* For SQLCOM_COMMIT, ROLLBACK, ROLLBACK TO SAVEPOINT, there is already
+      my_ok() in mysql_execute_command. Doing double my_ok() is not allowed. So
+      we avoid that here */
+      if (thd_sql_command(thd) != SQLCOM_COMMIT &&
+          thd_sql_command(thd) != SQLCOM_ROLLBACK &&
+          thd_sql_command(thd) != SQLCOM_ROLLBACK_TO_SAVEPOINT) {
+        my_ok(thd); /* sets thd->get_stmt_da()->status() to DA_OK */
+      }
+    }
 
     if (need_lock_log)
       mysql_mutex_unlock(&LOCK_log);
@@ -10339,32 +10444,15 @@ void MYSQL_BIN_LOG::handle_binlog_flush_or_sync_error(THD *thd,
                be skipped (it is handled by the caller somehow) and @c
                false otherwise (the normal case).
  */
-int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit)
+int MYSQL_BIN_LOG::prepare_ordered_commit(THD *thd, bool all,
+                                          bool skip_commit)
 {
-  DBUG_ENTER("MYSQL_BIN_LOG::ordered_commit");
-  int flush_error= 0, sync_error= 0;
-  my_off_t total_bytes= 0;
-  bool do_rotate= false;
+  DBUG_ENTER("MYSQL_BIN_LOG::prepare_ordered_commit");
 
 #ifdef WITH_WSREP
+  /* While running in emulation mode avoid flushing binary logs. */
   if (WSREP_EMULATE_BINLOG(thd))
-  {
-    /*
-      Skip group commit, just do storage engine commit.
-    */
-    int rcode = ha_commit_low(thd, all);
-
-    /* if there is myisam statement inside innodb transaction, we may
-       have events in stmt cache
-    */
-    binlog_cache_mngr *const cache_mngr= thd_get_cache_mngr(thd);
-    if(!cache_mngr->stmt_cache.is_binlog_empty())
-    {
-      WSREP_DEBUG("stmt transaction inside MST, SQL: %s", WSREP_QUERY(thd));
-      cache_mngr->stmt_cache.reset();
-    }
-    DBUG_RETURN(rcode);
-  }
+    DBUG_RETURN(0);
 #endif /* WITH_WSREP */
 
   /*
@@ -10426,12 +10514,45 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit)
       thd->commit_error= THD::CE_COMMIT_ERROR;
       DBUG_RETURN(thd->commit_error);
     }
-
-    if (change_stage(thd, Stage_manager::FLUSH_STAGE, thd, NULL, &LOCK_log))
-      DBUG_RETURN(finish_commit(thd));
   }
-  else
 #endif
+
+  DBUG_RETURN(0); /* no error */
+}
+
+
+#ifdef WITH_WSREP
+int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all)
+#else
+int MYSQL_BIN_LOG::ordered_commit(THD *thd)
+#endif /* WITH_WSREP */
+{
+  DBUG_ENTER("MYSQL_BIN_LOG::ordered_commit");
+  int      flush_error= 0, sync_error= 0;
+  my_off_t total_bytes= 0;
+  bool     do_rotate= false;
+
+#ifdef WITH_WSREP
+  if (WSREP_EMULATE_BINLOG(thd))
+  {
+    /*
+      Skip group commit, just do storage engine commit.
+    */
+    int rcode = ha_commit_low(thd, all);
+
+    /* if there is myisam statement inside innodb transaction, we may
+       have events in stmt cache
+    */
+    binlog_cache_mngr *const cache_mngr= thd_get_cache_mngr(thd);
+    if(!cache_mngr->stmt_cache.is_binlog_empty())
+    {
+      WSREP_DEBUG("stmt transaction inside MST, SQL: %s", WSREP_QUERY(thd));
+      cache_mngr->stmt_cache.reset();
+    }
+    DBUG_RETURN(rcode);
+  }
+#endif /* WITH_WSREP */
+
   if (change_stage(thd, Stage_manager::FLUSH_STAGE, thd, NULL, &LOCK_log))
   {
     DBUG_PRINT("return", ("Thread ID: %u, commit_error: %d",
@@ -10496,7 +10617,7 @@ int MYSQL_BIN_LOG::ordered_commit(THD *thd, bool all, bool skip_commit)
     /*
       Handle flush error (if any) after leader finishes it's flush stage.
     */
-    handle_binlog_flush_or_sync_error(thd, false /* need_lock_log */);
+    handle_binlog_flush_or_sync_error(thd, false /* need_lock_log */, NULL);
   }
 
   publish_coordinates_for_global_status();
@@ -10625,7 +10746,7 @@ commit_stage:
     Handle sync error after we release all locks in order to avoid deadlocks
   */
   if (sync_error)
-    handle_binlog_flush_or_sync_error(thd, true /* need_lock_log */);
+    handle_binlog_flush_or_sync_error(thd, true /* need_lock_log */, NULL);
 
   /* Commit done so signal all waiting threads */
   stage_manager.signal_done(final_queue);
@@ -10884,7 +11005,6 @@ static void set_binlog_snapshot_file(const char *src)
           sizeof(binlog_snapshot_file) - 1);
 }
 
-
 /** Copy the current binlog coordinates to the variables used for the
 not-in-consistent-snapshot case of SHOW STATUS */
 void MYSQL_BIN_LOG::publish_coordinates_for_global_status(void) const
@@ -10946,6 +11066,165 @@ void MYSQL_BIN_LOG::xunlock(void)
   mysql_mutex_unlock(&LOCK_log);
 }
 
+void MYSQL_BIN_LOG::report_missing_purged_gtids(const Gtid_set* slave_executed_gtid_set,
+                                         const char** errmsg)
+{
+  DBUG_ENTER("MYSQL_BIN_LOG::report_missing_purged_gtids");
+  THD *thd= current_thd;
+  Gtid_set gtid_missing(gtid_state->get_lost_gtids()->get_sid_map());
+  gtid_missing.add_gtid_set(gtid_state->get_lost_gtids());
+  gtid_missing.remove_gtid_set(slave_executed_gtid_set);
+
+  String tmp_uuid;
+  uchar name[]= "slave_uuid";
+
+  /* Protects thd->user_vars. */
+  mysql_mutex_lock(&thd->LOCK_thd_data);
+  user_var_entry *entry=
+    (user_var_entry*) my_hash_search(&thd->user_vars, name, sizeof(name)-1);
+  if (entry && entry->length() > 0)
+    tmp_uuid.copy(entry->ptr(), entry->length(), NULL);
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
+
+
+  char* missing_gtids= NULL;
+  char* slave_executed_gtids= NULL;
+  gtid_missing.to_string(&missing_gtids, NULL);
+  slave_executed_gtid_set->to_string(&slave_executed_gtids, NULL);
+
+  /*
+     Log the information about the missing purged GTIDs to the error log
+     if the message is less than MAX_LOG_BUFFER_SIZE.
+  */
+  std::ostringstream log_info;
+  log_info << "The missing transactions are '"<< missing_gtids <<"'";
+  const char* log_msg= ER(ER_FOUND_MISSING_GTIDS);
+
+  /* Don't consider the "%s" in the format string. Subtract 2 from the
+     total length */
+  uint total_length= (strlen(log_msg) - 2 + log_info.str().length());
+
+  DBUG_EXECUTE_IF("simulate_long_missing_gtids",
+                  { total_length= MAX_LOG_BUFFER_SIZE + 1;});
+
+  if (total_length > MAX_LOG_BUFFER_SIZE)
+    log_info.str("To find the missing purged transactions, run \"SELECT"
+                 " @@GLOBAL.GTID_PURGED\" on the master, then run \"SELECT"
+                 " CONCAT(RECEIVED_TRANSACTION_SET, ',', @@GLOBAL.GTID_EXECUTED)"
+                 " FROM PERFORMANCE_SCHEMA.replication_connection_status\" on"
+                 " the slave, and then run \"SELECT GTID_SUBTRACT(<master_set>,"
+                 " <slave_set>)\" on any server");
+
+  sql_print_warning(ER_THD(thd, ER_FOUND_MISSING_GTIDS), tmp_uuid.ptr(),
+                    log_info.str().c_str());
+
+  /*
+     Send the information about the slave executed GTIDs and missing
+     purged GTIDs to slave if the message is less than MYSQL_ERRMSG_SIZE.
+  */
+  std::ostringstream gtid_info;
+  gtid_info << "The GTID set sent by the slave is '" << slave_executed_gtids
+            << "', and the missing transactions are '"<< missing_gtids <<"'";
+  *errmsg= ER_THD(thd, ER_MASTER_HAS_PURGED_REQUIRED_GTIDS);
+
+  /* Don't consider the "%s" in the format string. Subtract 2 from the
+     total length */
+  total_length= (strlen(*errmsg) - 2 + gtid_info.str().length());
+
+  DBUG_EXECUTE_IF("simulate_long_missing_gtids",
+                  { total_length= MYSQL_ERRMSG_SIZE + 1;});
+
+  if (total_length > MYSQL_ERRMSG_SIZE)
+    gtid_info.str("The GTID sets and the missing purged transactions are too"
+                  " long to print in this message. For more information,"
+                  " please see the master's error log or the manual for"
+                  " GTID_SUBTRACT");
+
+  /* Buffer for formatting the message about the missing GTIDs. */
+  static char buff[MYSQL_ERRMSG_SIZE];
+  my_snprintf(buff, MYSQL_ERRMSG_SIZE, *errmsg, gtid_info.str().c_str());
+  *errmsg= const_cast<const char*>(buff);
+
+  my_free(missing_gtids);
+  my_free(slave_executed_gtids);
+  DBUG_VOID_RETURN;
+}
+
+void MYSQL_BIN_LOG::report_missing_gtids(const Gtid_set* previous_gtid_set,
+                                         const Gtid_set* slave_executed_gtid_set,
+                                         const char** errmsg)
+{
+  DBUG_ENTER("MYSQL_BIN_LOG::report_missing_gtids");
+  THD *thd=current_thd;
+  char* missing_gtids= NULL;
+  char* slave_executed_gtids= NULL;
+  Gtid_set gtid_missing(slave_executed_gtid_set->get_sid_map());
+  gtid_missing.add_gtid_set(slave_executed_gtid_set);
+  gtid_missing.remove_gtid_set(previous_gtid_set);
+  gtid_missing.to_string(&missing_gtids, NULL);
+  slave_executed_gtid_set->to_string(&slave_executed_gtids, NULL);
+
+  String tmp_uuid;
+  uchar name[]= "slave_uuid";
+
+  /* Protects thd->user_vars. */
+  mysql_mutex_lock(&thd->LOCK_thd_data);
+
+  user_var_entry *entry=
+    (user_var_entry*) my_hash_search(&thd->user_vars, name, sizeof(name)-1);
+  if (entry && entry->length() > 0)
+    tmp_uuid.copy(entry->ptr(), entry->length(), NULL);
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
+
+  /*
+     Log the information about the missing purged GTIDs to the error log
+     if the message is less than MAX_LOG_BUFFER_SIZE.
+  */
+  std::ostringstream log_info;
+  log_info << "If the binary log files have been deleted from disk,"
+      " check the consistency of 'GTID_PURGED' variable."
+      " The missing transactions are '"<< missing_gtids <<"'";
+  const char* log_msg= ER(ER_FOUND_MISSING_GTIDS);
+
+  /* Don't consider the "%s" in the format string. Subtract 2 from the
+     total length */
+  if ((strlen(log_msg) - 2 + log_info.str().length()) > MAX_LOG_BUFFER_SIZE)
+    log_info.str("To find the missing purged transactions, run \"SELECT"
+                 " @@GLOBAL.GTID_PURGED\" on the master, then run \"SELECT"
+                 " CONCAT(RECEIVED_TRANSACTION_SET, ',', @@GLOBAL.GTID_EXECUTED)"
+                 " FROM PERFORMANCE_SCHEMA.replication_connection_status\" on"
+                 " the slave, and then run \"SELECT GTID_SUBTRACT(<master_set>,"
+                 " <slave_set>)\" on any server");
+
+  sql_print_warning(ER_THD(thd, ER_FOUND_MISSING_GTIDS), tmp_uuid.ptr(),
+                    log_info.str().c_str());
+
+  /*
+     Send the information about the slave executed GTIDs and missing
+     purged GTIDs to slave if the message is less than MYSQL_ERRMSG_SIZE.
+  */
+  std::ostringstream gtid_info;
+  gtid_info << "The GTID set sent by the slave is '" << slave_executed_gtids
+            << "', and the missing transactions are '"<< missing_gtids <<"'";
+  *errmsg= ER_THD(thd, ER_MASTER_HAS_PURGED_REQUIRED_GTIDS);
+
+  /* Don't consider the "%s" in the format string. Subtract 2 from the
+     total length */
+  if ((strlen(*errmsg) - 2 + gtid_info.str().length()) > MYSQL_ERRMSG_SIZE)
+    gtid_info.str("The GTID sets and the missing purged transactions are too"
+                  " long to print in this message. For more information,"
+                  " please see the master's error log or the manual for"
+                  " GTID_SUBTRACT");
+  /* Buffer for formatting the message about the missing GTIDs. */
+  static char buff[MYSQL_ERRMSG_SIZE];
+  my_snprintf(buff, MYSQL_ERRMSG_SIZE, *errmsg, gtid_info.str().c_str());
+  *errmsg= const_cast<const char*>(buff);
+
+  my_free(missing_gtids);
+  my_free(slave_executed_gtids);
+
+  DBUG_VOID_RETURN;
+}
 
 bool THD::is_binlog_cache_empty(bool is_transactional)
 {
@@ -13360,19 +13639,23 @@ int wsrep_thd_binlog_rollback(THD* thd, bool all)
 }
 #endif /* WITH_WSREP */
 
-static int show_binlog_vars(THD *thd, SHOW_VAR *var, char *buff)
+static const binlog_cache_mngr *get_cache_mngr(THD *thd)
 {
-  mysql_mutex_assert_owner(&LOCK_status);
-
   const binlog_cache_mngr *cache_mngr
     = (thd && opt_bin_log)
     ? static_cast<binlog_cache_mngr *>(thd_get_ha_data(thd, binlog_hton))
     : NULL;
 
-  const bool have_snapshot= (cache_mngr &&
-                       cache_mngr->binlog_info.log_file_name[0] != '\0');
+  return cache_mngr;
+}
 
-  if (have_snapshot)
+static int show_binlog_vars(THD *thd, SHOW_VAR *var, char *buff)
+{
+  mysql_mutex_assert_owner(&LOCK_status);
+
+  const binlog_cache_mngr *cache_mngr= get_cache_mngr(thd);
+
+  if (cache_mngr && cache_mngr->has_consistent_snapshot())
   {
     set_binlog_snapshot_file(cache_mngr->binlog_info.log_file_name);
     binlog_snapshot_position= cache_mngr->binlog_info.pos;
@@ -13387,15 +13670,43 @@ static int show_binlog_vars(THD *thd, SHOW_VAR *var, char *buff)
     binlog_snapshot_file[0]= '\0';
     binlog_snapshot_position= 0;
   }
+
   var->type= SHOW_ARRAY;
   var->value= (char *)&binlog_status_vars_detail;
   return 0;
 }
 
+static int show_binlog_snapshot_gtid_executed(THD *thd, SHOW_VAR *var,
+                                              char *buff)
+{
+  mysql_mutex_assert_owner(&LOCK_status);
+
+  const binlog_cache_mngr *cache_mngr= get_cache_mngr(thd);
+
+  if (cache_mngr && cache_mngr->has_consistent_snapshot())
+  {
+    binlog_snapshot_gtid_executed= cache_mngr->snapshot_gtid_executed;
+  }
+  else if (mysql_bin_log.is_open())
+  {
+    binlog_snapshot_gtid_executed= "not-in-consistent-snapshot";
+  }
+  else
+  {
+    binlog_snapshot_gtid_executed.clear();
+  }
+
+  var->type= SHOW_CHAR;
+  var->value= const_cast<char *>(binlog_snapshot_gtid_executed.c_str());
+  return 0;
+}
+
 static SHOW_VAR binlog_status_vars_top[]= {
-  {"Binlog", (char *) &show_binlog_vars, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
-  {NullS, NullS, SHOW_LONG, SHOW_SCOPE_GLOBAL}
-};
+    {"Binlog", (char *)&show_binlog_vars, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
+    {"Binlog_snapshot_gtid_executed",
+     (char *)&show_binlog_snapshot_gtid_executed, SHOW_FUNC,
+     SHOW_SCOPE_GLOBAL},
+    {NullS, NullS, SHOW_LONG, SHOW_SCOPE_GLOBAL}};
 
 struct st_mysql_storage_engine binlog_storage_engine=
 { MYSQL_HANDLERTON_INTERFACE_VERSION };

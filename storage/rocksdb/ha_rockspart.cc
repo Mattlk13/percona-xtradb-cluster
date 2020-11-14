@@ -70,15 +70,13 @@ handler *ha_rockspart::clone(const char *name, MEM_ROOT *mem_root) {
 
   DBUG_ENTER("ha_rockspart::clone");
 
-  /* If this->table == nullptr, then the current handler has been created but not
-  opened. Prohibit cloning such handler. */
-  if (!table)
-    DBUG_RETURN(nullptr);
+  /* If this->table == nullptr, then the current handler has been created but
+  not opened. Prohibit cloning such handler. */
+  if (!table) DBUG_RETURN(nullptr);
 
   new_handler =
       new (mem_root) ha_rockspart(ht, table_share, m_part_info, this, mem_root);
-  if (!new_handler)
-    DBUG_RETURN(nullptr);
+  if (!new_handler) DBUG_RETURN(nullptr);
 
   /*
     Allocate new_handler->ref here because otherwise ha_open will allocate it
@@ -116,4 +114,11 @@ ulong ha_rockspart::index_flags(uint idx, uint part, bool all_parts) const {
 const char **ha_rockspart::bas_ext() const {
   static const char *null_ext = nullptr;
   return &null_ext;
+}
+
+/** Get partition row type
+@param[in] Id of partition for which row type to be retrieved
+@return Partition row type */
+enum row_type ha_rockspart::get_partition_row_type(uint part_id) {
+  return get_row_type();
 }

@@ -1,14 +1,20 @@
 /* Copyright (c) 2011, 2019, Oracle and/or its affiliates. All rights reserved.
 
-   This program is free software; you can redistribute it and/or
-   modify it under the terms of the GNU General Public License as
-   published by the Free Software Foundation; version 2 of the
-   License.
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
 
-   This program is distributed in the hope that it will be useful, but
-   WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-   General Public License for more details.
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -21,6 +27,9 @@
 #include "sql_class.h"             // THD
 #include "debug_sync.h"            // DEBUG_SYNC
 #include "binlog.h"
+#include "rpl_group_replication.h" // is_group_replication_plugin_loaded()
+
+#include <vector>
 
 PSI_memory_key key_memory_Gtid_state_group_commit_sidno;
 
@@ -142,6 +151,16 @@ void Gtid_state::broadcast_owned_sidnos(const THD *thd)
   }
 }
 
+void Gtid_state::get_snapshot_gtid_executed(
+    std::string &snapshot_gtid_executed)
+{
+  global_sid_lock->wrlock();
+  size_t size= executed_gtids.get_string_length() + 1;
+  std::vector<char> buf(size);
+  executed_gtids.to_string(buf.data());
+  snapshot_gtid_executed= buf.data();
+  global_sid_lock->unlock();
+}
 
 void Gtid_state::update_commit_group(THD *first_thd)
 {
@@ -289,8 +308,7 @@ bool Gtid_state::wait_for_sidno(THD *thd, rpl_sidno sidno,
   sid_locks.enter_cond(thd, sidno,
                        &stage_waiting_for_gtid_to_be_committed,
                        &old_stage);
-  bool ret= (thd->killed != THD::NOT_KILLED ||
-             sid_locks.wait(thd, sidno, abstime));
+  bool ret= sid_locks.wait(thd, sidno, abstime);
   // Can't call sid_locks.unlock() as that requires global_sid_lock.
   mysql_mutex_unlock(thd->current_mutex);
   thd->EXIT_COND(&old_stage);
@@ -528,12 +546,14 @@ enum_return_status Gtid_state::generate_automatic_gtid(THD *thd,
     Gtid automatic_gtid= { specified_sidno, specified_gno };
 
 #ifdef WITH_WSREP
-    /* If the trx has been executed in wsrep then get wsrep_sidno
-    and not the normal server_sid no. */
-    if (WSREP(thd) && thd->wsrep_trx_meta.gtid.seqno != -1 &&
+    /* If the trx has been executed in wsrep then get wsrep_sidno and not the
+     * normal server_sidno. Retain the same sidno if group_replication is
+     * loaded on to the server */
+    if (!is_group_replication_plugin_loaded() && WSREP(thd) &&
+        thd->wsrep_trx_meta.gtid.seqno != -1 &&
         !thd->wsrep_skip_wsrep_GTID)
       automatic_gtid.sidno= wsrep_sidno;
-    else
+    else if (automatic_gtid.sidno == 0)
       automatic_gtid.sidno= get_server_sidno();
 #else
     if (automatic_gtid.sidno == 0)

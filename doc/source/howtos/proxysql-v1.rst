@@ -1,4 +1,4 @@
-.. orphan::
+:orphan:
 
 Using ProxySQL v1 with ``proxysql-admin``
 ================================================================================
@@ -89,14 +89,14 @@ To view usage information, run ``proxysql-admin`` without any options:
                                       This option is supported only when using --mode=singlewrite
                                       Can accept comma delimited list with the first listed being
                                       the highest priority.
-   --include-slaves=host_name:port    Add specified slave node(s) to ProxySQL, these nodes will go
+   --include-slaves=host_name:port    Add specified replica node(s) to ProxySQL, these nodes will go
                                       into the reader hostgroup and will only be put into
                                       the writer hostgroup if all cluster nodes are down (this
                                       depends on the value of --use-slave-as-writer).
-                                      Slaves must be read only.  Can accept a comma delimited list.
-                                      If this is used make sure 'read_only=1' is in the slave's my.cnf
-   --use-slave-as-writer=<yes/no>     If this value is 'yes', then a slave may be used as a writer
-                                      if the entire cluster is down. If 'no', then a slave
+                                      Replicas must be read only.  Can accept a comma delimited list.
+                                      If this is used make sure 'read_only=1' is in the replica's my.cnf
+   --use-slave-as-writer=<yes/no>     If this value is 'yes', then a replica may be used as a writer
+                                      if the entire cluster is down. If 'no', then a replica
                                       will not be used as a writer. This option is required
                                       if '--include-slaves' is used.
    --writer-is-reader=<value>         Defines if the writer node also accepts writes.
@@ -204,18 +204,22 @@ The ``proxysql-admin`` tool will do the following:
   which checks cluster node membership
   and re-configures ProxySQL if the membership changes.
 
-* Create two new |PXC| users with the ``USAGE`` privilege on the node
-  and add them to ProxySQL configuration, if they are not already configured.
-  ProxySQL uses one user for monitoring cluster nodes,
-  and the other one is used for communicating with the cluster.
+* Create two new |PXC| users with the ``USAGE`` privilege on the node and add
+  them to ProxySQL configuration, if they are not already configured.  ProxySQL
+  uses one user for monitoring cluster nodes, and the other one is used for
+  communicating with the cluster. Make sure to use super user credentials
+  from Cluster to setup the default users.
 
-.. note::
+.. warning::
 
-Does this mean that we should give super user credentials to these users? What is meant by 'default' users.
+   Running more then one copy of ``proxysql_galera_check`` in the same runtime
+   environment simultaneously is not supported and may lead to undefined
+   behavior.
 
-
-   Please make sure to use super user credentials from Cluster
-   to setup the default users.
+   To avoid this problem, Galera process identification prevents a duplicate
+   script execution in most cases. However, in some rare cases, it may be
+   possible to circumvent this check if you run more then one copy of
+   ``proxysql_galera_check``.
 
 The following example shows how to add a |PXC| node
 using the ProxySQL configuration file
@@ -224,38 +228,61 @@ with all necessary connection and authentication information:
 .. code-block:: bash
 
    $ proxysql-admin --config-file=/etc/proxysql-admin.cnf --enable
+
+.. admonition:: Output
+
+   .. code-block:: text
    
-   This script will assist with configuring ProxySQL for use with
-   Percona XtraDB Cluster (currently only PXC in combination
-   with ProxySQL is supported)
+      This script will assist with configuring ProxySQL for use with
+      Percona XtraDB Cluster (currently only PXC in combination with ProxySQL is supported)
    
-   ProxySQL read/write configuration mode is singlewrite
+      ProxySQL read/write configuration mode is singlewrite
    
-   Configuring the ProxySQL monitoring user.
-   ProxySQL monitor user name as per command line/config-file is monitor
+      Configuring the ProxySQL monitoring user.  ProxySQL monitor user name as per
+      command line/config-file is monitor
    
-   User 'monitor'@'127.%' has been added with USAGE privileges
+      User 'monitor'@'127.%' has been added with USAGE privileges
    
-   Configuring the Percona XtraDB Cluster application user to connect through ProxySQL
-   Percona XtraDB Cluster application user name as per command line/config-file is proxysql_user
+      Configuring the Percona XtraDB Cluster application user to connect through ProxySQL
+      Percona XtraDB Cluster application user name as per command line/config-file is proxysql_user
    
-   Percona XtraDB Cluster application user 'proxysql_user'@'127.%' has been added with ALL privileges, this user is created for testing purposes
-   Adding the Percona XtraDB Cluster server nodes to ProxySQL
+      Percona XtraDB Cluster application user 'proxysql_user'@'127.%' has been added with ALL privileges, this user is created for testing purposes
+      Adding the Percona XtraDB Cluster server nodes to ProxySQL
    
-   Write node info
-   +-----------+--------------+-------+--------+
-   | hostname  | hostgroup_id | port  | weight |
-   +-----------+--------------+-------+--------+
-   | 127.0.0.1 | 10           | 26100 | 1000   |
-   +-----------+--------------+-------+--------+
+      Write node info
+
+      +-----------+--------------+-------+--------+
+      | hostname  | hostgroup_id | port  | weight |
+      +-----------+--------------+-------+--------+
+      | 127.0.0.1 | 10           | 26100 | 1000   |
+      +-----------+--------------+-------+--------+
    
-   ProxySQL configuration completed!
+      ProxySQL configuration completed!
    
-   ProxySQL has been successfully configured to use with Percona XtraDB Cluster
+      ProxySQL has been successfully configured to use with Percona XtraDB Cluster
    
-   You can use the following login credentials to connect your application through ProxySQL
+      You can use the following login credentials to connect your application through ProxySQL
    
-   mysql --user=proxysql_user -p --host=localhost --port=6033 --protocol=tcp
+      $ mysql --user=proxysql_user -p --host=localhost --port=6033 --protocol=tcp
+
+.. code-block:: mysql
+
+   mysql> select hostgroup_id,hostname,port,status,comment from mysql_servers;
+
+.. admonition:: Output
+
+   .. code-block:: text
+
+      +--------------+-----------+-------+--------+---------+
+      | hostgroup_id | hostname  | port  | status | comment |
+      +--------------+-----------+-------+--------+---------+
+      | 11           | 127.0.0.1 | 25400 | ONLINE | READ    |
+      | 10           | 127.0.0.1 | 25000 | ONLINE | WRITE   |
+      | 11           | 127.0.0.1 | 25100 | ONLINE | READ    |
+      | 11           | 127.0.0.1 | 25200 | ONLINE | READ    |
+      | 11           | 127.0.0.1 | 25300 | ONLINE | READ    |
+      +--------------+-----------+-------+--------+---------+
+      5 rows in set (0.00 sec)
    
 Disabling ProxySQL
 ------------------
@@ -450,13 +477,13 @@ The following extra options can be used:
 
 * ``--include-slaves=host_name:port``
 
-  This option helps to include specified slave node(s) to ProxySQL database.
+  This option helps to include specified replica node(s) to ProxySQL database.
   These nodes will go into the reader hostgroup and will only be put into the
-  writer hostgroup if all cluster nodes are down. Slaves must be read only. Can
+  writer hostgroup if all cluster nodes are down. Replicas must be read only. Can
   accept comma delimited list. If this is used, make sure ``read_only=1`` is
-  included into the slave's ``my.cnf`` configuration file.
+  included into the replica's ``my.cnf`` configuration file.
 
-  .. note:: With ``loadbal`` mode slave hosts only accept read/write requests
+  .. note:: With ``loadbal`` mode replica hosts only accept read/write requests
      when all cluster nodes are down.
 
 ProxySQL Status script
