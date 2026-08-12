@@ -3,10 +3,12 @@ create table t2 (variable_name text);
 load data infile "MYSQLTEST_VARDIR/tmp/sys_vars.all_vars.txt" into table t1;
 insert into t2 select variable_name from information_schema.global_variables
 where variable_name not like 'innodb_disallow_writes'
-  and   variable_name not like '%pxc_%';
+  and   variable_name not like '%pxc_%'
+  and   variable_name not like 'wsrep_start_position';
 insert into t2 select variable_name from information_schema.session_variables
 where variable_name not like 'innodb_disallow_writes'
-  and   variable_name not like '%pxc_%';
+  and   variable_name not like '%pxc_%'
+  and   variable_name not like 'wsrep_start_position';
 update t2 set variable_name= replace(variable_name, "PERFORMANCE_SCHEMA_", "PFS_");
 update t2 set variable_name= replace(variable_name, "_HISTORY_LONG_", "_HL_");
 update t2 set variable_name= replace(variable_name, "_HISTORY_", "_H_");
@@ -21,7 +23,13 @@ DISABLED_STORAGE_ENGINES
 DISABLED_STORAGE_ENGINES
 KEYRING_OPERATIONS
 KEYRING_OPERATIONS
+REPLICATION_OPTIMIZE_FOR_STATIC_PLUGIN_CONFIG
+REPLICATION_OPTIMIZE_FOR_STATIC_PLUGIN_CONFIG
+REPLICATION_SENDER_OBSERVE_COMMIT_ONLY
+REPLICATION_SENDER_OBSERVE_COMMIT_ONLY
 TLS_VERSION
 TLS_VERSION
+WSREP_MODE
+WSREP_MODE
 drop table t1;
 drop table t2;

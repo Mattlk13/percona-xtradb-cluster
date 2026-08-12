@@ -1,13 +1,20 @@
-# Copyright (c) 2009, 2017, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2023, Oracle and/or its affiliates.
 # 
 # This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; version 2 of the License.
+# it under the terms of the GNU General Public License, version 2.0,
+# as published by the Free Software Foundation.
+#
+# This program is also distributed with certain software (including
+# but not limited to OpenSSL) that is licensed under separate terms,
+# as designated in a particular file or component or in included license
+# documentation.  The authors of MySQL hereby grant you an additional
+# permission to link the program and your derivative works with the
+# separately licensed software that they have included with MySQL.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU General Public License, version 2.0, for more details.
 #
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
@@ -29,6 +36,7 @@ SET(CMAKE_GENERATOR "@CMAKE_GENERATOR@")
 SET(CMAKE_MAKE_PROGRAM "@CMAKE_MAKE_PROGRAM@")
 SET(CMAKE_SYSTEM_NAME "@CMAKE_SYSTEM_NAME@")
 SET(BUILD_IS_SINGLE_CONFIG "@BUILD_IS_SINGLE_CONFIG@")
+SET(WITH_WSREP "@WITH_WSREP@")
 
 SET(VERSION "@VERSION@")
 
@@ -57,31 +65,55 @@ IF(GIT_EXECUTABLE)
   ENDIF()
 ENDIF()
 
-IF(GIT_EXECUTABLE)
-  MESSAGE(STATUS "Running git archive -o ${PACKAGE_DIR}.tar")
-  EXECUTE_PROCESS(
-    COMMAND "${GIT_EXECUTABLE}" archive --format=tar
-    --prefix=${CPACK_SOURCE_PACKAGE_FILE_NAME}/ -o ${PACKAGE_DIR}.tar HEAD
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    RESULT_VARIABLE RESULT
-  )
-  IF(NOT RESULT EQUAL 0)
-    SET(GIT_EXECUTABLE)
-  ELSE()
-    # Unpack tarball
+# this code is to checkout current revision (not just HEAD)
+# with all submodules and create complete source tarball
+IF(WITH_WSREP)
+  IF(GIT_EXECUTABLE)
+    MESSAGE(STATUS "Running git checkout-index")
     EXECUTE_PROCESS(
-      COMMAND ${CMAKE_COMMAND} -E tar xf ${PACKAGE_DIR}.tar
-      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-      RESULT_VARIABLE TAR_RESULT
+      COMMAND "${GIT_EXECUTABLE}" checkout-index --all --prefix=${PACKAGE_DIR}/
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      RESULT_VARIABLE RESULT
     )
-    IF(NOT TAR_RESULT EQUAL 0)
+    IF(NOT RESULT EQUAL 0)
+      SET(GIT_EXECUTABLE)
+    ENDIF()
+    EXECUTE_PROCESS(
+      COMMAND "${GIT_EXECUTABLE}" submodule foreach "${GIT_EXECUTABLE} checkout-index --all --prefix=${PACKAGE_DIR}/$path/"
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      RESULT_VARIABLE RESULT
+    )
+    IF(NOT RESULT EQUAL 0)
+      SET(GIT_EXECUTABLE)
+    ENDIF()
+  ENDIF()
+ELSE()
+  IF(GIT_EXECUTABLE)
+    MESSAGE(STATUS "Running git archive -o ${PACKAGE_DIR}.tar")
+    EXECUTE_PROCESS(
+      COMMAND "${GIT_EXECUTABLE}" archive --format=tar
+      --prefix=${CPACK_SOURCE_PACKAGE_FILE_NAME}/ -o ${PACKAGE_DIR}.tar HEAD
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+      RESULT_VARIABLE RESULT
+    )
+    IF(NOT RESULT EQUAL 0)
       SET(GIT_EXECUTABLE)
     ELSE()
-      # Remove tarball after unpacking
+      # Unpack tarball
       EXECUTE_PROCESS(
-        COMMAND ${CMAKE_COMMAND} -E remove ${PACKAGE_DIR}.tar
+        COMMAND ${CMAKE_COMMAND} -E tar xf ${PACKAGE_DIR}.tar
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        RESULT_VARIABLE TAR_RESULT
       )
+      IF(NOT TAR_RESULT EQUAL 0)
+        SET(GIT_EXECUTABLE)
+      ELSE()
+        # Remove tarball after unpacking
+        EXECUTE_PROCESS(
+          COMMAND ${CMAKE_COMMAND} -E remove ${PACKAGE_DIR}.tar
+          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        )
+      ENDIF()
     ENDIF()
   ENDIF()
 ENDIF()
@@ -203,7 +235,7 @@ SET($ENV{GZIP} "--best")
 
 IF(GNUTAR)
   SET(PACK_COMMAND 
-  ${GNUTAR} cfz 
+  ${GNUTAR} --exclude-vcs --owner=0 --group=0 -czf 
   ${CPACK_SOURCE_PACKAGE_FILE_NAME}.tar.gz 
   ${CPACK_SOURCE_PACKAGE_FILE_NAME}
   )
@@ -214,7 +246,8 @@ ELSE()
 )
 ENDIF()
 
-MESSAGE(STATUS "Creating source package")
+STRING(REPLACE ";" " " PACK_COMMAND_STRING "${PACK_COMMAND}")
+MESSAGE(STATUS "Creating source package with ${PACK_COMMAND_STRING}")
 
 EXECUTE_PROCESS( 
   COMMAND ${PACK_COMMAND}

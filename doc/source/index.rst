@@ -4,50 +4,45 @@
 Percona XtraDB Cluster |version| Documentation
 ==============================================
 
-|PXC|_ is a database clustering solution for MySQL.
+Percona XtraDB Cluster is a database clustering solution for MySQL.
 It ensures high availability, prevents downtime and data loss,
 and provides linear scalability for a growing environment.
 
-Features of |PXC| include:
+Features of Percona XtraDB Cluster include:
 
-* **Synchronous replication**
+`Synchronous replication <Database replication>`
+   Data is written to all nodes simultaneously,
+   or not written at all if it fails even on a single node.
 
-  Data is written to all nodes simultaneously,
-  or not written at all if it fails even on a single node.
+`Multi-source replication`
+   Any node can trigger a data update.
 
-* **Multi-master replication**
+`True parallel replication <Database replication>`
+   Multiple threads on slave performing replication on row level.
 
-  Any node can trigger a data update.
+Automatic node provisioning**
+   You simply add a `node` and it automatically syncs.
 
-* **True parallel replication**
+Data consistency
+   Percona XtraDB Cluster ensures that data is automatically synchronized on all
+   `nodes <Node>` in your cluster.
 
-  Multiple threads on slave performing replication on row level.
+:ref:`pxc-strict-mode`
+   Avoids the use of experimental and unsupported features.
 
-* **Automatic node provisioning**
 
-  You simply add a node and it automatically syncs.
+Configuration script for ProxySQL
+  Percona provides a ProxySQL package with the ``proxysql-admin``
+  tool that automatically configures Percona XtraDB Cluster nodes.
 
-* **Data consistency**
+  .. seealso:: :ref:`load_balancing_with_proxysql`
 
-  No more unsynchronized nodes.
+Automatic configuration of SSL encryption
+  Percona XtraDB Cluster includes the ``pxc-encrypt-cluster-traffic`` variable
+  that enables automatic configuration of SSL encryption.
 
-* **PXC Strict Mode**
-
-  Avoids the use of experimental and unsupported features.
-
-* **Configuration script for ProxySQL**
-
-  Percona provides a ProxySQL package with the ``proxysql-admin`` tool
-  that automatically configures |PXC| nodes.
-
-* **Automatic configuration of SSL encryption**
-
-  |PXC| includes the ``pxc-encrypt-cluster-traffic`` variable
-  that enables automatic configuration of SSL encrytion.
-
-* **Optimized Performance**
-
-  |PXC| performance is optimized to scale with a growing production workload.
+Optimized Performance
+  Percona XtraDB Cluster performance is optimized to scale with a growing production workload.
 
   For more information, see the following blog posts:
 
@@ -57,14 +52,9 @@ Features of |PXC| include:
   * `Performance improvements in Percona XtraDB Cluster 5.7.17-29.20
     <https://www.percona.com/blog/2017/04/19/performance-improvements-percona-xtradb-cluster-5-7-17/>`_
 
-|PXC| is fully compatible with `MySQL Server Community Edition <MySQL>`_,
-|PS|_, and MariaDB_ in the following sense:
-
-* **Data compatibility**:
-  You can use data created by any MySQL variant.
-
-* **Application compatibility**:
-  There is no or minimal application changes required.
+Percona XtraDB Cluster is fully compatible with `MySQL Server Community Edition
+<MySQL>`_, |PS|_, and MariaDB_. It provides a robust application
+compatibility: there is no or minimal application changes required.
 
 Introduction
 ============
@@ -135,11 +125,21 @@ Flexibility
 
 .. toctree::
    :maxdepth: 1
-   
+
    flexibility/binlogging_replication_improvements
    flexibility/innodb_fts_improvements
-   diagnostics/innodb_fragmentation_count
    performance/aio_page_requests
+
+Diagnostics
+============================================================================
+
+.. toctree::
+   :maxdepth: 1
+
+   diagnostics/innodb_fragmentation_count
+   diagnostics/libcoredumper
+   diagnostics/stacktrace
+   
 
 How-tos
 =======
@@ -149,6 +149,7 @@ How-tos
    :glob:
 
    howtos/upgrade_guide
+   howtos/crash-recovery
    howtos/centos_howto
    howtos/ubuntu_howto
    howtos/garbd_howto
@@ -175,4 +176,3 @@ Reference
 
 * :ref:`genindex`
 * :ref:`search`
-

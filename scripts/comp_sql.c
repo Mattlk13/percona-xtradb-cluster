@@ -1,4 +1,4 @@
-/* Copyright (c) 2004, 2014, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2004, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -79,7 +79,8 @@ static void print_query(FILE *out, const char *query)
   fprintf(out, "\"");
   while (*ptr)
   {
-    if (column >= 120)
+    /* utf-8 encoded characters are always >= 0x80 for unsigned char  */
+    if ((column >= 120) && (*(unsigned char*)ptr < (unsigned char)0x80))
     {
       /* Wrap to the next line, tabulated. */
       fprintf(out, "\"\n  \"");

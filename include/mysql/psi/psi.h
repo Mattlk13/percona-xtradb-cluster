@@ -1,13 +1,20 @@
-/* Copyright (c) 2008, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2008, 2023, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation; version 2 of the License.
+  it under the terms of the GNU General Public License, version 2.0,
+  as published by the Free Software Foundation.
+
+  This program is also distributed with certain software (including
+  but not limited to OpenSSL) that is licensed under separate terms,
+  as designated in a particular file or component or in included license
+  documentation.  The authors of MySQL hereby grant you an additional
+  permission to link the program and your derivative works with the
+  separately licensed software that they have included with MySQL.
 
   This program is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
+  GNU General Public License, version 2.0, for more details.
 
   You should have received a copy of the GNU General Public License
   along with this program; if not, write to the Free Software Foundation,
@@ -1642,10 +1649,30 @@ typedef void (*set_connection_type_v1_t)(opaque_vio_type conn_type);
 
 
 /**
-  Assign a start time to the instrumented thread.
+  Assign a start time in seconds to the instrumented thread.
   @param start_time the thread start time
 */
 typedef void (*set_thread_start_time_v1_t)(time_t start_time);
+
+/**
+  Assign a start time in micro seconds to the instrumented thread.
+  @param start_time_usec the thread start time in micro seconds
+*/
+typedef void (*set_thread_start_time_usec_v1_t)(
+    unsigned long long start_time_usec);
+
+/**
+  Assign a sent rows count to the instrumented thread.
+  @param rows_sent the thread sent rows count
+*/
+typedef void (*set_thread_rows_sent_v1_t)(unsigned long long rows_sent);
+
+/**
+  Assign an examined rows count to the instrumented thread.
+  @param rows_examined the thread examined rows count
+*/
+typedef void (*set_thread_rows_examined_v1_t)(
+    unsigned long long rows_examined);
 
 /**
   Assign a state to the instrumented thread.
@@ -1670,6 +1697,15 @@ typedef void (*set_thread_info_v1_t)(const char* info, uint info_len);
   @param thread the thread instrumentation
 */
 typedef void (*set_thread_v1_t)(struct PSI_thread *thread);
+
+/**
+  Assign the remote (peer) port to the instrumented thread.
+
+  @param thread    pointer to the thread instrumentation
+  @param port      the remote port
+*/
+typedef void (*set_thread_peer_port_v1_t)(PSI_thread *thread,
+                                          unsigned int port);
 
 /** Delete the current thread instrumentation. */
 typedef void (*delete_current_thread_v1_t)(void);
@@ -2522,6 +2558,12 @@ struct PSI_v1
   set_connection_type_v1_t set_connection_type;
   /** @sa set_thread_start_time_v1_t. */
   set_thread_start_time_v1_t set_thread_start_time;
+  /** @sa set_thread_start_time_usec_v1_t. */
+  set_thread_start_time_usec_v1_t set_thread_start_time_usec;
+  /** @sa set_thread_rows_sent_v1_t. */
+  set_thread_rows_sent_v1_t set_thread_rows_sent;
+  /** @sa set_thread_rows_examined_v1_t. */
+  set_thread_rows_examined_v1_t set_thread_rows_examined;
   /** @sa set_thread_state_v1_t. */
   set_thread_state_v1_t set_thread_state;
   /** @sa set_thread_info_v1_t. */
@@ -2717,6 +2759,8 @@ struct PSI_v1
 
   start_metadata_wait_v1_t start_metadata_wait;
   end_metadata_wait_v1_t end_metadata_wait;
+
+  set_thread_peer_port_v1_t set_thread_peer_port;
 };
 
 /** @} (end of group Group_PSI_v1) */

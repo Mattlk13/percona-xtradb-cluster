@@ -1,13 +1,20 @@
-/* Copyright (c) 2005, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2005, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -18,6 +25,14 @@
 
 #include "my_global.h"
 #include "auth/sql_security_ctx.h"  // Security_context
+
+/* max size of log messages (error log, plugins' logging, general log) */
+#ifdef WITH_WSREP
+/* make this bigger to accomodate wsrep_provider_options */
+static const uint MAX_LOG_BUFFER_SIZE= 2048;
+#else
+static const uint MAX_LOG_BUFFER_SIZE= 1024;
+#endif /* WITH_WSREP */
 
 struct TABLE_LIST;
 
@@ -88,8 +103,8 @@ enum enum_log_table_type
 class File_query_log
 {
   File_query_log(enum_log_table_type log_type)
-    : m_log_type(log_type), name(NULL), write_error(false), log_open(false),
-      cur_log_ext(-1)
+    : cur_log_ext(0), last_removed_ext(0), m_log_type(log_type), name(NULL),
+      write_error(false), log_open(false)
   {
     memset(&log_file, 0, sizeof(log_file));
     mysql_mutex_init(key_LOG_LOCK_log, &LOCK_log, MY_MUTEX_INIT_SLOW);
@@ -103,11 +118,14 @@ class File_query_log
 
   ~File_query_log()
   {
-    DBUG_ASSERT(!is_open());
+    assert(!is_open());
+    if (name != NULL)
+    {
+      my_free(name);
+      name= NULL;
+    }
     mysql_mutex_destroy(&LOCK_log);
   }
-  int rotate(ulong max_size, bool *need_purge);
-  int new_file();
 
   /** @return true if the file log is open, false otherwise. */
   bool is_open() const { return log_open; }
@@ -128,6 +146,11 @@ class File_query_log
      The internal structures are not freed until the destructor is called.
   */
   void close();
+
+  /**
+   Change what file we log to
+  */
+  bool set_file(const char *new_name);
 
   /**
      Check if we have already printed ER_ERROR_ON_WRITE and if not,
@@ -181,6 +204,14 @@ class File_query_log
                   const char *sql_text, size_t sql_text_len);
 
 private:
+  /** slow log rotation and purging functions */
+  bool set_rotated_name(bool need_lock);
+  bool rotate(ulong max_size);
+  bool purge_logs();
+
+  ulong cur_log_ext;
+  ulong last_removed_ext;
+
   /** Type of log file. */
   const enum_log_table_type m_log_type;
 
@@ -204,14 +235,10 @@ private:
   /** True if the file log is open, false otherwise. */
   volatile bool log_open;
 
-  ulong cur_log_ext;
-
 #ifdef HAVE_PSI_INTERFACE
   /** Instrumentation key to use for file io in @c log_file */
   PSI_file_key m_log_file_key;
 #endif
-
-  bool purge_up_to(ulong to_ext, const char *log_name);
 
   friend class Log_to_file_event_handler;
   friend class Query_logger;
@@ -370,7 +397,7 @@ private:
   {
     if (log_type == QUERY_LOG_SLOW)
       return &mysql_slow_log;
-    DBUG_ASSERT(log_type == QUERY_LOG_GENERAL);
+    assert(log_type == QUERY_LOG_GENERAL);
     return &mysql_general_log;
   }
 
@@ -435,7 +462,7 @@ public:
       return (opt_slow_log && (log_output_options & LOG_TABLE));
     else if (log_type == QUERY_LOG_GENERAL)
       return (opt_general_log && (log_output_options & LOG_TABLE));
-    DBUG_ASSERT(false);
+    assert(false);
     return false;                             /* make compiler happy */
   }
 
@@ -535,6 +562,17 @@ public:
      @param log_type  QUERY_LOG_SLOW or QUERY_LOG_GENERAL
   */
   bool reopen_log_file(enum_log_table_type log_type);
+
+  /**
+     Read log file name from global variable opt_*_logname.
+     If called from a sys_var update function, the caller
+     must hold a lock protecting the sys_var
+     (LOCK_global_system_variables, a polylock for the
+     variable, etc.).
+
+     @param log_type  QUERY_LOG_SLOW or QUERY_LOG_GENERAL
+  */
+  bool set_log_file(enum_log_table_type log_type);
 
   /**
      Check if given TABLE_LIST has a query log table name and
@@ -966,16 +1004,26 @@ bool log_syslog_find_facility(char *f, SYSLOG_FACILITY *rsf);
 bool log_syslog_init();
 void log_syslog_exit();
 
+/* 26 for regular timestamp, plus 7 (".123456") when using micro-seconds */
+static const int iso8601_size = 33;
+
+/**
+  Make and return an ISO 8601 / RFC 3339 compliant timestamp.
+  Heeds log_timestamps.
+
+  @param buf       A buffer of at least 26 bytes to store the timestamp in
+                   (19 + tzinfo tail + \0)
+  @param seconds   Seconds since the epoch, or 0 for "now"
+
+  @return          length of timestamp (excluding \0)
+*/
+int make_iso8601_timestamp(char *buf, ulonglong utime = 0);
+
 #ifdef WITH_WSREP
 IO_CACHE* wsrep_get_trans_log(THD * thd, bool transaction);
 bool wsrep_trans_cache_is_empty(THD *thd);
 void wsrep_thd_binlog_flush_pending_rows_event(THD *thd, bool stmt_end);
 void wsrep_thd_binlog_trx_reset(THD * thd);
-
-#define WSREP_BINLOG_FORMAT(my_format)                         \
-   ((wsrep_forced_binlog_format != BINLOG_FORMAT_UNSPEC) ?     \
-   wsrep_forced_binlog_format : my_format)
-#else
-#define WSREP_BINLOG_FORMAT(my_format) my_format
 #endif /* WITH_WSREP */
+
 #endif /* LOG_H */

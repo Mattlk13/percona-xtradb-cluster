@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2025, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -234,10 +242,10 @@ trx_undo_log_v_idx(
 
 	ut_ad(n_idx > 0);
 
-	/* Size to reserve, max 5 bytes for each index id and position, plus
+	/* Size to reserve, max (11 + 5) bytes for each index id and position, plus
 	5 bytes for num of indexes, 2 bytes for write total length.
 	1 byte for undo log record format version marker */
-	ulint		size = n_idx * (5 + 5) + 5 + 2 + (first_v_col ? 1 : 0);
+	ulint		size = n_idx * (11 + 5) + 5 + 2 + (first_v_col ? 1 : 0);
 
 	if (trx_undo_left(undo_page, ptr) < size) {
 		return(NULL);
@@ -262,7 +270,7 @@ trx_undo_log_v_idx(
 	     it != vcol->v_indexes->end(); ++it) {
 		dict_v_idx_t	v_index = *it;
 
-		ptr += mach_write_compressed(
+		ptr += mach_u64_write_much_compressed(
 			ptr, static_cast<ulint>(v_index.index->id));
 
 		ptr += mach_write_compressed(ptr, v_index.nth_field);
@@ -301,7 +309,7 @@ trx_undo_read_v_idx_low(
 	dict_index_t*	clust_index = dict_table_get_first_index(table);
 
 	for (ulint i = 0; i < num_idx; i++) {
-		index_id_t	id = mach_read_next_compressed(&ptr);
+		index_id_t	id = mach_read_next_much_compressed(&ptr);
 		ulint		pos = mach_read_next_compressed(&ptr);
 		dict_index_t*	index = dict_table_get_next_index(clust_index);
 
@@ -570,6 +578,21 @@ trx_undo_rec_get_pars(
 	*table_id = mach_read_next_much_compressed(&ptr);
 
 	return(const_cast<byte*>(ptr));
+}
+
+/** Reads from an undo log record the table ID
+@param[in]	undo_rec	Undo log record
+@return the table ID */
+table_id_t
+trx_undo_rec_get_table_id(const trx_undo_rec_t* undo_rec)
+{
+	const byte*	ptr = undo_rec + 3;
+
+	/* Skip the UNDO number */
+	mach_read_next_much_compressed(&ptr);
+
+	/* Read the table ID */
+	return(mach_read_next_much_compressed(&ptr));
 }
 
 /** Read from an undo log record a non-virtual column value.
@@ -1966,9 +1989,7 @@ trx_undo_report_row_operation(
 
 	undo_block = buf_page_get_gen(
 		page_id_t(undo->space, page_no), undo->page_size, RW_X_LATCH,
-		buf_pool_is_obsolete(undo->withdraw_clock)
-		? NULL : undo->guess_block, BUF_GET, __FILE__, __LINE__,
-		&mtr);
+		undo->guess_block, BUF_GET, __FILE__, __LINE__,&mtr);
 
 	buf_block_dbg_add_level(undo_block, SYNC_TRX_UNDO_PAGE);
 
@@ -2028,14 +2049,13 @@ trx_undo_report_row_operation(
 			mtr_commit(&mtr);
 		} else {
 			/* Success */
-			undo->withdraw_clock = buf_withdraw_clock;
+			undo->guess_block = undo_block;
 			mtr_commit(&mtr);
 
 			undo->empty = FALSE;
 			undo->top_page_no = page_no;
 			undo->top_offset  = offset;
 			undo->top_undo_no = trx->undo_no;
-			undo->guess_block = undo_block;
 
 			trx->undo_no++;
 			trx->undo_rseg_space = undo_ptr->rseg->space;
@@ -2122,7 +2142,7 @@ trx_undo_get_undo_rec_low(
 		page_id_t(rseg->space, page_no), rseg->page_size,
 		&mtr);
 
-	undo_rec = trx_undo_rec_copy(undo_page + offset, heap);
+	undo_rec = trx_undo_rec_copy(undo_page, offset, heap);
 
 	mtr_commit(&mtr);
 
@@ -2351,11 +2371,13 @@ trx_undo_prev_version_build(
 
 		entry = row_rec_to_index_entry(
 			rec, index, offsets, &n_ext, heap);
-		n_ext += btr_push_update_extern_fields(entry, update, heap);
 		/* The page containing the clustered index record
 		corresponding to entry is latched in mtr.  Thus the
 		following call is safe. */
 		row_upd_index_replace_new_col_vals(entry, index, update, heap);
+
+		/* Get number of externally stored columns in updated record */
+		n_ext = entry->get_n_ext();
 
 		buf = static_cast<byte*>(mem_heap_alloc(
 			heap, rec_get_converted_size(index, entry, n_ext)));

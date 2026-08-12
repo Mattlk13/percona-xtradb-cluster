@@ -1,13 +1,20 @@
-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2025, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -73,9 +80,11 @@
 using std::max;
 using std::min;
 
+#ifdef WITH_WSREP
 #if !defined(MYSQL_MAX_VARIABLE_VALUE_LEN)
 #define MYSQL_MAX_VARIABLE_VALUE_LEN 1024
 #endif // !defined(MYSQL_MAX_VARIABLE_VALUE_LEN)
+#endif /* WITH_WSREP */
 #define STR_OR_NIL(S) ((S) ? (S) : "<nil>")
 
 enum enum_i_s_events_fields
@@ -187,7 +196,7 @@ static my_bool show_plugins(THD *thd, plugin_ref plugin,
     table->field[2]->store(STRING_WITH_LEN("DISABLED"), cs);
     break;
   default:
-    DBUG_ASSERT(0);
+    assert(0);
   }
 
   table->field[3]->store(plugin_type_names[plug->type].str,
@@ -484,7 +493,7 @@ ignore_db_dirs_process_additions()
   size_t len;
   char *ptr;
 
-  DBUG_ASSERT(opt_ignore_db_dirs == NULL);
+  assert(opt_ignore_db_dirs == NULL);
 
   if (my_hash_init(&ignore_db_dirs_hash, 
                    lower_case_table_names ?
@@ -554,10 +563,10 @@ ignore_db_dirs_process_additions()
   if (ptr > opt_ignore_db_dirs)
   {
     ptr--;
-    DBUG_ASSERT(*ptr == ',');
+    assert(*ptr == ',');
   }
   /* make sure the string is terminated */
-  DBUG_ASSERT(ptr - opt_ignore_db_dirs <= (ptrdiff_t) len);
+  assert(ptr - opt_ignore_db_dirs <= (ptrdiff_t) len);
   *ptr= 0;
 
   /* 
@@ -703,13 +712,21 @@ find_files(THD *thd, List<LEX_STRING> *files, const char *db,
     }
 
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
+    char tname[NAME_LEN + 1];
     /* Don't show tables where we don't have any privileges */
     if (db && !(col_access & TABLE_ACLS))
     {
       table_list.db= (char*) db;
       table_list.db_length= strlen(db);
-      table_list.table_name= uname;
       table_list.table_name_length= file_name_len;
+      if (lower_case_table_names == 2)
+      {
+        strcpy(tname, uname);
+        my_casedn_str(files_charset_info, tname);
+        table_list.table_name= tname;
+      }
+      else
+        table_list.table_name= uname;
       table_list.grant.privilege=col_access;
       if (check_grant(thd, TABLE_ACLS, &table_list, TRUE, 1, TRUE))
         continue;
@@ -1051,14 +1068,13 @@ bool mysqld_show_create_db(THD *thd, char *dbname,
     my_casedn_str(files_charset_info, dbname);
 
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
-  if (sctx->check_access(DB_ACLS))
-    db_access=DB_ACLS;
+  if (sctx->check_access(DB_OP_ACLS))
+    db_access = DB_OP_ACLS;
   else
     db_access= (acl_get(sctx->host().str, sctx->ip().str,
                         sctx->priv_user().str, dbname, 0) |
                 sctx->master_access());
-  if (!(db_access & DB_ACLS) && check_grant_db(thd,dbname))
-  {
+  if (!(db_access & DB_OP_ACLS) && check_grant_db(thd, dbname, true)) {
     thd->diff_access_denied_errors++;
     my_error(ER_DBACCESS_DENIED_ERROR, MYF(0),
              sctx->priv_user().str, sctx->host_or_ip().str, dbname);
@@ -1272,7 +1288,9 @@ append_identifier(THD *thd, String *packet, const char *name, size_t length,
       to_length= 1;
     if (to_length == 1 && chr == static_cast<uchar>(quote_char))
       packet->append(&quote_char, 1, system_charset_info);
-    packet->append(to_name, to_length, system_charset_info);
+    packet->append(to_name,
+                   std::min(to_length, static_cast<size_t>(name_end - to_name)),
+                   system_charset_info);
   }
   packet->append(&quote_char, 1, system_charset_info);
 }
@@ -1351,7 +1369,7 @@ static void append_directory(THD *thd, String *packet, const char *dir_type,
 */
 static bool print_on_update_clause(Field *field, String *val, bool lcase)
 {
-  DBUG_ASSERT(val->charset()->mbminlen == 1);
+  assert(val->charset()->mbminlen == 1);
   val->length(0);
   if (field->has_update_default_function())
   {
@@ -1629,7 +1647,7 @@ int store_create_info(THD *thd, TABLE_LIST *table_list, String *packet,
       packet->append(STRING_WITH_LEN(" /*!50606 STORAGE MEMORY */"));
       break;
     default:
-      DBUG_ASSERT(0);
+      assert(0);
       break;
     }
 
@@ -1660,7 +1678,7 @@ int store_create_info(THD *thd, TABLE_LIST *table_list, String *packet,
       }
       break;
     default:
-      DBUG_ASSERT(0);
+      assert(0);
       break;
     }
 
@@ -1949,7 +1967,7 @@ int store_create_info(THD *thd, TABLE_LIST *table_list, String *packet,
 
     if (share->was_encryption_key_id_set)
     {
-      DBUG_ASSERT(share->encrypt_type.length == 0 || my_strcasecmp(system_charset_info, share->encrypt_type.str, "KEYRING") != 0
+      assert(share->encrypt_type.length == 0 || my_strcasecmp(system_charset_info, share->encrypt_type.str, "KEYRING") != 0
                   || share->encrypt_type.length == strlen("KEYRING"));
 
       char *end;
@@ -2041,8 +2059,8 @@ static void store_key_options(THD *thd, String *packet, TABLE *table,
       end= longlong10_to_str(key_info->block_size, buff, 10);
       packet->append(buff, (uint) (end - buff));
     }
-    DBUG_ASSERT(MY_TEST(key_info->flags & HA_USES_COMMENT) == 
-               (key_info->comment.length > 0));
+    assert(MY_TEST(key_info->flags & HA_USES_COMMENT) == 
+           (key_info->comment.length > 0));
     if (key_info->flags & HA_USES_COMMENT)
     {
       packet->append(STRING_WITH_LEN(" COMMENT "));
@@ -2090,7 +2108,7 @@ static void append_algorithm(TABLE_LIST *table, String *buff)
     buff->append(STRING_WITH_LEN("MERGE "));
     break;
   default:
-    DBUG_ASSERT(0); // never should happen
+    assert(0); // never should happen
   }
 }
 
@@ -2189,19 +2207,20 @@ view_store_create_info(THD *thd, TABLE_LIST *table, String *buff)
 
 /****************************************************************************
   Return info about all processes
-  returns for each thread: thread id, user, host, db, command, info,
+  returns for each thread: thread id, start_time, user, host, db, command, info,
   rows_sent, rows_examined
 ****************************************************************************/
 class thread_info : public Sql_alloc
 {
 public:
   thread_info()
-    : thread_id(0), start_time(0), command(0),
+    : thread_id(0), start_time(0), start_time_in_usecs(0), command(0),
       user(NULL), host(NULL), db(NULL), proc_info(NULL), state_info(NULL)
   { }
 
   my_thread_id thread_id;
   time_t start_time;
+  ulonglong start_time_in_usecs;
   uint   command;
   const char *user,*host,*db,*proc_info,*state_info;
   CSET_STRING query_string;
@@ -2342,9 +2361,28 @@ public:
     /* INFO */
     mysql_mutex_lock(&inspect_thd->LOCK_thd_query);
     {
-      const char *query_str= inspect_thd->query().str;
-      size_t query_length= inspect_thd->query().length;
+      const char *query_str= NULL;
+      size_t query_length= 0;
+
+      /* If a rewritten query exists, use that. */
+      if (inspect_thd->rewritten_query().length() > 0) {
+        query_length = inspect_thd->rewritten_query().length();
+        query_str = inspect_thd->rewritten_query().ptr();
+      }
+      /*
+        Otherwise, use the original query. If the query contains password in
+        plain text, we have the query re-written immediately after parsing and
+        password string is replaced. However, there is a unsafe window before
+        rewrite is done and in such case we should not display the plain text
+        password.
+      */
+      else if (inspect_thd->safe_to_display()) {
+        query_length = inspect_thd->query().length;
+        query_str = inspect_thd->query().str;
+      }
+
 #ifndef EMBEDDED_LIBRARY
+      /* In the stand-alone server, add "PLUGIN" as needed. */
       String buf;
       if (inspect_thd->is_a_srv_session())
       {
@@ -2358,6 +2396,7 @@ public:
       }
       /* No else. We need fall-through */
 #endif
+      /* If we managed to create query info, set a copy on thd_info. */
       if (query_str)
       {
         const size_t width= min<size_t>(m_max_query_length, query_length);
@@ -2371,6 +2410,7 @@ public:
 
     /* MYSQL_TIME */
     thd_info->start_time= inspect_thd->start_time.tv_sec;
+    thd_info->start_time_in_usecs = inspect_thd->start_utime;
 
     m_thread_infos->push_back(thd_info);
   }
@@ -2399,6 +2439,10 @@ void mysqld_list_processes(THD *thd,const char *user, bool verbose)
   field->maybe_null=1;
   field_list.push_back(field=new Item_empty_string("Info",max_query_length));
   field->maybe_null=1;
+  field_list.push_back(field = new Item_return_int("Time_ms",
+                                                   MY_INT64_NUM_DECIMAL_DIGITS,
+                                                   MYSQL_TYPE_LONGLONG));
+  field->maybe_null = 1;
   field_list.push_back(field= new Item_return_int("Rows_sent",
                                                   MY_INT64_NUM_DECIMAL_DIGITS,
                                                   MYSQL_TYPE_LONGLONG));
@@ -2421,6 +2465,7 @@ void mysqld_list_processes(THD *thd,const char *user, bool verbose)
   std::sort(thread_infos.begin(), thread_infos.end(), thread_info_compare());
 
   time_t now= my_time(0);
+  ulonglong now_us= my_micro_time();
   for (size_t ix= 0; ix < thread_infos.size(); ++ix)
   {
     thread_info *thd_info= thread_infos.at(ix);
@@ -2443,6 +2488,13 @@ void mysqld_list_processes(THD *thd,const char *user, bool verbose)
     protocol->store(thd_info->state_info, system_charset_info);
     protocol->store(thd_info->query_string.str(),
                     thd_info->query_string.charset());
+    if (thd_info->start_time_in_usecs)
+      protocol->store(((thd_info->start_time_in_usecs > now_us)
+                           ? 0
+                           : now_us - thd_info->start_time_in_usecs) /
+                      1000);
+    else
+      protocol->store_null();
     protocol->store(thd_info->rows_sent);
     protocol->store(thd_info->rows_examined);
     if (protocol->end_row())
@@ -2572,9 +2624,28 @@ public:
     /* INFO */
     mysql_mutex_lock(&inspect_thd->LOCK_thd_query);
     {
-      const char *query_str= inspect_thd->query().str;
-      size_t query_length= inspect_thd->query().length;
+      const char *query_str= NULL;
+      size_t query_length= 0;
+
+      /* If a rewritten query exists, use that. */
+      if (inspect_thd->rewritten_query().length() > 0) {
+        query_length = inspect_thd->rewritten_query().length();
+        query_str = inspect_thd->rewritten_query().ptr();
+      }
+      /*
+        Otherwise, use the original query. If the query contains password in
+        plain text, we have the query re-written immediately after parsing and
+        password string is replaced. However, there is a unsafe window before
+        rewrite is done and in such case we should not display the plain text
+        password.
+      */
+      else if (inspect_thd->safe_to_display()) {
+        query_length = inspect_thd->query().length;
+        query_str = inspect_thd->query().str;
+      }
+
 #ifndef EMBEDDED_LIBRARY
+      /* In the stand-alone server, add "PLUGIN" as needed. */
       String buf;
       if (inspect_thd->is_a_srv_session())
       {
@@ -2588,6 +2659,7 @@ public:
       }
       /* No else. We need fall-through */
 #endif
+      /* If we managed to create query info, set a copy on thd_info. */
       if (query_str)
       {
         const size_t width= min<size_t>(PROCESS_LIST_INFO_WIDTH, query_length);
@@ -3001,7 +3073,7 @@ const char* get_one_variable_ext(THD *running_thd, THD *target_thd,
       break;
 
     case SHOW_SIGNED_INT:
-      end= int10_to_str((long) *(uint32*) value, buff, -10);
+      end= int10_to_str((long) *(int32*) value, buff, -10);
       value_charset= system_charset_info;
       break;
 
@@ -3059,7 +3131,7 @@ const char* get_one_variable_ext(THD *running_thd, THD *target_thd,
     case SHOW_SYS:          /* Cannot happen */
 
     default:
-      DBUG_ASSERT(0);
+      assert(0);
       break;
   }
 
@@ -3067,7 +3139,7 @@ const char* get_one_variable_ext(THD *running_thd, THD *target_thd,
   /* Some callers do not use the result. */
   if (charset != NULL)
   {
-    DBUG_ASSERT(value_charset != NULL);
+    assert(value_charset != NULL);
     *charset= value_charset;
   }
   return pos;
@@ -3136,6 +3208,19 @@ static bool show_status_array(THD *thd, const char *wild,
         const char *pos;
         size_t length;
 
+        DBUG_EXECUTE_IF("catch_show_gtid_mode", {
+          String gtid_mode;
+          static const char *gm= "gtid\\_mode";
+          unsigned int errors;
+          gtid_mode.copy(gm, strlen(gm), &my_charset_latin1, system_charset_info,
+                         &errors);
+
+          if (!my_strcasecmp(system_charset_info, wild,
+                             gtid_mode.c_ptr_safe())) {
+            DEBUG_SYNC_C("before_show_gtid_executed");
+          }
+        });
+
         mysql_mutex_lock(&LOCK_global_system_variables);
         pos= get_one_variable(thd, var, value_type, show_type, status_var,
                               &charset, buff, &length);
@@ -3180,6 +3265,7 @@ end:
      0 - OK
      1 - error
 */
+static
 int send_user_stats(THD* thd, HASH *all_user_stats, TABLE *table)
 {
   DBUG_ENTER("send_user_stats");
@@ -3219,6 +3305,7 @@ int send_user_stats(THD* thd, HASH *all_user_stats, TABLE *table)
   DBUG_RETURN(0);
 }
 
+static
 int send_thread_stats(THD* thd, HASH *all_thread_stats, TABLE *table)
 {
   DBUG_ENTER("send_thread_stats");
@@ -3272,7 +3359,7 @@ int send_thread_stats(THD* thd, HASH *all_thread_stats, TABLE *table)
      1 - error
 */
 
-
+static
 int fill_schema_user_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 {
   TABLE *table= tables->table;
@@ -3312,7 +3399,7 @@ int fill_schema_user_stats(THD* thd, TABLE_LIST* tables, Item* cond)
      1 - error
 */
 
-
+static
 int fill_schema_client_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 {
   TABLE *table= tables->table;
@@ -3339,6 +3426,7 @@ int fill_schema_client_stats(THD* thd, TABLE_LIST* tables, Item* cond)
   DBUG_RETURN(1);
 }
 
+static
 int fill_schema_thread_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 {
   TABLE *table= tables->table;
@@ -3365,6 +3453,7 @@ int fill_schema_thread_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 }
 
 // Sends the global table stats back to the client.
+static
 int fill_schema_table_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 {
   TABLE *table= tables->table;
@@ -3409,6 +3498,7 @@ int fill_schema_table_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 }
 
 // Sends the global index stats back to the client.
+static
 int fill_schema_index_stats(THD* thd, TABLE_LIST* tables, Item* cond)
 {
   TABLE *table= tables->table;
@@ -4138,7 +4228,27 @@ make_table_name_list(THD *thd, List<LEX_STRING> *table_names, LEX *lex,
       }
     }
     else
-    {    
+    {
+#ifndef NO_EMBEDDED_ACCESS_CHECKS
+      if (!(thd->col_access & TABLE_ACLS))
+      {
+        TABLE_LIST table_list;
+
+        /*
+          Database name and table name have already been converted to lowercase
+          if lower_case_table_names is > 0. We can safely use lookup_field_vals
+          here.
+        */
+        table_list.db= db_name->str;
+        table_list.db_length= db_name->length;
+        table_list.table_name_length= lookup_field_vals->table_value.length;
+        table_list.table_name= lookup_field_vals->table_value.str;
+        table_list.grant.privilege=thd->col_access;
+
+        if (check_grant(thd, TABLE_ACLS, &table_list, TRUE, 1, TRUE))
+         return 2;
+      }
+#endif
       if (table_names->push_back(&lookup_field_vals->table_value))
         return 1;
       /*
@@ -4379,7 +4489,7 @@ end:
   lex_end(thd->lex);
 
   // Free items, before restoring backup_arena below.
-  DBUG_ASSERT(i_s_arena.free_list == NULL);
+  assert(i_s_arena.free_list == NULL);
   thd->free_items();
 
   /*
@@ -4450,7 +4560,7 @@ static int fill_schema_table_names(THD *thd, TABLE *table,
                                system_charset_info);
         break;
       default:
-        DBUG_ASSERT(0);
+        assert(0);
       }
     if (thd->is_error() &&
         thd->get_stmt_da()->mysql_errno() == ER_NO_SUCH_TABLE)
@@ -4525,6 +4635,7 @@ uint get_table_open_method(TABLE_LIST *tables,
     @retval       0                        success
     @retval       1                        error
 */
+static
 int make_temporary_tables_old_format(THD *thd, ST_SCHEMA_TABLE *schema_table)
 {
   char tmp[128];
@@ -4675,12 +4786,12 @@ static int store_temporary_table_record(THD *thd, TABLE *table,
 class Fill_global_temporary_tables : public Do_THD_Impl
 {
 private:
-  THD* m_client_thd;
+  THD* const m_client_thd;
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
-  Security_context* m_sctx;
+  Security_context* const m_sctx;
 #endif
   bool m_failed;
-  TABLE_LIST *m_tables;
+  TABLE_LIST * const m_tables;
 
 public:
   Fill_global_temporary_tables(THD* client_thd, TABLE_LIST* tables)
@@ -4698,7 +4809,7 @@ public:
   {
     mysql_mutex_lock(&thd->LOCK_temporary_tables);
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     const char* tmp_proc_info= thd->proc_info;
     if (tmp_proc_info &&
         !strncmp(tmp_proc_info,
@@ -4765,7 +4876,7 @@ static int fill_global_temporary_tables(THD *thd, TABLE_LIST *tables,
     @retval       0                        success
     @retval       1                        error
 */
-
+static
 int fill_temporary_tables(THD *thd, TABLE_LIST *tables, Item *cond)
 {
   DBUG_ENTER("fill_temporary_tables");
@@ -4883,8 +4994,8 @@ static int fill_schema_table_from_frm(THD *thd, TABLE_LIST *tables,
   size_t key_length;
   char db_name_buff[NAME_LEN + 1], table_name_buff[NAME_LEN + 1];
 
-  DBUG_ASSERT(db_name->length <= NAME_LEN);
-  DBUG_ASSERT(table_name->length <= NAME_LEN);
+  assert(db_name->length <= NAME_LEN);
+  assert(table_name->length <= NAME_LEN);
 
   if (lower_case_table_names)
   {
@@ -4928,7 +5039,7 @@ static int fill_schema_table_from_frm(THD *thd, TABLE_LIST *tables,
       lock and deadlocks can occur due to waiting for it to go away.
       So instead of waiting skip this table with an appropriate warning.
     */
-    DBUG_ASSERT(can_deadlock);
+    assert(can_deadlock);
 
     push_warning_printf(thd, Sql_condition::SL_WARNING,
                         ER_WARN_I_S_SKIPPED_TABLE,
@@ -5018,6 +5129,13 @@ static int fill_schema_table_from_frm(THD *thd, TABLE_LIST *tables,
 
     if (!view_open_result)
     {
+      if (table_list.is_view())
+      {
+        // See comments in tdc_open_view() for explanation.
+        if (!table_list.prelocking_placeholder &&
+            table_list.prepare_security(thd))
+          goto end;
+      }
       // Actual view query is not needed, just indicate that this is a view:
       table_list.set_view_query((LEX *) 1);
       res= schema_table->process_table(thd, &table_list, table,
@@ -5072,7 +5190,7 @@ end:
     We don't have any tables open since we took backup, so rolling back to
     savepoint is safe.
   */
-  DBUG_ASSERT(thd->open_tables == NULL);
+  assert(thd->open_tables == NULL);
   thd->mdl_context.rollback_to_savepoint(open_tables_state_backup->mdl_system_tables_svp);
   thd->clear_error();
   return res;
@@ -5275,14 +5393,14 @@ int get_all_tables(THD *thd, TABLE_LIST *tables, Item *cond)
   it.rewind(); /* To get access to new elements in basis list */
   while ((db_name= it++))
   {
-    DBUG_ASSERT(db_name->length <= NAME_LEN);
+    assert(db_name->length <= NAME_LEN);
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
-    if (!(check_access(thd, SELECT_ACL, db_name->str,
-                       &thd->col_access, NULL, 0, 1) ||
+    if (!(check_access(thd, SELECT_ACL, db_name->str, &thd->col_access, NULL, 0,
+                       1) ||
           (!thd->col_access && check_grant_db(thd, db_name->str))) ||
-        sctx->check_access(DB_ACLS | SHOW_DB_ACL, true) ||
-        acl_get(sctx->host().str, sctx->ip().str,
-                sctx->priv_user().str, db_name->str, 0))
+        sctx->check_access(DB_OP_ACLS | SHOW_DB_ACL, true) ||
+        acl_get(sctx->host().str, sctx->ip().str, sctx->priv_user().str,
+                db_name->str, 0))
 #endif
     {
       List<LEX_STRING> table_names;
@@ -5297,7 +5415,7 @@ int get_all_tables(THD *thd, TABLE_LIST *tables, Item *cond)
       List_iterator_fast<LEX_STRING> it_files(table_names);
       while ((table_name= it_files++))
       {
-        DBUG_ASSERT(table_name->length <= NAME_LEN);
+        assert(table_name->length <= NAME_LEN);
 	restore_record(table, s->default_values);
         table->field[schema_table->idx_field1]->
           store(db_name->str, db_name->length, system_charset_info);
@@ -5468,7 +5586,7 @@ int fill_schema_schemata(THD *thd, TABLE_LIST *tables, Item *cond)
   List_iterator_fast<LEX_STRING> it(db_names);
   while ((db_name=it++))
   {
-    DBUG_ASSERT(db_name->length <= NAME_LEN);
+    assert(db_name->length <= NAME_LEN);
     if (with_i_schema)       // information schema name is always first in list
     {
       if (store_schema_shemata(thd, table, db_name,
@@ -5478,10 +5596,10 @@ int fill_schema_schemata(THD *thd, TABLE_LIST *tables, Item *cond)
       continue;
     }
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
-    if (sctx->check_access(DB_ACLS | SHOW_DB_ACL, true) ||
-	acl_get(sctx->host().str, sctx->ip().str,
-                sctx->priv_user().str, db_name->str, 0) ||
-                !check_grant_db(thd, db_name->str))
+    if (sctx->check_access(DB_OP_ACLS | SHOW_DB_ACL, true) ||
+        acl_get(sctx->host().str, sctx->ip().str, sctx->priv_user().str,
+                db_name->str, 0) ||
+        !check_grant_db(thd, db_name->str))
 #endif
     {
       load_db_opt_by_name(thd, db_name->str, &create);
@@ -6778,8 +6896,8 @@ static int get_schema_stat_record(THD *thd, TABLE_LIST *tables,
         else
           table->field[14]->store("", 0, cs);
         table->field[14]->set_notnull();
-        DBUG_ASSERT(MY_TEST(key_info->flags & HA_USES_COMMENT) ==
-                   (key_info->comment.length > 0));
+        assert(MY_TEST(key_info->flags & HA_USES_COMMENT) ==
+               (key_info->comment.length > 0));
         if (key_info->flags & HA_USES_COMMENT)
           table->field[15]->store(key_info->comment.str, 
                                   key_info->comment.length, cs);
@@ -7525,7 +7643,7 @@ static int get_schema_partitions_record(THD *thd, TABLE_LIST *tables,
       table->field[7]->store(tmp_res.ptr(), tmp_res.length(), cs);
       break;
     default:
-      DBUG_ASSERT(0);
+      assert(0);
       my_error(ER_OUT_OF_RESOURCES, MYF(ME_FATALERROR));
       DBUG_RETURN(1);
     }
@@ -7822,7 +7940,7 @@ copy_event_to_schema_table(THD *thd, TABLE *sch_table, TABLE *event_table)
       sch_table->field[ISE_STATUS]->store(STRING_WITH_LEN("DISABLED"), scs);
       break;
     default:
-      DBUG_ASSERT(0);
+      assert(0);
   }
   sch_table->field[ISE_ORIGINATOR]->store(et.originator, TRUE);
 
@@ -7835,11 +7953,11 @@ copy_event_to_schema_table(THD *thd, TABLE *sch_table, TABLE *event_table)
                                 store(STRING_WITH_LEN("PRESERVE"), scs);
     
   number_to_datetime(et.created, &time, 0, &not_used);
-  DBUG_ASSERT(not_used==0);
+  assert(not_used==0);
   sch_table->field[ISE_CREATED]->store_time(&time);
 
   number_to_datetime(et.modified, &time, 0, &not_used);
-  DBUG_ASSERT(not_used==0);
+  assert(not_used==0);
   sch_table->field[ISE_LAST_ALTERED]->store_time(&time);
 
   if (et.last_executed)
@@ -7968,7 +8086,7 @@ int fill_variables(THD *thd, TABLE_LIST *tables, Item *cond)
   }
   else
   {
-    DBUG_ASSERT(schema_table_idx == SCH_SESSION_VARIABLES);
+    assert(schema_table_idx == SCH_SESSION_VARIABLES);
     option_type= OPT_SESSION;
   }
 
@@ -8066,7 +8184,7 @@ int fill_status(THD *thd, TABLE_LIST *tables, Item *cond)
   }
   else
   {
-    DBUG_ASSERT(schema_table_idx == SCH_SESSION_STATUS);
+    assert(schema_table_idx == SCH_SESSION_STATUS);
     option_type= OPT_SESSION;
     status_var_ptr= &thd->status_var;
   }
@@ -8372,7 +8490,7 @@ TABLE *create_schema_table(THD *thd, TABLE_LIST *table_list)
       break;
     default:
       /* Don't let unimplemented types pass through. Could be a grave error. */
-      DBUG_ASSERT(fields_info->field_type == MYSQL_TYPE_STRING);
+      assert(fields_info->field_type == MYSQL_TYPE_STRING);
 
       if (!(item= new Item_empty_string("", fields_info->field_length, cs)))
       {
@@ -8806,7 +8924,7 @@ static bool do_fill_table(THD *thd,
     QEP_TAB::sort_table() (=filesort, for ORDER BY), so we can trust
     that condition() is complete, has not been zeroed by filesort:
   */
-  DBUG_ASSERT(qep_tab->condition() == qep_tab->condition_optim());
+  assert(qep_tab->condition() == qep_tab->condition_optim());
 
   bool res= table_list->schema_table->fill_table(
     thd, table_list, qep_tab->condition());
@@ -8978,6 +9096,9 @@ int hton_fill_schema_table(THD *thd, TABLE_LIST *tables, Item *cond)
   args.tables= tables;
   args.cond= cond;
 
+  if (check_global_access(thd, PROCESS_ACL))
+    DBUG_RETURN(1);
+
   plugin_foreach(thd, run_hton_fill_schema_table,
                  MYSQL_STORAGE_ENGINE_PLUGIN, &args);
 
@@ -9038,7 +9159,7 @@ ST_FIELD_INFO tables_fields_info[]=
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, SKIP_OPEN_TABLE}
 };
 
-ST_FIELD_INFO temporary_table_fields_info[]=
+static ST_FIELD_INFO temporary_table_fields_info[]=
 {
   {"SESSION_ID", 4, MYSQL_TYPE_LONGLONG, 0, 0, "Session", SKIP_OPEN_TABLE},
   {"TABLE_SCHEMA", NAME_CHAR_LEN, MYSQL_TYPE_STRING, 0, 0, "Db", SKIP_OPEN_TABLE},
@@ -9476,13 +9597,17 @@ ST_FIELD_INFO variables_fields_info[]=
 {
   {"VARIABLE_NAME", 64, MYSQL_TYPE_STRING, 0, 0, "Variable_name",
    SKIP_OPEN_TABLE},
+#ifdef WITH_WSREP
   {"VARIABLE_VALUE", MYSQL_MAX_VARIABLE_VALUE_LEN, MYSQL_TYPE_STRING, 0, 1,
    "Value", SKIP_OPEN_TABLE},
+#else
+  {"VARIABLE_VALUE", 1024, MYSQL_TYPE_STRING, 0, 1, "Value", SKIP_OPEN_TABLE},
+#endif /* WITH_WSREP */
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, SKIP_OPEN_TABLE}
 };
 
 
-ST_FIELD_INFO user_stats_fields_info[]=
+static ST_FIELD_INFO user_stats_fields_info[]=
 {
   {"USER", USERNAME_LENGTH, MYSQL_TYPE_STRING, 0, 0, "User", SKIP_OPEN_TABLE},
   {"TOTAL_CONNECTIONS", MY_INT64_NUM_DECIMAL_DIGITS, MYSQL_TYPE_LONGLONG, 0,
@@ -9530,7 +9655,7 @@ ST_FIELD_INFO user_stats_fields_info[]=
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, 0}
 };
 
-ST_FIELD_INFO client_stats_fields_info[]=
+static ST_FIELD_INFO client_stats_fields_info[]=
 {
   {"CLIENT", LIST_PROCESS_HOST_LEN, MYSQL_TYPE_STRING, 0, 0, "Client",
    SKIP_OPEN_TABLE},
@@ -9579,7 +9704,7 @@ ST_FIELD_INFO client_stats_fields_info[]=
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, 0}
 };
 
-ST_FIELD_INFO thread_stats_fields_info[]=
+static ST_FIELD_INFO thread_stats_fields_info[]=
 {
   {"THREAD_ID", MY_INT64_NUM_DECIMAL_DIGITS, MYSQL_TYPE_LONGLONG, 0,
    MY_I_S_UNSIGNED, "Thread_id", SKIP_OPEN_TABLE},
@@ -9628,7 +9753,7 @@ ST_FIELD_INFO thread_stats_fields_info[]=
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, 0}
 };
 
-ST_FIELD_INFO table_stats_fields_info[]=
+static ST_FIELD_INFO table_stats_fields_info[]=
 {
   {"TABLE_SCHEMA", NAME_LEN, MYSQL_TYPE_STRING, 0, 0, "Table_schema",
    SKIP_OPEN_TABLE},
@@ -9643,7 +9768,7 @@ ST_FIELD_INFO table_stats_fields_info[]=
   {0, 0, MYSQL_TYPE_STRING, 0, 0, 0, 0}
 };
 
-ST_FIELD_INFO index_stats_fields_info[]=
+static ST_FIELD_INFO index_stats_fields_info[]=
 {
   {"TABLE_SCHEMA", NAME_LEN, MYSQL_TYPE_STRING, 0, 0, "Table_schema",
    SKIP_OPEN_TABLE},
@@ -10002,7 +10127,7 @@ int finalize_schema_table(st_plugin_int *plugin)
     if (plugin->plugin->deinit)
     {
       DBUG_PRINT("info", ("Deinitializing plugin: '%s'", plugin->name.str));
-      if (plugin->plugin->deinit(NULL))
+      if (plugin->plugin->deinit(plugin))
       {
         DBUG_PRINT("warning", ("Plugin '%s' deinit function returned error.",
                                plugin->name.str));

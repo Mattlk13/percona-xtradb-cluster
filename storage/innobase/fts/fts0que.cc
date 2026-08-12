@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 2007, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2007, 2024, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -43,6 +51,7 @@ Completed 2011/7/10 Sunny and Jimmy Yang
 #endif
 
 #include <iomanip>
+#include <limits>
 #include <vector>
 
 #define FTS_ELEM(t, n, i, j) (t[(i) * n + (j)])
@@ -160,6 +169,9 @@ struct fts_query_t {
 	/** number of docs fetched by query. This is to restrict the
 	result with limit value */
 	ulonglong		n_docs;
+
+	ulint		nested_exp_count; /*!< number of nested sub expression
+					  limit */
 };
 
 /** For phrase matching, first we collect the documents and the positions
@@ -281,6 +293,9 @@ struct fts_word_freq_t {
 	double		idf;		/*!< Inverse document frequency */
 };
 
+static ib_rbt_compare fts_ranking_doc_id_cmp =
+    fts_doc_id_field_cmp<fts_ranking_t>;
+
 /********************************************************************
 Callback function to fetch the rows in an FTS INDEX record.
 @return always TRUE */
@@ -380,25 +395,7 @@ fts_query_terms_in_document(
 	fts_query_t*	query,		/*!< in: FTS query state */
 	doc_id_t	doc_id,		/*!< in: the word to check */
 	ulint*		total);		/*!< out: total words in document */
-#endif
 
-/********************************************************************
-Compare two fts_doc_freq_t doc_ids.
-@return < 0 if n1 < n2, 0 if n1 == n2, > 0 if n1 > n2 */
-UNIV_INLINE
-int
-fts_freq_doc_id_cmp(
-/*================*/
-	const void*	p1,			/*!< in: id1 */
-	const void*	p2)			/*!< in: id2 */
-{
-	const fts_doc_freq_t*	fq1 = (const fts_doc_freq_t*) p1;
-	const fts_doc_freq_t*	fq2 = (const fts_doc_freq_t*) p2;
-
-	return((int) (fq1->doc_id - fq2->doc_id));
-}
-
-#if 0
 /*******************************************************************//**
 Print the table used for calculating LCS. */
 static
@@ -671,7 +668,7 @@ fts_query_add_word_freq(
 		word_freq.doc_count = 0;
 
 		word_freq.doc_freqs = rbt_create(
-			sizeof(fts_doc_freq_t), fts_freq_doc_id_cmp);
+			sizeof(fts_doc_freq_t), fts_doc_id_field_cmp<fts_doc_freq_t>);
 
 		parent.last = rbt_add_node(
 			query->word_freqs, &parent, &word_freq);
@@ -1198,7 +1195,8 @@ fts_query_difference(
 		fetch.read_record = fts_query_index_fetch_nodes;
 
 		error = fts_index_fetch_nodes(
-			trx, &graph, &query->fts_index_table, token, &fetch);
+			trx, &graph, &query->fts_index_table, token, &fetch,
+			 false);
 
 		/* DB_FTS_EXCEED_RESULT_CACHE_LIMIT passed by 'query->error' */
 		ut_ad(!(query->error != DB_SUCCESS && error != DB_SUCCESS));
@@ -1323,7 +1321,8 @@ fts_query_intersect(
 		fetch.read_record = fts_query_index_fetch_nodes;
 
 		error = fts_index_fetch_nodes(
-			trx, &graph, &query->fts_index_table, token, &fetch);
+			trx, &graph, &query->fts_index_table, token, &fetch,
+			false);
 
 		/* DB_FTS_EXCEED_RESULT_CACHE_LIMIT passed by 'query->error' */
 		ut_ad(!(query->error != DB_SUCCESS && error != DB_SUCCESS));
@@ -1445,7 +1444,7 @@ fts_query_union(
 
 	/* Read the nodes from disk. */
 	error = fts_index_fetch_nodes(
-		trx, &graph, &query->fts_index_table, token, &fetch);
+		trx, &graph, &query->fts_index_table, token, &fetch, false);
 
 	/* DB_FTS_EXCEED_RESULT_CACHE_LIMIT passed by 'query->error' */
 	ut_ad(!(query->error != DB_SUCCESS && error != DB_SUCCESS));
@@ -2839,7 +2838,7 @@ fts_query_phrase_search(
 
 			error = fts_index_fetch_nodes(
 				trx, &graph, &query->fts_index_table,
-				token, &fetch);
+				token, &fetch, false);
 
 			/* DB_FTS_EXCEED_RESULT_CACHE_LIMIT passed by 'query->error' */
 			ut_ad(!(query->error != DB_SUCCESS && error != DB_SUCCESS));
@@ -3124,6 +3123,17 @@ fts_ast_visit_sub_exp(
 
 	DBUG_ENTER("fts_ast_visit_sub_exp");
 
+	/* sub-expression list may contains sub-expressions.
+	So we increase sub-expression depth counter.
+	If this counter reaches to the threshold then
+	we abort the search opertion and reports an error */
+	if (query->nested_exp_count > FTS_MAX_NESTED_EXP) {
+		query->error = DB_FTS_TOO_MANY_NESTED_EXP;
+		DBUG_RETURN(query->error);
+	}
+	query->nested_exp_count++;
+
+
 	ut_a(node->type == FTS_AST_SUBEXP_LIST);
 
 	cur_oper = query->oper;
@@ -3186,14 +3196,17 @@ fts_query_find_doc_id(
 		ulint		freq = 0;
 		ulint		min_pos = 0;
 		ulint		last_pos = 0;
-		ulint		pos = fts_decode_vlc(&ptr);
+		const uint64_t  delta = fts_decode_vlc(&ptr);
 
 		/* Add the delta. */
-		doc_id += pos;
+		doc_id += delta;
 
 		while (*ptr) {
 			++freq;
-			last_pos += fts_decode_vlc(&ptr);
+                        const uint64_t pos_delta = fts_decode_vlc(&ptr);
+                        ut_ad(uint64_t(last_pos) + pos_delta <=
+                              std::numeric_limits<ulint>::max());
+                        last_pos += static_cast<ulint>(pos_delta);
 
 			/* Only if min_pos is not set and the current
 			term exists in a position greater than the
@@ -3266,15 +3279,15 @@ fts_query_filter_doc_ids(
 		fts_doc_freq_t*	doc_freq;
 		fts_match_t*	match = NULL;
 		ulint		last_pos = 0;
-		ulint		pos = fts_decode_vlc(&ptr);
+		const uint64_t	delta = fts_decode_vlc(&ptr);
 
 		/* Some sanity checks. */
 		if (doc_id == 0) {
-			ut_a(pos == node->first_doc_id);
+			ut_a(delta == node->first_doc_id);
 		}
 
 		/* Add the delta. */
-		doc_id += pos;
+		doc_id += delta;
 
 		if (calc_doc_count) {
 			word_freq->doc_count++;
@@ -3304,7 +3317,10 @@ fts_query_filter_doc_ids(
 
 		/* Unpack the positions within the document. */
 		while (*ptr) {
-			last_pos += fts_decode_vlc(&ptr);
+                        const uint64_t decoded_pos = fts_decode_vlc(&ptr);
+                        ut_ad(uint64_t(last_pos) + decoded_pos
+                              <= std::numeric_limits<ulint>::max());
+                        last_pos += static_cast<ulint>(decoded_pos);
 
 			/* Collect the matching word positions, for phrase
 			matching later. */
@@ -3999,7 +4015,7 @@ fts_query(
 	bool		boolean_mode;
 	trx_t*		query_trx;
 	CHARSET_INFO*	charset;
-	ulint		start_time_ms;
+	ib_time_monotonic_ms_t		start_time_ms;
 	bool		will_be_ignored = false;
 
 	boolean_mode = flags & FTS_BOOL;
@@ -4009,7 +4025,7 @@ fts_query(
 	query_trx = trx_allocate_for_background();
 	query_trx->op_info = "FTS query";
 
-	start_time_ms = ut_time_ms();
+	start_time_ms = ut_time_monotonic_ms();
 
 	query.trx = query_trx;
 	query.index = index;
@@ -4092,7 +4108,7 @@ fts_query(
 	DEBUG_SYNC_C("fts_deleted_doc_ids_append");
 
 	/* Sort the vector so that we can do a binary search over the ids. */
-	ib_vector_sort(query.deleted->doc_ids, fts_update_doc_id_cmp);
+	ib_vector_sort(query.deleted->doc_ids, fts_doc_id_field_cmp<fts_doc_freq_t>);
 
 	/* Convert the query string to lower case before parsing. We own
 	the ut_malloc'ed result and so remember to free it before return. */
@@ -4198,7 +4214,7 @@ fts_query(
 	ut_free(lc_query_str);
 
 	if (fts_enable_diag_print && (*result)) {
-		ulint	diff_time = ut_time_ms() - start_time_ms;
+		uint64_t diff_time = ut_time_monotonic_ms() - start_time_ms;
 
 		ib::info() << "FTS Search Processing time: "
 			<< diff_time / 1000 << " secs: " << diff_time % 1000
@@ -4507,24 +4523,27 @@ fts_phrase_or_proximity_search(
 			if (k == ib_vector_size(query->match_array[j])) {
 				end_list = TRUE;
 
-				if (match[j]->doc_id != match[0]->doc_id) {
-					/* no match */
-					if (query->flags & FTS_PHRASE) {
-						ulint	s;
-
-						match[0]->doc_id = 0;
-
-						for (s = i + 1; s < n_matched;
-						     s++) {
-							match[0] = static_cast<
-							fts_match_t*>(
-							ib_vector_get(
-							query->match_array[0],
-							s));
-							match[0]->doc_id = 0;
-						}
+				if (query->flags & FTS_PHRASE) {
+					ulint	s;
+					/* Since i is the last doc id in the
+					match_array[j], remove all doc ids > i
+					from the match_array[0]. */
+					fts_match_t*    match_temp;
+					for (s = i + 1; s < n_matched; s++) {
+						match_temp = static_cast<
+						fts_match_t*>(ib_vector_get(
+						query->match_array[0], s));
+						match_temp->doc_id = 0;
 					}
 
+					if (match[j]->doc_id !=
+						match[0]->doc_id) {
+						/* no match */
+						match[0]->doc_id = 0;
+					}
+				}
+
+				if (match[j]->doc_id != match[0]->doc_id) {
 					goto func_exit;
 				}
 			}

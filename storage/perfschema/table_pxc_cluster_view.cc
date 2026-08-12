@@ -65,6 +65,11 @@ TABLE_FIELD_DEF
 table_pxc_cluster_view::m_field_def=
 { 5, field_types };
 
+PFS_engine_table_share_state
+table_pxc_cluster_view::m_share_state = {
+  false /* m_checked */
+};
+
 PFS_engine_table_share
 table_pxc_cluster_view::m_share=
 {
@@ -77,8 +82,9 @@ table_pxc_cluster_view::m_share=
   sizeof(PFS_simple_index),
   &m_table_lock,
   &m_field_def,
-  false, /* checked */
-  false  /* perpetual */
+  false, /* m_perpetual */
+  false, /* m_optional */
+  &m_share_state
 };
 
 PFS_engine_table*
@@ -132,7 +138,7 @@ int
 table_pxc_cluster_view::rnd_pos(const void *pos)
 {
   set_position(pos);
-  DBUG_ASSERT(m_pos.m_index < get_row_count());
+  assert(m_pos.m_index < get_row_count());
   make_row(m_pos.m_index);
 
   return 0;
@@ -167,7 +173,7 @@ int table_pxc_cluster_view
   if (unlikely(! m_row_exists))
     return HA_ERR_RECORD_DELETED;
 
-  DBUG_ASSERT(table->s->null_bytes == 1);
+  assert(table->s->null_bytes == 1);
   buf[0]= 0;
 
   for (; (f= *fields) ; fields++)
@@ -192,7 +198,7 @@ int table_pxc_cluster_view
         set_field_ulong(f, m_row.segment);
         break;
       default:
-        DBUG_ASSERT(false);
+        assert(false);
       }
     }
   }

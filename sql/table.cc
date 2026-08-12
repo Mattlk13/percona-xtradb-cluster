@@ -1,14 +1,21 @@
 /*
-   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2025, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -226,7 +233,7 @@ GRANT_INFO::GRANT_INFO()
   grant_table= 0;
   version= 0;
   privilege= NO_ACCESS;
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   want_privilege= 0;
 #endif
 }
@@ -279,8 +286,8 @@ static TABLE_CATEGORY get_table_category(const LEX_STRING &db,
                                          const LEX_STRING &name)
 #endif /* WITH_WSREP */
 {
-  DBUG_ASSERT(db.str != NULL);
-  DBUG_ASSERT(name.str != NULL);
+  assert(db.str != NULL);
+  assert(name.str != NULL);
 
   if (is_infoschema_db(db.str, db.length))
     return TABLE_CATEGORY_INFORMATION;
@@ -562,7 +569,7 @@ void TABLE_SHARE::destroy()
 bool TABLE_SHARE::has_compressed_columns() const
 {
   DBUG_ENTER("has_compressed_columns");
-  DBUG_ASSERT(field != 0);
+  assert(field != 0);
 
   Field **field_ptr= field;
   while(*field_ptr != 0 &&
@@ -584,7 +591,7 @@ void free_table_share(TABLE_SHARE *share)
 {
   DBUG_ENTER("free_table_share");
   DBUG_PRINT("enter", ("table: %s.%s", share->db.str, share->table_name.str));
-  DBUG_ASSERT(share->ref_count == 0);
+  assert(share->ref_count == 0);
 
   if (share->m_flush_tickets.is_empty())
   {
@@ -773,7 +780,7 @@ int open_table_def(THD *thd, TABLE_SHARE *share, uint db_flags)
       The following is a safety test and should never fail
       as the old file name should never be longer than the new one.
     */
-    DBUG_ASSERT(length <= share->normalized_path.length);
+    assert(length <= share->normalized_path.length);
     /*
       If the old and the new names have the same length,
       then table name does not have tricky characters,
@@ -881,7 +888,7 @@ err_not_open:
 
 void KEY_PART_INFO::init_flags()
 {
-  DBUG_ASSERT(field);
+  assert(field);
   if (field->type() == MYSQL_TYPE_BLOB ||
       field->type() == MYSQL_TYPE_GEOMETRY)
     key_part_flag|= HA_BLOB_PART;
@@ -970,7 +977,8 @@ static void setup_key_part_field(TABLE_SHARE *share, handler *handler_file,
   if (field->key_length() == key_part->length &&
       !(field->flags & BLOB_FLAG))
   {
-    if (handler_file->index_flags(key_n, key_part_n, 0) & HA_KEYREAD_ONLY)
+    if ((handler_file->index_flags(key_n, key_part_n, 0) & HA_KEYREAD_ONLY) &&
+        !(keyinfo->flags & HA_SPATIAL))
     {
       share->keys_for_keyread.set_bit(key_n);
       field->part_of_key.set_bit(key_n);
@@ -1010,28 +1018,36 @@ static void setup_key_part_field(TABLE_SHARE *share, handler *handler_file,
   @param[in]     share         Pointer to TABLE_SHARE
   @param[in]     handler       Pointer to handler
   @param[in,out] usable_parts  Pointer to usable_parts variable
+  @param[in]     use_extended_sk  TRUE if use_index_extensions is ON
 
   @retval                      Number of added key parts
 */
 
 static uint add_pk_parts_to_sk(KEY *sk, uint sk_n, KEY *pk, uint pk_n,
                                TABLE_SHARE *share, handler *handler_file,
-                               uint *usable_parts)
+                               uint *usable_parts, bool use_extended_sk)
 {
   uint max_key_length= sk->key_length;
-  bool is_unique_key= false;
+  /*
+    Secondary key becomes unique if the key does not exceed
+    key length limitation(MAX_KEY_LENGTH) and key parts
+    limitation(MAX_REF_PARTS) and PK parts are added to SK.
+  */
+  bool is_unique_key = use_extended_sk;
+  uint pk_part = 0;
   KEY_PART_INFO *current_key_part= &sk->key_part[sk->user_defined_key_parts];
 
   /* 
      For each keypart in the primary key: check if the keypart is
      already part of the secondary key and add it if not.
   */
-  for (uint pk_part= 0; pk_part < pk->user_defined_key_parts; pk_part++)
-  {
+  for (; pk_part < pk->user_defined_key_parts; pk_part++) {
     KEY_PART_INFO *pk_key_part= &pk->key_part[pk_part];
-    /* MySQL does not supports more key parts than MAX_REF_LENGTH */
-    if (sk->actual_key_parts >= MAX_REF_PARTS)
-      goto end;
+    /* No more than MAX_REF_PARTS key parts are supported. */
+    if (sk->actual_key_parts >= MAX_REF_PARTS) {
+      is_unique_key = false;
+      break;
+    }
 
     bool pk_field_is_in_sk= false;
     for (uint j= 0; j < sk->user_defined_key_parts; j++)
@@ -1045,12 +1061,18 @@ static uint add_pk_parts_to_sk(KEY *sk, uint sk_n, KEY *pk, uint pk_n,
       }
     }
 
-    /* Add PK field to secondary key if it's not already  part of the key. */
     if (!pk_field_is_in_sk)
     {
-      /* MySQL does not supports keys longer than MAX_KEY_LENGTH */
-      if (max_key_length + pk_key_part->length > MAX_KEY_LENGTH)
-        goto end;
+      if (max_key_length + pk_key_part->length > MAX_KEY_LENGTH) {
+        is_unique_key = false;
+        break;
+      }
+      max_key_length += pk_key_part->length;
+      /*
+        Do not add key part if SK is a unique key or
+        if use_index_extensions is OFF.
+      */
+      if ((sk->flags & HA_NOSAME) || !use_extended_sk) continue;
 
       *current_key_part= *pk_key_part;
       setup_key_part_field(share, handler_file, pk_n, sk, sk_n,
@@ -1060,18 +1082,20 @@ static uint add_pk_parts_to_sk(KEY *sk, uint sk_n, KEY *pk, uint pk_n,
       sk->rec_per_key[sk->actual_key_parts - 1]= 0;
       sk->set_records_per_key(sk->actual_key_parts - 1, REC_PER_KEY_UNKNOWN);
       current_key_part++;
-      max_key_length+= pk_key_part->length;
-      /*
-        Secondary key will be unique if the key  does not exceed
-        key length limitation and key parts limitation.
-      */
-      is_unique_key= true;
     }
   }
   if (is_unique_key)
     sk->actual_flags|= HA_NOSAME;
 
-end:
+  /*
+    Clean key maps for those PK parts which exceed
+    MAX_KEY_LENGTH or MAX_REF_PARTS limits.
+  */
+  for (; pk_part < pk->user_defined_key_parts; pk_part++) {
+    Field *fld = pk->key_part[pk_part].field;
+    fld->part_of_key.clear_bit(sk_n);
+    fld->part_of_sortkey.clear_bit(sk_n);
+  }
   return (sk->actual_key_parts - sk->user_defined_key_parts);
 }
 
@@ -1148,7 +1172,7 @@ bool get_table_and_parts_tablespace_names(
                                          ha_checktype(thd,
                                                       db_type, false, false));
     handlerton *se_hton= plugin_data<handlerton*>(se_plugin);
-    DBUG_ASSERT(se_hton);
+    assert(se_hton);
 
     // Now, assemble the parameters:
     // 1. The tablespace name (to be retrieved).
@@ -1487,7 +1511,7 @@ static int make_field_from_frm(THD *thd,
         return 4;
 
       gcol_info_length= uint2korr(*gcol_screen_pos + 1);
-      DBUG_ASSERT(gcol_info_length); // Expect non-null expression
+      assert(gcol_info_length); // Expect non-null expression
 
       fld_stored_in_db= (bool) (uint) (*gcol_screen_pos)[3];
       gcol_info->set_field_stored(fld_stored_in_db);
@@ -1679,6 +1703,7 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
   uint i,j;
   bool use_extended_sk;   // Supported extending of secondary keys with PK parts
   bool use_hash;
+  bool use_packed_keys;   // Supports packed keys.
   char *keynames, *names, *comment_pos, *gcol_screen_pos;
   char *orig_comment_pos, *orig_gcol_screen_pos;
   uchar forminfo[288];
@@ -1728,7 +1753,7 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
     goto err;
   DBUG_PRINT("info", ("default_part_db_type = %u", head[61]));
   legacy_db_type= (enum legacy_db_type) (uint) *(head+3);
-  DBUG_ASSERT(share->db_plugin == NULL);
+  assert(share->db_plugin == NULL);
   /*
     if the storage engine is dynamic, no point in resolving it by its
     dynamically allocated legacy_db_type. We will resolve it later by name.
@@ -1822,6 +1847,10 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
   share->key_info= keyinfo;
   key_part= reinterpret_cast<KEY_PART_INFO*>(keyinfo+keys);
 
+  use_packed_keys=
+    ha_check_storage_engine_flag(share->db_type(),
+                                 HTON_SUPPORTS_PACKED_KEYS);
+
   for (i=0 ; i < keys ; i++, keyinfo++)
   {
     keyinfo->table= 0;                           // Updated in open_frm
@@ -1854,6 +1883,23 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
       keyinfo->algorithm= HA_KEY_ALG_UNDEF;
       strpos+=4;
     }
+
+    /*
+      Beginning in 5.7.23, HA_PACK_KEY and HA_BINARY_PACK_KEY are no longer set
+      if the SE does not support it. If the index was created prior to 5.7.23
+      these bits may be set in the flags option, and when being added to
+      key_info->flags, the ALTER algorithm analysis will be broken because the
+      intermediate table is created without these flags, and hence, the
+      analysis will incorrectly conclude that all indexes have changed.
+
+      To workaround this issue, we remove the flags below, depending on the SE
+      capabilities, when preparing the table share. Thus, if we ALTER the table
+      at a later stage, indexes not being touched by the ALTER statement will
+      have the same flags both in the source table and the intermediate table,
+      and hence, the algorithm analysis will come to the right conclusion.
+    */
+    if (!use_packed_keys)
+      keyinfo->flags &= ~(HA_PACK_KEY | HA_BINARY_PACK_KEY);
 
     keyinfo->key_part= key_part;
     keyinfo->set_rec_per_key_array(rec_per_key, rec_per_key_float);
@@ -1920,8 +1966,8 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
                                          keyinfo->comment.length);
       strpos+= 2 + keyinfo->comment.length;
     } 
-    DBUG_ASSERT(MY_TEST(keyinfo->flags & HA_USES_COMMENT) ==
-               (keyinfo->comment.length > 0));
+    assert(MY_TEST(keyinfo->flags & HA_USES_COMMENT) ==
+           (keyinfo->comment.length > 0));
   }
 
   share->reclength = uint2korr((head+16));
@@ -2023,8 +2069,8 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
           Partition engine is ready, share->db_plugin must already contain a
           properly locked reference to it.
         */
-	DBUG_ASSERT(is_ha_partition_handlerton(plugin_data<handlerton*>(
-                                                 share->db_plugin)));
+	assert(is_ha_partition_handlerton(plugin_data<handlerton*>(
+                                                                   share->db_plugin)));
         DBUG_PRINT("info", ("setting dbtype to '%.*s' (%d)",
                             str_db_type_length, next_chunk + 2,
                             ha_legacy_type(share->db_type())));
@@ -2392,7 +2438,7 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
     comment_pos= orig_comment_pos;
     gcol_screen_pos= orig_gcol_screen_pos;
     // Generated columns can be present only in new .FRMs.
-    DBUG_ASSERT(new_frm_ver >= 3);
+    assert(new_frm_ver >= 3);
     for (i=0 ; i < share->fields; i++, strpos+=field_pack_length)
     {
       if ((strpos[10] & Field::GENERATED_FIELD) && // Field::unireg_check
@@ -2427,8 +2473,8 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
   error= 4;
   share->field[share->fields]= 0; // End marker
   /* Sanity checks: */
-  DBUG_ASSERT(share->fields >= share->stored_fields);
-  DBUG_ASSERT(share->reclength >= share->stored_rec_length);
+  assert(share->fields >= share->stored_fields);
+  assert(share->reclength >= share->stored_rec_length);
 
   /* update zip dict info (name + data) from the handler */
   if (share->has_compressed_columns())
@@ -2440,16 +2486,6 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
     const int pk_off= find_type(primary_key_name, &share->keynames,
                                   FIND_TYPE_NO_PREFIX);
     uint primary_key= (pk_off > 0 ? pk_off-1 : MAX_KEY);
-    /*
-      The following if-else is here for MyRocks:
-      set share->primary_key as early as possible, because the return value
-      of ha_rocksdb::index_flags(key, ...) (HA_KEYREAD_ONLY bit in particular)
-      depends on whether the key is the primary key.
-    */
-    if (primary_key < MAX_KEY && share->keys_in_use.is_set(primary_key))
-      share->primary_key= primary_key;
-    else
-      share->primary_key= MAX_KEY;
 
     longlong ha_option= handler_file->ha_table_flags();
     keyinfo= share->key_info;
@@ -2472,7 +2508,7 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
 	primary_key=key;
 	for (i=0 ; i < keyinfo->user_defined_key_parts ;i++)
 	{
-          DBUG_ASSERT(key_part[i].fieldnr > 0);
+          assert(key_part[i].fieldnr > 0);
           // Table field corresponding to the i'th key part.
           Field *table_field= share->field[key_part[i].fieldnr - 1];
 
@@ -2514,13 +2550,6 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
 	    break;
 	  }
 	}
-
-        /*
-          The following is here for MyRocks. See the comment above
-          about "set share->primary_key as early as possible"
-        */
-        if (primary_key < MAX_KEY && share->keys_in_use.is_set(primary_key))
-          share->primary_key= primary_key;
       }
 
       for (i=0 ; i < keyinfo->user_defined_key_parts ; key_part++,i++)
@@ -2612,11 +2641,11 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
         }
       }
 
-
-      if (use_extended_sk && primary_key < MAX_KEY &&
-          key && !(keyinfo->flags & HA_NOSAME))
-        key_part+= add_pk_parts_to_sk(keyinfo, key, share->key_info, primary_key,
-                                      share,  handler_file, &usable_parts);
+      if (primary_key < MAX_KEY && key != primary_key &&
+          (ha_option & HA_PRIMARY_KEY_IN_READ_INDEX))
+        key_part += add_pk_parts_to_sk(keyinfo, key, share->key_info,
+                                       primary_key, share, handler_file,
+                                       &usable_parts, use_extended_sk);
 
       /* Skip unused key parts if they exist */
       key_part+= keyinfo->unused_key_parts;
@@ -2645,46 +2674,31 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
     if (handler_file->init_with_fields())
       goto err;
 
-    if (primary_key < MAX_KEY && (handler_file->ha_table_flags() &
-                                  HA_PRIMARY_KEY_IN_READ_INDEX))
+    if (primary_key < MAX_KEY &&
+        (share->keys_in_use.is_set(primary_key)))
     {
-      keyinfo= &share->key_info[primary_key];
-      key_part= keyinfo->key_part;
-      for (i=0 ; i < keyinfo->user_defined_key_parts ; key_part++,i++)
-      {
-        Field *field= key_part->field;
-        /*
-          If this field is part of the primary key and all keys contains
-          the primary key, then we can use any key to find this column
-        */
-        if (field->key_length() == key_part->length &&
-            !(field->flags & BLOB_FLAG))
-          field->part_of_key= share->keys_in_use;
-        if (field->part_of_sortkey.is_set(primary_key))
-            field->part_of_sortkey= share->keys_in_use;
-      }
-    }
-
-    if (share->primary_key != MAX_KEY)
-    {
+      share->primary_key= primary_key;
       /*
-	If we are using an integer as the primary key then allow the user to
-	refer to it as '_rowid'
+       If we are using an integer as the primary key then allow the user to
+       refer to it as '_rowid'
       */
       if (share->key_info[primary_key].user_defined_key_parts == 1)
       {
-	Field *field= share->key_info[primary_key].key_part[0].field;
-	if (field && field->result_type() == INT_RESULT)
+        Field *field= share->key_info[primary_key].key_part[0].field;
+        if (field && field->result_type() == INT_RESULT)
         {
           /* note that fieldnr here (and rowid_field_offset) starts from 1 */
-	  share->rowid_field_offset= (share->key_info[primary_key].key_part[0].
-                                      fieldnr);
+          share->rowid_field_offset= (share->key_info[primary_key].key_part[0].
+              fieldnr);
         }
       }
     }
+    else
+      share->primary_key = MAX_KEY; // we do not have a primary key
   }
   else
     share->primary_key= MAX_KEY;
+
   my_free(disk_buff);
   disk_buff=0;
   if (new_field_pack_flag <= 1)
@@ -2747,7 +2761,7 @@ static int open_binary_frm(THD *thd, TABLE_SHARE *share, uchar *head,
   bitmap_set_all(&share->all_set);
 
   delete handler_file;
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   if (use_hash)
     (void) my_hash_check(&share->name_hash);
 #endif
@@ -2787,7 +2801,7 @@ static bool validate_generated_expr(Field *field)
   DBUG_ENTER("validate_generate_expr");
   Item* expr= field->gcol_info->expr_item;
   const char *field_name= field->field_name;
-  DBUG_ASSERT(expr);
+  assert(expr);
 
   /**
     These are not allowed:
@@ -2804,7 +2818,7 @@ static bool validate_generated_expr(Field *field)
     my_error(ER_GENERATED_COLUMN_FUNCTION_IS_NOT_ALLOWED, MYF(0), field_name);
     DBUG_RETURN(TRUE);
   }
-  DBUG_ASSERT(!expr->has_subquery());           // 4)
+  assert(!expr->has_subquery());           // 4)
   /*
     Walk through the Item tree, checking the validity of items
     belonging to the generated column.
@@ -2850,7 +2864,7 @@ static bool fix_fields_gcol_func(THD *thd, Field *field)
   char db_name_string[FN_REFLEN];
   bool save_use_only_table_context;
   enum_mark_columns save_mark_used_columns= thd->mark_used_columns;
-  DBUG_ASSERT(func_expr);
+  assert(func_expr);
   DBUG_ENTER("fix_fields_gcol_func");
 
   /*
@@ -2924,7 +2938,7 @@ static bool fix_fields_gcol_func(THD *thd, Field *field)
     goto end;
 
   // Virtual columns expressions that substitute themselves are invalid
-  DBUG_ASSERT(new_func == func_expr);
+  assert(new_func == func_expr);
   result= FALSE;
 
 end:
@@ -2948,7 +2962,7 @@ bool Generated_column::register_base_columns(TABLE *table)
   my_bitmap_map *bitbuf=
     static_cast<my_bitmap_map *>(alloc_root(&table->mem_root,
                                 bitmap_buffer_size(table->s->fields)));
-  DBUG_ASSERT(num_non_virtual_base_cols == 0);
+  assert(num_non_virtual_base_cols == 0);
   bitmap_init(&base_columns_map, bitbuf, table->s->fields, 0);
 
   MY_BITMAP *save_old_read_set= table->read_set;
@@ -3007,9 +3021,9 @@ static bool unpack_gcol_info_from_frm(THD *thd,
                                       bool *error_reported)
 {
   DBUG_ENTER("unpack_gcol_info_from_frm");
-  DBUG_ASSERT(field->table == table);
+  assert(field->table == table);
   LEX_STRING *gcol_expr= &field->gcol_info->expr_str;
-  DBUG_ASSERT(gcol_expr);
+  assert(gcol_expr);
   /*
     Step 1: Construct a statement for the parser.
     The parsed string needs to take the following format:
@@ -3210,7 +3224,7 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
   }
   else
   {
-    DBUG_ASSERT(!db_stat);
+    assert(!db_stat);
   }
 
   error= 4;
@@ -3309,8 +3323,15 @@ int open_table_from_share(THD *thd, TABLE_SHARE *share, const char *alias,
       {
         Field *field= key_part->field= outparam->field[key_part->fieldnr-1];
 
+        /*
+          For spatial indexes, the key parts are assigned the length (4 *
+          sizeof(double)) in mysql_prepare_create_table() and the
+          field->key_length() is set to 0. This makes it appear like a prefixed
+          index. However, prefixed indexes are not allowed on Geometric columns.
+          Hence skipping new field creation for Geometric columns.
+        */
         if (field->key_length() != key_part->length &&
-            !(field->flags & BLOB_FLAG))
+            field->type() != MYSQL_TYPE_GEOMETRY)
         {
           /*
             We are using only a prefix of the column as a key:
@@ -3491,7 +3512,7 @@ partititon_err:
 	    ibd file might be missing
           */
           error= 1;
-          DBUG_ASSERT(my_errno() == HA_ERR_TABLESPACE_MISSING);
+          assert(my_errno() == HA_ERR_TABLESPACE_MISSING);
           break;
         case HA_ERR_NO_SUCH_TABLE:
 	  /*
@@ -3584,6 +3605,37 @@ int closefrm(TABLE *table, bool free_share)
     error=table->file->ha_close();
   my_free((void *) table->alias);
   table->alias= 0;
+
+  /*
+    Iterate through the Table's Key_info and free its key_part->field if the
+    field is of BLOB type.
+
+    When a prefixed key is present, a new Field object is created in
+    open_table_from_share(). These field objects get destroyed when the Table's
+    mem_root is cleared here later. In case of Field_blob objects,
+    Field_blob::value is allocated on the heap. Thus Field_blob objects are
+    freed here in order to destruct the Field_blob::value object.
+  */
+  KEY *key_info= table->key_info;
+  if (key_info)
+  {
+    for (KEY *key_info_end= key_info + table->s->keys; key_info < key_info_end;
+         key_info++)
+    {
+      KEY_PART_INFO *key_part= key_info->key_part;
+      for (KEY_PART_INFO *key_part_end= key_part + key_info->actual_key_parts;
+           key_part < key_part_end; key_part++)
+      {
+        if (key_part->field && (key_part->field->flags & BLOB_FLAG) &&
+            key_part->field->type() != MYSQL_TYPE_GEOMETRY)
+        {
+          delete key_part->field;
+          key_part->field= 0;
+        }
+      }
+    }
+  }
+
   if (table->field)
   {
     for (Field **ptr=table->field ; *ptr ; ptr++)
@@ -4113,8 +4165,8 @@ File create_frm(THD *thd, const char *name, const char *db,
     */
     for (i= 0; i < keys; i++)
     {
-      DBUG_ASSERT(MY_TEST(key_info[i].flags & HA_USES_COMMENT) ==
-                 (key_info[i].comment.length > 0));
+      assert(MY_TEST(key_info[i].flags & HA_USES_COMMENT) ==
+             (key_info[i].comment.length > 0));
       if (key_info[i].flags & HA_USES_COMMENT)
         key_comment_total_bytes += 2 + key_info[i].comment.length;
     }
@@ -4378,19 +4430,20 @@ enum_ident_name_check check_table_name(const char *name, size_t length,
 }
 
 
-bool check_column_name(const char *name)
-{
+bool check_column_name(const Name_string &namestring) {
   // name length in symbols
   size_t name_length= 0;
   bool last_char_is_space= TRUE;
+  const char *name = namestring.ptr();
+  const char *name_end = name + namestring.length();
+  const bool is_multibyte = use_mb(system_charset_info);
 
   while (*name)
   {
     last_char_is_space= my_isspace(system_charset_info, *name);
-    if (use_mb(system_charset_info))
+    if (is_multibyte)
     {
-      int len=my_ismbchar(system_charset_info, name, 
-                          name+system_charset_info->mbmaxlen);
+      int len=my_ismbchar(system_charset_info, name, name_end);
       if (len)
       {
         name += len;
@@ -4659,7 +4712,7 @@ end:
   gvisitor->m_lock_open_count--;
   if (locked)
   {
-    DBUG_ASSERT(gvisitor->m_lock_open_count == 0);
+    assert(gvisitor->m_lock_open_count == 0);
     table_cache_manager.unlock_all_and_tdc();
   }
 
@@ -4711,7 +4764,7 @@ bool TABLE_SHARE::wait_for_old_version(THD *thd, struct timespec *abstime,
     up to date and the share is referenced. Otherwise our
     thread will never be woken up from wait.
   */
-  DBUG_ASSERT(version != refresh_version && ref_count != 0);
+  assert(version != refresh_version && ref_count != 0);
 
   m_flush_tickets.push_front(&ticket);
 
@@ -4769,7 +4822,7 @@ bool TABLE_SHARE::wait_for_old_version(THD *thd, struct timespec *abstime,
   case MDL_wait::KILLED:
     return TRUE;
   default:
-    DBUG_ASSERT(0);
+    assert(0);
     return TRUE;
   }
 }
@@ -4788,7 +4841,7 @@ bool TABLE_SHARE::wait_for_old_version(THD *thd, struct timespec *abstime,
 
 void TABLE::init(THD *thd, TABLE_LIST *tl)
 {
-  DBUG_ASSERT(s->ref_count > 0 || s->tmp_table != NO_TMP_TABLE);
+  assert(s->ref_count > 0 || s->tmp_table != NO_TMP_TABLE);
 
   if (thd->lex->need_correct_ident())
     alias_name_used= my_strcasecmp(table_alias_charset,
@@ -4816,18 +4869,18 @@ void TABLE::init(THD *thd, TABLE_LIST *tl)
   reginfo.impossible_range= 0;
 
   /* Catch wrong handling of the auto_increment_field_not_null. */
-  DBUG_ASSERT(!auto_increment_field_not_null);
+  assert(!auto_increment_field_not_null);
   auto_increment_field_not_null= FALSE;
 
   pos_in_table_list= tl;
 
   clear_column_bitmaps();
 
-  DBUG_ASSERT(key_read == 0);
+  assert(key_read == 0);
   no_keyread= false;
 
   /* Tables may be reused in a sub statement. */
-  DBUG_ASSERT(!file->extra(HA_EXTRA_IS_ATTACHED_CHILDREN));
+  assert(!file->extra(HA_EXTRA_IS_ATTACHED_CHILDREN));
   
   /*
     Do not call refix_gc_items() for tables which are not directly used by the
@@ -4845,7 +4898,7 @@ void TABLE::init(THD *thd, TABLE_LIST *tl)
   if (!pos_in_table_list->prelocking_placeholder)
   {
     bool error MY_ATTRIBUTE((unused))= refix_gc_items(thd);
-    DBUG_ASSERT(!error);
+    assert(!error);
   }
 }
 
@@ -4857,7 +4910,7 @@ bool TABLE::refix_gc_items(THD *thd)
     for (Field **vfield_ptr= vfield; *vfield_ptr; vfield_ptr++)
     {
       Field *vfield= *vfield_ptr;
-      DBUG_ASSERT(vfield->gcol_info && vfield->gcol_info->expr_item);
+      assert(vfield->gcol_info && vfield->gcol_info->expr_item);
       if (!vfield->gcol_info->expr_item->fixed)
       {
         bool res= false;
@@ -4987,7 +5040,7 @@ void TABLE::reset_item_list(List<Item> *item_list) const
   for (Field **ptr= visible_field_ptr(); *ptr; ptr++, i++)
   {
     Item_field *item_field= (Item_field*) it++;
-    DBUG_ASSERT(item_field != 0);
+    assert(item_field != 0);
     item_field->reset_field(*ptr);
   }
 }
@@ -5010,7 +5063,7 @@ TABLE_LIST *TABLE_LIST::new_nested_join(MEM_ROOT *allocator,
                             List<TABLE_LIST> *belongs_to,
                             class st_select_lex *select)
 {
-  DBUG_ASSERT(belongs_to && select);
+  assert(belongs_to && select);
 
   TABLE_LIST *const join_nest=
     (TABLE_LIST*) alloc_root(allocator, sizeof(TABLE_LIST));
@@ -5049,7 +5102,7 @@ TABLE_LIST *TABLE_LIST::new_nested_join(MEM_ROOT *allocator,
 
 bool TABLE_LIST::merge_underlying_tables(class st_select_lex *select)
 {
-  DBUG_ASSERT(nested_join->join_list.is_empty());
+  assert(nested_join->join_list.is_empty());
 
   List_iterator_fast<TABLE_LIST> li(select->top_join_list);
   TABLE_LIST *tl;
@@ -5117,7 +5170,7 @@ bool TABLE_LIST::merge_where(THD *thd)
 {
   DBUG_ENTER("TABLE_LIST::merge_where");
 
-  DBUG_ASSERT(is_merged());
+  assert(is_merged());
 
   Item *const condition= derived_unit()->first_select()->where_cond();
 
@@ -5160,9 +5213,9 @@ bool TABLE_LIST::create_field_translation(THD *thd)
   List_iterator_fast<Item> it(select->item_list);
   uint field_count= 0;
 
-  DBUG_ASSERT(derived->is_prepared());
+  assert(derived->is_prepared());
 
-  DBUG_ASSERT(!field_translation);
+  assert(!field_translation);
 
   Prepared_stmt_arena_holder ps_arena_holder(thd);
 
@@ -5264,7 +5317,7 @@ static bool merge_join_conditions(THD *thd, TABLE_LIST *table, Item **pcond)
 bool TABLE_LIST::prepare_check_option(THD *thd, bool is_cascaded)
 {
   DBUG_ENTER("TABLE_LIST::prepare_check_option");
-  DBUG_ASSERT(is_view());
+  assert(is_view());
 
   /*
     True if conditions of underlying views should be treated as WITH CASCADED
@@ -5460,7 +5513,7 @@ bool TABLE_LIST::set_insert_values(MEM_ROOT *mem_root)
   }
   else
   {
-    DBUG_ASSERT(view && merge_underlying_list);
+    assert(view && merge_underlying_list);
     for (TABLE_LIST *tbl= merge_underlying_list; tbl; tbl= tbl->next_local)
       if (tbl->set_insert_values(mem_root))
         return true;                     /* purecov: inspected */
@@ -5522,7 +5575,7 @@ TABLE_LIST *TABLE_LIST::first_leaf_for_name_resolution()
 
   if (is_leaf_for_name_resolution())
     return this;
-  DBUG_ASSERT(nested_join);
+  assert(nested_join);
 
   for (cur_nested_join= nested_join;
        cur_nested_join;
@@ -5579,7 +5632,7 @@ TABLE_LIST *TABLE_LIST::last_leaf_for_name_resolution()
 
   if (is_leaf_for_name_resolution())
     return this;
-  DBUG_ASSERT(nested_join);
+  assert(nested_join);
 
   for (cur_nested_join= nested_join;
        cur_nested_join;
@@ -5614,7 +5667,7 @@ TABLE_LIST *TABLE_LIST::last_leaf_for_name_resolution()
 
 void TABLE_LIST::set_want_privilege(ulong want_privilege)
 {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   // Remove SHOW_VIEW_ACL, because it will be checked during making view
   want_privilege&= ~SHOW_VIEW_ACL;
 
@@ -5645,11 +5698,11 @@ bool TABLE_LIST::prepare_view_securety_context(THD *thd)
   DBUG_ENTER("TABLE_LIST::prepare_view_securety_context");
   DBUG_PRINT("enter", ("table: %s", alias));
 
-  DBUG_ASSERT(!prelocking_placeholder && view);
+  assert(!prelocking_placeholder && view);
   if (view_suid)
   {
     DBUG_PRINT("info", ("This table is suid view => load contest"));
-    DBUG_ASSERT(view && view_sctx);
+    assert(view && view_sctx);
     if (acl_getroot(view_sctx,
                     const_cast<char*>(definer.user.str),
                     const_cast<char*>(definer.host.str),
@@ -5708,10 +5761,10 @@ Security_context *TABLE_LIST::find_view_security_context(THD *thd)
   TABLE_LIST *upper_view= this;
   DBUG_ENTER("TABLE_LIST::find_view_security_context");
 
-  DBUG_ASSERT(view);
+  assert(view);
   while (upper_view && !upper_view->view_suid)
   {
-    DBUG_ASSERT(!upper_view->prelocking_placeholder);
+    assert(!upper_view->prelocking_placeholder);
     upper_view= upper_view->referencing_view;
   }
   if (upper_view)
@@ -5719,7 +5772,7 @@ Security_context *TABLE_LIST::find_view_security_context(THD *thd)
     DBUG_PRINT("info", ("Securety context of view %s will be used",
                         upper_view->alias));
     sctx= upper_view->view_sctx;
-    DBUG_ASSERT(sctx);
+    assert(sctx);
   }
   else
   {
@@ -5751,14 +5804,14 @@ bool TABLE_LIST::prepare_security(THD *thd)
 #ifndef NO_EMBEDDED_ACCESS_CHECKS
   Security_context *save_security_ctx= thd->security_context();
 
-  DBUG_ASSERT(!prelocking_placeholder);
+  assert(!prelocking_placeholder);
   if (prepare_view_securety_context(thd))
     DBUG_RETURN(TRUE);
   thd->set_security_context(find_view_security_context(thd));
   opt_trace_disable_if_no_security_context_access(thd);
   while ((tbl= tb++))
   {
-    DBUG_ASSERT(tbl->referencing_view);
+    assert(tbl->referencing_view);
     const char *local_db, *local_table_name;
     if (tbl->is_view())
     {
@@ -5793,7 +5846,7 @@ bool TABLE_LIST::prepare_security(THD *thd)
 Natural_join_column::Natural_join_column(Field_translator *field_param,
                                          TABLE_LIST *tab)
 {
-  DBUG_ASSERT(tab->field_translation);
+  assert(tab->field_translation);
   view_field= field_param;
   table_field= NULL;
   table_ref= tab;
@@ -5804,7 +5857,7 @@ Natural_join_column::Natural_join_column(Field_translator *field_param,
 Natural_join_column::Natural_join_column(Item_field *field_param,
                                          TABLE_LIST *tab)
 {
-  DBUG_ASSERT(tab->table == field_param->field->table);
+  assert(tab->table == field_param->field->table);
   table_field= field_param;
   /*
     Cache table, to have no resolution problem after natural join nests have
@@ -5822,7 +5875,7 @@ const char *Natural_join_column::name()
 {
   if (view_field)
   {
-    DBUG_ASSERT(table_field == NULL);
+    assert(table_field == NULL);
     return view_field->name;
   }
 
@@ -5834,7 +5887,7 @@ Item *Natural_join_column::create_item(THD *thd)
 {
   if (view_field)
   {
-    DBUG_ASSERT(table_field == NULL);
+    assert(table_field == NULL);
     SELECT_LEX *select= thd->lex->current_select();
     return create_view_field(thd, table_ref, &view_field->item,
                              view_field->name, &select->context);
@@ -5847,7 +5900,7 @@ Field *Natural_join_column::field()
 {
   if (view_field)
   {
-    DBUG_ASSERT(table_field == NULL);
+    assert(table_field == NULL);
     return NULL;
   }
   return table_field->field;
@@ -5856,7 +5909,7 @@ Field *Natural_join_column::field()
 
 const char *Natural_join_column::table_name()
 {
-  DBUG_ASSERT(table_ref);
+  assert(table_ref);
   return table_ref->alias;
 }
 
@@ -5871,11 +5924,11 @@ const char *Natural_join_column::db_name()
     ensure consistency. An exception are I_S schema tables, which
     are inconsistent in this respect.
   */
-  DBUG_ASSERT(!strcmp(table_ref->db,
-                      table_ref->table->s->db.str) ||
-              (table_ref->schema_table &&
-               is_infoschema_db(table_ref->table->s->db.str,
-                                table_ref->table->s->db.length)));
+  assert(!strcmp(table_ref->db,
+                 table_ref->table->s->db.str) ||
+         (table_ref->schema_table &&
+          is_infoschema_db(table_ref->table->s->db.str,
+                           table_ref->table->s->db.length)));
   return table_ref->db;
 }
 
@@ -5890,7 +5943,7 @@ GRANT_INFO *Natural_join_column::grant()
 
 void Field_iterator_view::set(TABLE_LIST *table)
 {
-  DBUG_ASSERT(table->field_translation);
+  assert(table->field_translation);
   view= table;
   ptr= table->field_translation;
   array_end= table->field_translation_end;
@@ -5949,11 +6002,11 @@ static Item *create_view_field(THD *thd, TABLE_LIST *view, Item **field_ref,
       ('mysql_schema_table' function). So we can return directly the
       field. This case happens only for 'show & where' commands.
     */
-    DBUG_ASSERT(field && field->fixed);
+    assert(field && field->fixed);
     DBUG_RETURN(field);
   }
 
-  DBUG_ASSERT(field);
+  assert(field);
   if (!field->fixed)
   {
     if (field->fix_fields(thd, field_ref))
@@ -5974,7 +6027,7 @@ static Item *create_view_field(THD *thd, TABLE_LIST *view, Item **field_ref,
       field= down_cast<Item_ref *>(field)->ref[0];
     }
     if (field->type() == Item::FIELD_ITEM)
-      table_name= down_cast<Item_field *>(field)->table_name;
+      table_name= thd->mem_strdup(down_cast<Item_field *>(field)->table_name);
     else
       table_name= "";
   }
@@ -5999,7 +6052,7 @@ static Item *create_view_field(THD *thd, TABLE_LIST *view, Item **field_ref,
 
 void Field_iterator_natural_join::set(TABLE_LIST *table_ref)
 {
-  DBUG_ASSERT(table_ref->join_columns);
+  assert(table_ref->join_columns);
   column_ref_it.init(*(table_ref->join_columns));
   cur_column_ref= column_ref_it++;
 }
@@ -6008,9 +6061,9 @@ void Field_iterator_natural_join::set(TABLE_LIST *table_ref)
 void Field_iterator_natural_join::next()
 {
   cur_column_ref= column_ref_it++;
-  DBUG_ASSERT(!cur_column_ref || ! cur_column_ref->table_field ||
-              cur_column_ref->table_ref->table ==
-              cur_column_ref->table_field->field->table);
+  assert(!cur_column_ref || ! cur_column_ref->table_field ||
+         cur_column_ref->table_ref->table ==
+         cur_column_ref->table_field->field->table);
 }
 
 
@@ -6027,18 +6080,18 @@ void Field_iterator_table_ref::set_field_iterator()
   if (table_ref->is_join_columns_complete)
   {
     /* Necesary, but insufficient conditions. */
-    DBUG_ASSERT(table_ref->is_natural_join ||
-                table_ref->nested_join ||
-                (table_ref->join_columns &&
-                /* This is a merge view. */
-                ((table_ref->field_translation &&
-                  table_ref->join_columns->elements ==
-                  (ulong)(table_ref->field_translation_end -
-                          table_ref->field_translation)) ||
-                 /* This is stored table or a tmptable view. */
-                 (!table_ref->field_translation &&
-                  table_ref->join_columns->elements ==
-                  table_ref->table->s->fields))));
+    assert(table_ref->is_natural_join ||
+           table_ref->nested_join ||
+           (table_ref->join_columns &&
+            /* This is a merge view. */
+            ((table_ref->field_translation &&
+              table_ref->join_columns->elements ==
+              (ulong)(table_ref->field_translation_end -
+                      table_ref->field_translation)) ||
+             /* This is stored table or a tmptable view. */
+             (!table_ref->field_translation &&
+              table_ref->join_columns->elements ==
+              table_ref->table->s->fields))));
     field_it= &natural_join_it;
     DBUG_PRINT("info",("field_it for '%s' is Field_iterator_natural_join",
                        table_ref->alias));
@@ -6046,7 +6099,7 @@ void Field_iterator_table_ref::set_field_iterator()
   /* This is a merge view, so use field_translation. */
   else if (table_ref->field_translation)
   {
-    DBUG_ASSERT(table_ref->is_merged());
+    assert(table_ref->is_merged());
     field_it= &view_field_it;
     DBUG_PRINT("info", ("field_it for '%s' is Field_iterator_view",
                         table_ref->alias));
@@ -6054,7 +6107,7 @@ void Field_iterator_table_ref::set_field_iterator()
   /* This is a base table or stored view. */
   else
   {
-    DBUG_ASSERT(table_ref->table || table_ref->is_view());
+    assert(table_ref->table || table_ref->is_view());
     field_it= &table_field_it;
     DBUG_PRINT("info", ("field_it for '%s' is Field_iterator_table",
                         table_ref->alias));
@@ -6066,10 +6119,10 @@ void Field_iterator_table_ref::set_field_iterator()
 
 void Field_iterator_table_ref::set(TABLE_LIST *table)
 {
-  DBUG_ASSERT(table);
+  assert(table);
   first_leaf= table->first_leaf_for_name_resolution();
   last_leaf=  table->last_leaf_for_name_resolution();
-  DBUG_ASSERT(first_leaf && last_leaf);
+  assert(first_leaf && last_leaf);
   table_ref= first_leaf;
   set_field_iterator();
 }
@@ -6086,7 +6139,7 @@ void Field_iterator_table_ref::next()
   if (field_it->end_of_fields() && table_ref != last_leaf)
   {
     table_ref= table_ref->next_name_resolution_table;
-    DBUG_ASSERT(table_ref);
+    assert(table_ref);
     set_field_iterator();
   }
 }
@@ -6099,8 +6152,8 @@ const char *Field_iterator_table_ref::get_table_name()
   else if (table_ref->is_natural_join)
     return natural_join_it.column_ref()->table_name();
 
-  DBUG_ASSERT(!strcmp(table_ref->table_name,
-                      table_ref->table->s->table_name.str));
+  assert(!strcmp(table_ref->table_name,
+                 table_ref->table->s->table_name.str));
   return table_ref->table_name;
 }
 
@@ -6117,10 +6170,10 @@ const char *Field_iterator_table_ref::get_db_name()
     ensure consistency. An exception are I_S schema tables, which
     are inconsistent in this respect.
   */
-  DBUG_ASSERT(!strcmp(table_ref->db, table_ref->table->s->db.str) ||
-              (table_ref->schema_table &&
-               is_infoschema_db(table_ref->table->s->db.str,
-                                table_ref->table->s->db.length)));
+  assert(!strcmp(table_ref->db, table_ref->table->s->db.str) ||
+         (table_ref->schema_table &&
+          is_infoschema_db(table_ref->table->s->db.str,
+                           table_ref->table->s->db.length)));
 
   return table_ref->db;
 }
@@ -6208,13 +6261,13 @@ Field_iterator_table_ref::get_or_create_column_ref(THD *thd, TABLE_LIST *parent_
       already created via one of the two constructor calls above. In this case
       we just return the already created column reference.
     */
-    DBUG_ASSERT(table_ref->is_join_columns_complete);
+    assert(table_ref->is_join_columns_complete);
     is_created= FALSE;
     nj_col= natural_join_it.column_ref();
-    DBUG_ASSERT(nj_col);
+    assert(nj_col);
   }
-  DBUG_ASSERT(!nj_col->table_field ||
-              nj_col->table_ref->table == nj_col->table_field->field->table);
+  assert(!nj_col->table_field ||
+         nj_col->table_ref->table == nj_col->table_field->field->table);
 
   /*
     If the natural join column was just created add it to the list of
@@ -6224,7 +6277,7 @@ Field_iterator_table_ref::get_or_create_column_ref(THD *thd, TABLE_LIST *parent_
   if (is_created)
   {
     /* Make sure not all columns were materialized. */
-    DBUG_ASSERT(!add_table_ref->is_join_columns_complete);
+    assert(!add_table_ref->is_join_columns_complete);
     if (!add_table_ref->join_columns)
     {
       /* Create a list of natural join columns on demand. */
@@ -6270,16 +6323,16 @@ Field_iterator_table_ref::get_natural_column_ref()
 {
   Natural_join_column *nj_col;
 
-  DBUG_ASSERT(field_it == &natural_join_it);
+  assert(field_it == &natural_join_it);
   /*
     The field belongs to a NATURAL join, therefore the column reference was
     already created via one of the two constructor calls above. In this case
     we just return the already created column reference.
   */
   nj_col= natural_join_it.column_ref();
-  DBUG_ASSERT(nj_col &&
-              (!nj_col->table_field ||
-               nj_col->table_ref->table == nj_col->table_field->field->table));
+  assert(nj_col &&
+         (!nj_col->table_field ||
+          nj_col->table_ref->table == nj_col->table_field->field->table));
   return nj_col;
 }
 
@@ -6385,7 +6438,7 @@ void TABLE::mark_column_used(THD *thd, Field *field,
       DBUG_PRINT("warning", ("Found duplicated field"));
       thd->dup_field= field;
     }
-    DBUG_ASSERT(!get_fields_in_item_tree);
+    assert(!get_fields_in_item_tree);
 
     if (field->is_gcol())
       mark_gcol_in_maps(field);
@@ -6478,7 +6531,7 @@ void TABLE::mark_columns_used_by_index_no_reset(uint index,
 
 void TABLE::mark_auto_increment_column()
 {
-  DBUG_ASSERT(found_next_number_field);
+  assert(found_next_number_field);
   /*
     We must set bit in read set as update_auto_increment() is using the
     store() to check overflow of auto_increment values
@@ -6696,8 +6749,8 @@ void TABLE::mark_columns_needed_for_update(bool mark_binlog_columns)
 void TABLE::mark_columns_per_binlog_row_image()
 {
   DBUG_ENTER("mark_columns_per_binlog_row_image");
-  DBUG_ASSERT(read_set->bitmap);
-  DBUG_ASSERT(write_set->bitmap);
+  assert(read_set->bitmap);
+  assert(write_set->bitmap);
 
   /**
     If in RBR we may need to mark some extra columns,
@@ -6756,7 +6809,7 @@ void TABLE::mark_columns_per_binlog_row_image()
         break;
 
       default: 
-        DBUG_ASSERT(FALSE);
+        assert(FALSE);
     }
     file->column_bitmaps_signal();
   }
@@ -6781,7 +6834,7 @@ void TABLE::mark_columns_per_binlog_row_image()
 
 bool TABLE::alloc_keys(uint key_count)
 {
-  DBUG_ASSERT(!s->keys);
+  assert(!s->keys);
   max_keys= key_count;
   if (!(key_info= s->key_info=
         (KEY*) alloc_root(&mem_root, sizeof(KEY)*max_keys)))
@@ -6813,7 +6866,7 @@ bool TABLE::alloc_keys(uint key_count)
 
 bool TABLE::add_tmp_key(Field_map *key_parts, char *key_name)
 {
-  DBUG_ASSERT(!created && s->keys < max_keys && key_parts);
+  assert(!created && s->keys < max_keys && key_parts);
 
   KEY* cur_key= key_info + s->keys;
   Field **reg_field;
@@ -6830,7 +6883,7 @@ bool TABLE::add_tmp_key(Field_map *key_parts, char *key_name)
     {
       KEY_PART_INFO tkp;
       // Ensure that we're not creating a key over a blob field.
-      DBUG_ASSERT(!((*reg_field)->flags & BLOB_FLAG));
+      assert(!((*reg_field)->flags & BLOB_FLAG));
       /*
         Check if possible key is too long, ignore it if so.
         The reason to use MI_MAX_KEY_LENGTH (myisam's default) is that it is
@@ -6926,7 +6979,7 @@ bool TABLE::add_tmp_key(Field_map *key_parts, char *key_name)
 
 void TABLE::use_index(int key_to_save)
 {
-  DBUG_ASSERT(!created && s->keys && key_to_save < (int)s->keys);
+  assert(!created && s->keys && key_to_save < (int)s->keys);
 
   Field **reg_field;
   /*
@@ -7076,7 +7129,7 @@ void TABLE::mark_generated_columns(bool is_update)
     for (vfield_ptr= vfield; *vfield_ptr; vfield_ptr++)
     {
       tmp_vfield= *vfield_ptr;
-      DBUG_ASSERT(tmp_vfield->gcol_info && tmp_vfield->gcol_info->expr_item);
+      assert(tmp_vfield->gcol_info && tmp_vfield->gcol_info->expr_item);
 
       /*
         We need to evaluate the GC if:
@@ -7108,7 +7161,7 @@ void TABLE::mark_generated_columns(bool is_update)
     for (vfield_ptr= vfield; *vfield_ptr; vfield_ptr++)
     {
       tmp_vfield= *vfield_ptr;
-      DBUG_ASSERT(tmp_vfield->gcol_info && tmp_vfield->gcol_info->expr_item);
+      assert(tmp_vfield->gcol_info && tmp_vfield->gcol_info->expr_item);
       tmp_vfield->table->mark_column_used(in_use, tmp_vfield,
                                           MARK_COLUMNS_WRITE);
       bitmap_updated= TRUE;
@@ -7137,7 +7190,7 @@ bool TABLE::is_field_used_by_generated_columns(uint field_index)
   for (Field **vfield_ptr= vfield; *vfield_ptr; vfield_ptr++)
   {
     Field *tmp_vfield= *vfield_ptr;
-    DBUG_ASSERT(tmp_vfield->gcol_info && tmp_vfield->gcol_info->expr_item);
+    assert(tmp_vfield->gcol_info && tmp_vfield->gcol_info->expr_item);
     Mark_field mark_fld(MARK_COLUMNS_TEMP);
     tmp_vfield->gcol_info->expr_item->walk(&Item::mark_field_in_map,
                                            Item::WALK_PREFIX, (uchar *) &mark_fld);
@@ -7425,7 +7478,7 @@ bool TABLE_LIST::is_mergeable() const
 ///  @returns true if materializable table contains one or zero rows
 bool TABLE_LIST::materializable_is_const() const
 {
-  DBUG_ASSERT(uses_materialization());
+  assert(uses_materialization());
   return derived_unit()->query_result()->estimated_rowcount <= 1;
 }
 
@@ -7437,7 +7490,7 @@ bool TABLE_LIST::materializable_is_const() const
 uint TABLE_LIST::leaf_tables_count() const
 {
   // Join nests are not permissible, except as merged views
-  DBUG_ASSERT(nested_join == NULL || is_merged());
+  assert(nested_join == NULL || is_merged());
   if (!is_merged())  // Base table or materialized view
     return 1;
 
@@ -7708,7 +7761,7 @@ bool TABLE_LIST::generate_keys()
   Derived_key *entry;
   uint key= 0;
   char buf[NAME_CHAR_LEN];
-  DBUG_ASSERT(uses_materialization());
+  assert(uses_materialization());
 
   if (!derived_key_list.elements)
     return FALSE;
@@ -7783,8 +7836,8 @@ bool TABLE::check_read_removal(uint index)
   bool retval= false;
 
   DBUG_ENTER("check_read_removal");
-  DBUG_ASSERT(file->ha_table_flags() & HA_READ_BEFORE_WRITE_REMOVAL);
-  DBUG_ASSERT(index != MAX_KEY);
+  assert(file->ha_table_flags() & HA_READ_BEFORE_WRITE_REMOVAL);
+  assert(index != MAX_KEY);
 
   // Index must be unique
   if ((key_info[index].flags & HA_NOSAME) == 0)
@@ -7811,7 +7864,7 @@ bool TABLE::check_read_removal(uint index)
 bool TABLE::has_compressed_columns() const
 {
   DBUG_ENTER("has_compressed_columns");
-  DBUG_ASSERT(field != 0);
+  assert(field != 0);
 
   Field **field_ptr= field;
   while(*field_ptr != 0 &&
@@ -7829,7 +7882,7 @@ bool TABLE::has_compressed_columns() const
 bool TABLE::has_compressed_columns_with_dictionaries() const
 {
   DBUG_ENTER("has_compressed_columns_with_dictionaries");
-  DBUG_ASSERT(field != 0);
+  assert(field != 0);
 
   Field **field_ptr= field;
   while(*field_ptr != 0 &&
@@ -7855,8 +7908,8 @@ void TABLE::update_compressed_columns_info(const List<Create_field>& fields)
     ++field_ptr;
     field_definition= it++;
   }
-  DBUG_ASSERT(field_definition == 0);
-  DBUG_ASSERT(*field_ptr == 0);
+  assert(field_definition == 0);
+  assert(*field_ptr == 0);
 }
 
 /**
@@ -7913,7 +7966,7 @@ void repoint_field_to_record(TABLE *table, uchar *old_rec, uchar *new_rec)
 bool update_generated_read_fields(uchar *buf, TABLE *table, uint active_index)
 {
   DBUG_ENTER("update_generated_read_fields");
-  DBUG_ASSERT(table && table->vfield);
+  assert(table && table->vfield);
   if (active_index != MAX_KEY && table->key_read)
   {
     /*
@@ -7945,7 +7998,7 @@ bool update_generated_read_fields(uchar *buf, TABLE *table, uint active_index)
   for (Field **vfield_ptr= table->vfield; *vfield_ptr; vfield_ptr++)
   {
     Field *vfield= *vfield_ptr;
-    DBUG_ASSERT(vfield->gcol_info && vfield->gcol_info->expr_item);
+    assert(vfield->gcol_info && vfield->gcol_info->expr_item);
     /*
       Only calculate those virtual generated fields that are marked in the
       read_set bitmap.
@@ -8015,13 +8068,13 @@ bool update_generated_write_fields(const MY_BITMAP *bitmap, TABLE *table)
   Field **vfield_ptr;
   int error= 0;
 
-  DBUG_ASSERT(table->vfield);
+  assert(table->vfield);
   /* Iterate over generated fields in the table */
   for (vfield_ptr= table->vfield; *vfield_ptr; vfield_ptr++)
   {
     Field *vfield;
     vfield= (*vfield_ptr);
-    DBUG_ASSERT(vfield->gcol_info && vfield->gcol_info->expr_item);
+    assert(vfield->gcol_info && vfield->gcol_info->expr_item);
 
     /* Only update those fields that are marked in the bitmap */
     if (bitmap_is_set(bitmap, vfield->field_index))

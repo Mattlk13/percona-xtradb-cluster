@@ -21,6 +21,7 @@
 #include "sql_parse.h"
 #include "sql_base.h" // close_thread_tables()
 #include "mysqld.h"   // start_wsrep_THD();
+#include "debug_sync.h"
 
 static long long wsrep_bf_aborts_counter = 0;
 
@@ -31,6 +32,8 @@ int wsrep_show_bf_aborts (THD *thd, SHOW_VAR *var, char *buff)
     var->value = (char*)&wsrep_local_bf_aborts;
     return 0;
 }
+
+extern void mysql_ha_flush(THD *thd);
 
 /* must have (&thd->LOCK_wsrep_thd) */
 void wsrep_client_rollback(THD *thd)
@@ -68,6 +71,12 @@ void wsrep_client_rollback(THD *thd)
 
   /* Release all user-locks. */
   mysql_ull_cleanup(thd);
+
+  /* If there are any tables opened by HANDLER OPEN statement
+     we need to close them before releasing explicit MDL locks.
+     If we don't do it, DDL which caused BF-abort, like DROP TABLE
+     will detect that there are still open table instances and abort. */
+  if (thd->handler_tables_hash.records) mysql_ha_flush(thd);
 
   /* release explicit MDL locks */
   thd->mdl_context.release_explicit_locks();
@@ -109,14 +118,20 @@ static void wsrep_prepare_bf_thd(THD *thd, struct wsrep_thd_shadow* shadow)
   shadow->server_status = thd->server_status;
   shadow->wsrep_exec_mode = thd->wsrep_exec_mode;
   shadow->vio           = thd->active_vio;
-
+  shadow->rli_slave     = thd->rli_slave;
   // Disable general logging on applier threads
   thd->variables.option_bits |= OPTION_LOG_OFF;
   // Enable binlogging if opt_log_slave_updates is set
   if (opt_log_slave_updates)
+  {
     thd->variables.option_bits|= OPTION_BIN_LOG;
+    thd->variables.option_bits&= ~(OPTION_BIN_LOG_INTERNAL_OFF);
+  }
   else
+  {
     thd->variables.option_bits&= ~(OPTION_BIN_LOG);
+    thd->variables.option_bits|= OPTION_BIN_LOG_INTERNAL_OFF;
+  }
 
 #ifdef GALERA
   /*
@@ -130,7 +145,6 @@ static void wsrep_prepare_bf_thd(THD *thd, struct wsrep_thd_shadow* shadow)
   if (!thd->wsrep_rli)
   {
     thd->wsrep_rli = wsrep_relay_log_init("wsrep_relay");
-    assert(!thd->rli_slave);
     thd->rli_slave = thd->wsrep_rli;
     thd->wsrep_rli->info_thd= thd;
     thd->init_for_queries(thd->wsrep_rli);
@@ -161,17 +175,15 @@ static void wsrep_return_from_bf_mode(THD *thd, struct wsrep_thd_shadow* shadow)
   thd->variables.tx_isolation = shadow->tx_isolation;
   thd->reset_db(shadow->db);
   thd->user_time              = shadow->user_time;
-
   assert(thd->rli_slave == thd->wsrep_rli);
-  thd->rli_slave = NULL;
+  thd->rli_slave              = shadow->rli_slave;
 
   delete thd->wsrep_rli->current_mts_submode;
   thd->wsrep_rli->current_mts_submode = 0;
+  thd->wsrep_rli->cleanup_after_session();
   delete thd->wsrep_rli;
   thd->wsrep_rli = 0;
-#ifdef GALERA
-  thd->slave_thread = FALSE;
-#endif /* GALERA */
+  thd->slave_thread = (thd->rli_slave) ? TRUE : FALSE;
   thd->set_row_count_func(shadow->row_count_func);
 }
 
@@ -179,9 +191,9 @@ void wsrep_replay_sp_transaction(THD* thd)
 {
   DBUG_ENTER("wsrep_replay_sp_transaction");
   mysql_mutex_assert_owner(&thd->LOCK_wsrep_thd);
-  DBUG_ASSERT(thd->wsrep_conflict_state == MUST_REPLAY);
-  DBUG_ASSERT(thd->sp_runtime_ctx);
-  DBUG_ASSERT(wsrep_thd_trx_seqno(thd) > 0);
+  assert(thd->wsrep_conflict_state == MUST_REPLAY);
+  assert(thd->sp_runtime_ctx);
+  assert(wsrep_thd_trx_seqno(thd) > 0);
 
   close_thread_tables(thd);
   if (thd->locked_tables_mode && thd->lock)
@@ -284,7 +296,7 @@ void wsrep_replay_transaction(THD *thd)
   DBUG_ENTER("wsrep_replay_transaction");
   /* checking if BF trx must be replayed */
   if (thd->wsrep_conflict_state== MUST_REPLAY) {
-    DBUG_ASSERT(wsrep_thd_trx_seqno(thd));
+    assert(wsrep_thd_trx_seqno(thd));
     if (thd->wsrep_exec_mode!= REPL_RECV) {
       if (thd->get_stmt_da()->is_sent())
       {
@@ -363,6 +375,16 @@ void wsrep_replay_transaction(THD *thd)
       thd->variables.option_bits|= OPTION_BEGIN;
       thd->server_status|= SERVER_STATUS_IN_TRANS;
 
+      // Allow tests to block the applier thread using the DBUG facilities.
+      DBUG_EXECUTE_IF("sync.wsrep_replay_cb",
+                      {
+                        const char act[]=
+                          "now "
+                          "SIGNAL sync.wsrep_replay_cb_reached "
+                          "WAIT_FOR signal.wsrep_replay_cb";
+                        assert(!debug_sync_set_action(thd,
+                                                      STRING_WITH_LEN(act)));
+                      };);
       int rcode = wsrep->replay_trx(wsrep,
                                     &thd->wsrep_ws_handle,
                                     (void *)thd);
@@ -644,7 +666,7 @@ static void wsrep_rollback_process(THD *thd)
 
       /* Clear the thread state, since the rollback thread is done with it */
       aborting->restore_globals();
-
+      thd->store_globals();
       mysql_mutex_lock(&LOCK_wsrep_rollback);
     }
   }
@@ -658,7 +680,6 @@ static void wsrep_rollback_process(THD *thd)
   mysql_mutex_unlock(&thd->LOCK_thd_data);
 
   sql_print_information("WSREP: rollbacker thread exiting");
-  thd->store_globals();
   DBUG_PRINT("wsrep",("wsrep rollbacker thread exiting"));
   DBUG_VOID_RETURN;
 }
@@ -673,12 +694,12 @@ void wsrep_create_rollbacker()
   }
 }
 
-void wsrep_thd_set_PA_safe(void *thd_ptr, my_bool safe)
+void wsrep_thd_set_PA_unsafe(void *thd_ptr)
 { 
   if (thd_ptr) 
   {
     THD* thd = (THD*)thd_ptr;
-    thd->wsrep_PA_safe = safe;
+    thd->wsrep_PA_safe = false;
   }
 }
 
@@ -807,6 +828,17 @@ bool wsrep_safe_to_persist_xid(THD* thd)
 {
   /* Rollback of transaction too also invoke persist of XID.
   Avoid persisting XID in this use-case. */
+  
+  /* This method is the part of performance improvement
+  (introduce in commi c01c75da8ec67197e5b2f86edbdd9541df717faa)
+  Before upstream wsrep_5.7.30-25.22 merge we never got here in case of 
+  recovery, because xid was unconditionally reset in trx_get_trx_by_xid_low()
+  and then we skipped this call in trx_write_serialisation_history()
+  Togheter with wsrep_5.7.30-25.22 merge we have conditional xid reset in trx_get_trx_by_xid_low()
+  and as it is WSREP xid, we are not resetting it, so we get here. However, we do not have
+  thd context. In this case skip the optimization. */
+  if (!thd) return true;
+
   bool safe_to_persist_xid= false;
   if (thd->wsrep_conflict_state == NO_CONFLICT      ||
       thd->wsrep_conflict_state == REPLAYING        ||

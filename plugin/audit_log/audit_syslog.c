@@ -29,10 +29,10 @@ struct audit_handler_syslog_data_struct
   logger_epilog_func_t footer;
 };
 
-int audit_handler_syslog_write(audit_handler_t *handler,
-                               const char *buf, size_t len);
-int audit_handler_syslog_flush(audit_handler_t *handler);
-int audit_handler_syslog_close(audit_handler_t *handler);
+static int audit_handler_syslog_write(audit_handler_t *handler,
+                                      const char *buf, size_t len);
+static int audit_handler_syslog_flush(audit_handler_t *handler);
+static int audit_handler_syslog_close(audit_handler_t *handler);
 
 
 audit_handler_t *audit_handler_syslog_open(audit_handler_syslog_config_t *opts)
@@ -62,16 +62,18 @@ audit_handler_t *audit_handler_syslog_open(audit_handler_syslog_config_t *opts)
   return handler;
 }
 
+static
 int audit_handler_syslog_write(audit_handler_t *handler,
                                const char *buf, size_t len)
 {
   audit_handler_syslog_data_t *data=
                                    (audit_handler_syslog_data_t*) handler->data;
-  DBUG_ASSERT(data->struct_size == sizeof(audit_handler_syslog_data_t));
+  assert(data->struct_size == sizeof(audit_handler_syslog_data_t));
   syslog(data->priority, "%s", buf);
   return len;
 }
 
+static
 int audit_handler_syslog_flush(audit_handler_t *handler)
 {
   audit_handler_syslog_data_t *data=
@@ -83,6 +85,7 @@ int audit_handler_syslog_flush(audit_handler_t *handler)
   return 0;
 }
 
+static
 int audit_handler_syslog_close(audit_handler_t *handler)
 {
   audit_handler_syslog_data_t *data=

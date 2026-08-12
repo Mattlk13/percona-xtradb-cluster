@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -1343,7 +1351,7 @@ lock_rec_other_has_conflicting(
                         }
 #else
 		if (lock_rec_has_to_wait(trx, mode, lock, is_supremum)) {
-#endif /* WITH_WSREP */
+#endif
 			return(lock);
 		}
 	}
@@ -1403,7 +1411,8 @@ lock_sec_rec_some_has_impl(
 	return(trx);
 }
 
-#if defined(UNIV_DEBUG) && !defined(WITH_WSREP)
+#ifndef WITH_WSREP
+#ifdef UNIV_DEBUG
 /*********************************************************************//**
 Checks if some transaction, other than given trx_id, has an explicit
 lock on the given rec, in the given precise_mode.
@@ -1452,7 +1461,8 @@ lock_rec_other_trx_holds_expl(
 
 	return(holds);
 }
-#endif /* UNIV_DEBUG && !WITH_WSREP */
+#endif /* UNIV_DEBUG */
+#endif /* !WITH_WSREP */
 
 /*********************************************************************//**
 Return approximate number or record locks (bits set in the bitmap) for
@@ -1648,14 +1658,16 @@ Add the lock to the record lock hash and the transaction's lock list
 @param[in,out] c_lock	conflicting lock
 @param[in,out] thr	query thread handler */
 void
+#ifdef WITH_WSREP
 RecLock::lock_add(
 	lock_t*			lock,
 	bool			add_to_hash
-#ifdef WITH_WSREP
 	,lock_t* const		c_lock,
 	que_thr_t*		thr
-#endif /* WITH_WSREP */
 	)
+#else
+RecLock::lock_add(lock_t* lock, bool add_to_hash)
+#endif /* WITH_WSREP */
 {
 	ut_ad(lock_mutex_own());
 	ut_ad(trx_mutex_own(lock->trx));
@@ -1768,12 +1780,14 @@ RecLock::create(
 	trx_t*			trx,
 	bool			owns_trx_mutex,
 	bool			add_to_hash,
+#ifndef WITH_WSREP
+	const lock_prdt_t*	prdt)
+#else
 	const lock_prdt_t*	prdt
-#ifdef WITH_WSREP
 	,lock_t* const		c_lock,
 	que_thr_t*		thr
+  )
 #endif /* WITH_WSREP */
-	)
 {
 	ut_ad(lock_mutex_own());
 	ut_ad(owns_trx_mutex == trx_mutex_own(trx));
@@ -1795,11 +1809,11 @@ RecLock::create(
 		trx_mutex_enter(trx);
 	}
 
-	lock_add(lock, add_to_hash
-#ifdef WITH_WSREP
-		 , c_lock, thr
+#ifndef WITH_WSREP
+	lock_add(lock, add_to_hash);
+#else
+	lock_add(lock, add_to_hash, c_lock, thr);
 #endif /* WITH_WSREP */
-		);
 
 	if (!owns_trx_mutex) {
 		trx_mutex_exit(trx);
@@ -1969,26 +1983,27 @@ RecLock::add_to_waitq(const lock_t* wait_for, const lock_prdt_t* prdt)
 
 	prepare();
 
+	bool	high_priority = trx_is_high_priority(m_trx);
+#ifdef WITH_WSREP
 	lock_t*		lock;
 
 	/* We don't rollback internal (basically background statistics
 	gathering) transactions. The problem is that we don't currently
 	block them using the TrxInInnoDB() mechanism. */
 
-#ifdef WITH_WSREP
 	if (wsrep_on(m_trx->mysql_thd) &&
 	    m_trx->lock.was_chosen_as_deadlock_victim) {
 		return(DB_DEADLOCK);
 	}
 
-	lock = create(m_trx, true, true, prdt,
+	lock = create(m_trx, true, !high_priority, prdt,
 			const_cast<lock_t*>(wait_for), m_thr);
 
 #else
-	bool	high_priority = trx_is_high_priority(m_trx);
 
 	/* Don't queue the lock to hash table, if high priority transaction. */
 	lock_t*	lock = create(m_trx, true, !high_priority, prdt);
+#endif /* WITH_WSREP */
 
 	/* Attempt to jump over the low priority waiting locks. */
 	if (high_priority && jump_queue(lock, wait_for)) {
@@ -1998,7 +2013,6 @@ RecLock::add_to_waitq(const lock_t* wait_for, const lock_prdt_t* prdt)
 	}
 
 	ut_ad(lock_get_wait(lock));
-#endif /* WITH_WSREP */
 
 	dberr_t	err = deadlock_check(lock);
 
@@ -2125,7 +2139,9 @@ lock_rec_add_to_queue(
 
 		if (lock != NULL) {
 
-			lock_rec_set_nth_bit(lock, heap_no);
+			if (!lock_rec_get_nth_bit(lock, heap_no)) {
+				lock_rec_set_nth_bit(lock, heap_no);
+			}
 
 			return;
 		}
@@ -5591,7 +5607,7 @@ lock_trx_print_wait_and_mvcc_state(
 {
 	fprintf(file, "---");
 
-	trx_print_latched(file, trx, 600);
+	trx_print_latched(file, trx, 3000);
 
 	const ReadView*	read_view = trx_get_read_view(trx);
 
@@ -7436,12 +7452,23 @@ lock_trx_handle_wait(
 
 #ifdef WITH_WSREP
         if (trx->wsrep_killed_by_query == 0) {
-#endif /* WITH_WSREP */
+            /* There is this gap between checking wsrep_killed_by_query value
+            and acquiring trx_mutex. If wsrep_killed_by_query is set between
+            this gap it can cause trx mutex to not get released.
+            This issue is now addressed by ensuring additional check below
+            post acquiring trx_mutex. */
+            lock_mutex_enter();
+            trx_mutex_enter(trx);
+
+            if (trx->wsrep_killed_by_query != 0) {
+                lock_mutex_exit();
+                trx_mutex_exit(trx);
+            }
+        }
+#else
 	lock_mutex_enter();
 
 	trx_mutex_enter(trx);
-#ifdef WITH_WSREP
-        }
 #endif /* WITH_WSREP */
 
 	if (trx->lock.was_chosen_as_deadlock_victim) {
@@ -8214,3 +8241,23 @@ lock_trx_alloc_locks(trx_t* trx)
 	}
 
 }
+
+#ifdef WITH_WSREP
+void
+populate_locked_table_list(trx_t *			trx,
+			   std::vector<dict_table_t *> &locked_tables) {
+	trx_mutex_enter(trx);
+	lock_t *lock;
+	for (lock = UT_LIST_GET_FIRST(trx->lock.trx_locks); lock != NULL;
+	     lock = UT_LIST_GET_NEXT(trx_locks, lock)) {
+		lock_table_t *tab_lock;
+		if (!(lock_get_type_low(lock) & LOCK_TABLE)) {
+			/* We are only interested in table locks. */
+			continue;
+		}
+		tab_lock = &lock->un_member.tab_lock;
+		locked_tables.push_back(tab_lock->table);
+	}
+	trx_mutex_exit(trx);
+}
+#endif /* WITH_WSREP */

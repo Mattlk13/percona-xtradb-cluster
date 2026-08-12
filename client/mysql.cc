@@ -1,14 +1,21 @@
 /*
-   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2025, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -153,6 +160,7 @@ static char * opt_mysql_unix_port=0;
 static char *opt_bind_addr = NULL;
 static int connect_flag=CLIENT_INTERACTIVE;
 static my_bool opt_binary_mode= FALSE;
+static bool opt_commands = true;
 static my_bool opt_connect_expired_password= FALSE;
 static char *current_host,*current_db,*current_user=0,*opt_password=0,
             *current_prompt=0, *delimiter_str= 0,
@@ -217,7 +225,7 @@ const char *default_dbug_option="d:t:o,/tmp/mysql.trace";
 
   For using this feature in test case, we add the option in debug code.
 */
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 static my_bool opt_build_completion_hash = FALSE;
 #endif
 
@@ -285,7 +293,7 @@ static int com_nopager(String *str, char*), com_pager(String *str, char*),
 #endif
 
 static int read_and_execute(bool interactive);
-static void init_connection_options(MYSQL *mysql);
+static bool init_connection_options(MYSQL *mysql);
 static int sql_connect(char *host,char *database,char *user,char *password,
 		       uint silent);
 static const char *server_version_string(MYSQL *mysql);
@@ -365,7 +373,7 @@ static COMMANDS commands[] = {
     "Execute an SQL script file. Takes a file name as an argument."},
   { "status", 's', com_status, 0, "Get status information from the server."},
 #ifdef USE_POPEN
-  { "system", '!', com_shell,  1, "Execute a system shell command."},
+  { "system", '!', com_shell,  1, "Execute a system shell command, if enabled."},
 #endif
   { "tee",    'T', com_tee,    1, 
     "Set outfile [to_outfile]. Append everything into given outfile." },
@@ -1205,7 +1213,7 @@ inline int get_command_index(char cmd_char)
 
 static int delimiter_index= -1;
 static int charset_index= -1;
-static bool real_binary_mode= FALSE;
+static bool disable_commands = false;
 
 #ifdef _WIN32
 BOOL windows_ctrl_handler(DWORD fdwCtrlType)
@@ -1628,6 +1636,10 @@ unsigned short get_terminal_width()
   return 80;
 }
 
+#ifdef USE_POPEN
+static bool opt_system_command = true;
+#endif
+
 static struct my_option my_long_options[] =
 {
   {"help", '?', "Display this help and exit.", 0, 0, 0, GET_NO_ARG, NO_ARG, 0,
@@ -1664,6 +1676,9 @@ static struct my_option my_long_options[] =
   {"column-type-info", OPT_COLUMN_TYPES, "Display column type information.",
    &column_types_flag, &column_types_flag,
    0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
+  {"commands", OPT_MYSQL_COMMANDS,
+   "Enable or disable processing of local mysql commands.", &opt_commands,
+   &opt_commands, 0, GET_BOOL, NO_ARG, 1, 0, 0, 0, 0, 0},
   {"comments", 'c', "Preserve comments. Send comments to the server."
    " The default is --skip-comments (discard comments), enable with --comments.",
    &preserve_comments, &preserve_comments,
@@ -1671,7 +1686,7 @@ static struct my_option my_long_options[] =
   {"compress", 'C', "Use compression in server/client protocol.",
    &opt_compress, &opt_compress, 0, GET_BOOL, NO_ARG, 0, 0, 0,
    0, 0, 0},
-#ifdef DBUG_OFF
+#ifdef NDEBUG
   {"debug", '#', "This is a non-debug version. Catch this and exit.",
    0,0, 0, GET_DISABLED, OPT_ARG, 0, 0, 0, 0, 0, 0},
   {"debug-check", OPT_DEBUG_CHECK, "This is a non-debug version. Catch this and exit.",
@@ -1880,12 +1895,18 @@ static struct my_option my_long_options[] =
    "password sandbox mode.",
    &opt_connect_expired_password, &opt_connect_expired_password, 0, GET_BOOL,
    NO_ARG, 0, 0, 0, 0, 0, 0},
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   {"build-completion-hash", 0,
    "Build completion hash even when it is in batch mode. It is used for "
    "test purpose, so it is just built when DEBUG is on.",
    &opt_build_completion_hash, &opt_build_completion_hash, 0, GET_BOOL,
    NO_ARG, 0, 0, 0, 0, 0, 0},
+#endif
+#ifdef USE_POPEN
+  {"system-command", 0,
+   "Enable (by default) or disable the system mysql command.",
+   &opt_system_command, &opt_system_command, 0, GET_BOOL, NO_ARG,
+   1, 0, 0, 0, 0, 0},
 #endif
   { 0, 0, 0, 0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0}
 };
@@ -2212,7 +2233,7 @@ static int read_and_execute(bool interactive)
   size_t line_length= 0;
   status.exit_status=1;
 
-  real_binary_mode= !interactive && opt_binary_mode;
+  disable_commands = !interactive && (opt_binary_mode || !opt_commands);
   for (;;)
   {
     /* Reset as SIGINT has already got handled. */
@@ -2225,7 +2246,7 @@ static int read_and_execute(bool interactive)
         In that case, we need to double check that we have a valid
         line before actually setting line_length to read_length.
         */
-      line= batch_readline(status.line_buff, real_binary_mode);
+      line = batch_readline(status.line_buff, opt_binary_mode);
       if (line) 
       {
         line_length= status.line_buff->read_length;
@@ -2234,7 +2255,7 @@ static int read_and_execute(bool interactive)
           ASCII 0x00 is not allowed appearing in queries if it is not in binary
           mode.
         */
-        if (!real_binary_mode && strlen(line) != line_length)
+        if (!opt_binary_mode && strlen(line) != line_length)
         {
           status.exit_status= 1;
           String msg;
@@ -2386,11 +2407,11 @@ static int read_and_execute(bool interactive)
 #endif
 
   /*
-    If the function is called by 'source' command, it will return to interactive
-    mode, so real_binary_mode should be FALSE. Otherwise, it will exit the
-    program, it is safe to set real_binary_mode to FALSE.
+    If the function is called by 'source' command, it will return to
+    interactive mode, so disable_commands should be false. Otherwise, it will
+    exit the program, it is safe to set disable_commands to false.
   */
-  real_binary_mode= FALSE;
+  disable_commands = false;
   return status.exit_status;
 }
 
@@ -2422,10 +2443,10 @@ static COMMANDS *find_command(char cmd_char)
   int index= -1;
 
   /*
-    In binary-mode, we disallow all mysql commands except '\C'
+    If specified, we disallow all mysql commands except '\C'
     and DELIMITER.
   */
-  if (real_binary_mode)
+  if (disable_commands)
   {
     if (cmd_char == 'C')
       index= charset_index;
@@ -2457,7 +2478,7 @@ static COMMANDS *find_command(char *name)
   char *end;
   DBUG_ENTER("find_command");
 
-  DBUG_ASSERT(name != NULL);
+  assert(name != NULL);
   DBUG_PRINT("enter", ("name: '%s'", name));
 
   while (my_isspace(charset_info, *name))
@@ -2467,7 +2488,7 @@ static COMMANDS *find_command(char *name)
     this is not a delimiter command, let add_line() take care of
     parsing the row and calling find_command().
   */
-  if ((!real_binary_mode && strstr(name, "\\g")) ||
+  if ((!disable_commands && strstr(name, "\\g")) ||
       (strstr(name, delimiter) &&
        !is_delimiter_command(name, DELIMITER_NAME_LEN)))
       DBUG_RETURN((COMMANDS *) 0);
@@ -2484,7 +2505,7 @@ static COMMANDS *find_command(char *name)
     len= (uint) strlen(name);
 
   int index= -1;
-  if (real_binary_mode)
+  if (disable_commands)
   {
     if (is_delimiter_command(name, len))
       index= delimiter_index;
@@ -2667,8 +2688,8 @@ static bool add_line(String &buffer, char *line, size_t line_length,
       }
       buffer.length(0);
     }
-    else if (!*ml_comment && (!*in_string && (inchar == '#' ||
-                                              (inchar == '-' && pos[1] == '-' &&
+    else if (!*ml_comment && (!*in_string && ss_comment != SSC_HINT && (inchar == '#' ||
+        (inchar == '-' && pos[1] == '-' &&
                               /*
                                 The third byte is either whitespace or is the
                                 end of the line -- which would occur only
@@ -2812,14 +2833,12 @@ C_MODE_END
   if not.
 */
 
-#if defined(USE_NEW_XLINE_INTERFACE)
-static int fake_magic_space(int, int);
-extern "C" char *no_completion(const char*,int)
-#elif defined(USE_LIBEDIT_INTERFACE)
-static int fake_magic_space(const char *, int);
-extern "C" int no_completion(const char*,int)
+#if defined(XLINE_HAVE_COMPLETION_CHAR)
+char *no_completion(const char *, int)
+#elif defined(XLINE_HAVE_COMPLETION_INT)
+int no_completion(const char *, int)
 #else
-extern "C" char *no_completion()
+char *no_completion()
 #endif
 {
   return 0;					/* No filename completion */
@@ -2857,17 +2876,19 @@ static void initialize_readline (char *name)
   /* Allow conditional parsing of the ~/.inputrc file. */
   rl_readline_name = name;
 
-  /* Tell the completer that we want a crack first. */
-#if defined(USE_NEW_XLINE_INTERFACE)
-  rl_attempted_completion_function= (rl_completion_func_t*)&new_mysql_completion;
-  rl_completion_entry_function= (rl_compentry_func_t*)&no_completion;
+  /* Accept all locales. */
+  setlocale(LC_ALL,"");
 
-  rl_add_defun("magic-space", (rl_command_func_t *)&fake_magic_space, -1);
-#elif defined(USE_LIBEDIT_INTERFACE)
-  setlocale(LC_ALL,""); /* so as libedit use isprint */
-  rl_attempted_completion_function= (CPPFunction*)&new_mysql_completion;
+  /* Tell the completer that we want a crack first. */
+#if defined(XLINE_HAVE_COMPLETION_CHAR)
+  rl_attempted_completion_function= &new_mysql_completion;
   rl_completion_entry_function= &no_completion;
-  rl_add_defun("magic-space", (Function*)&fake_magic_space, -1);
+
+  rl_add_defun("magic-space", &fake_magic_space, -1);
+#elif defined(XLINE_HAVE_COMPLETION_INT)
+  rl_attempted_completion_function= &new_mysql_completion;
+  rl_completion_entry_function= &no_completion;
+  rl_add_defun("magic-space", &fake_magic_space, -1);
 #else
   rl_attempted_completion_function= (CPPFunction*)&new_mysql_completion;
   rl_completion_entry_function= &no_completion;
@@ -2889,7 +2910,7 @@ static char **new_mysql_completion(const char *text,
 #if defined(USE_NEW_XLINE_INTERFACE)
     return rl_completion_matches(text, new_command_generator);
 #else
-    return completion_matches((char *)text, (CPFunction *)new_command_generator);
+    return completion_matches(const_cast<char*>(text), new_command_generator);
 #endif
   else
     return (char**) 0;
@@ -2988,7 +3009,7 @@ static void build_completion_hash(bool rehash, bool write_info)
   int i,j,num_fields;
   DBUG_ENTER("build_completion_hash");
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   if (!opt_build_completion_hash)
 #endif
   {
@@ -3728,8 +3749,7 @@ end:
   if (show_warnings == 1 && (warnings >= 1 || error))
     print_warnings();
 
-  if (!error && !status.batch && 
-      (mysql.server_status & SERVER_STATUS_DB_DROPPED))
+  if (!error && (mysql.server_status & SERVER_STATUS_DB_DROPPED))
     get_current_db();
 
   executing_query= 0;
@@ -3940,8 +3960,6 @@ print_table_data(MYSQL_RES *result)
   bool		*num_flag;
   size_t        sz;
 
-  sz= sizeof(bool) * mysql_num_fields(result);
-  num_flag= (bool *) my_safe_alloca(sz, MAX_ALLOCA_SIZE);
   if (column_types_flag)
   {
     print_field_types(result);
@@ -3949,6 +3967,8 @@ print_table_data(MYSQL_RES *result)
       return;
     mysql_field_seek(result,0);
   }
+  sz= sizeof(bool) * mysql_num_fields(result);
+  num_flag= (bool *) my_safe_alloca(sz, MAX_ALLOCA_SIZE);
   separator.copy("+",1,charset_info);
   while ((field = mysql_fetch_field(result)))
   {
@@ -4094,9 +4114,9 @@ static int get_result_width(MYSQL_RES *result)
   MYSQL_FIELD *field;
   MYSQL_FIELD_OFFSET offset;
   
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   offset= mysql_field_tell(result);
-  DBUG_ASSERT(offset == 0);
+  assert(offset == 0);
 #else
   offset= 0;
 #endif
@@ -4577,6 +4597,14 @@ com_shell(String *buffer MY_ATTRIBUTE((unused)),
     put_info("Usage: \\! shell-command", INFO_ERROR);
     return -1;
   }
+
+  if (!opt_system_command) {
+    return put_info(
+        "'system' command received, but the --system-command option is off. "
+        "Skipping.",
+        INFO_ERROR);
+  }
+
   /*
     The output of the shell command does not
     get directed to the pager or the outfile
@@ -5007,7 +5035,12 @@ sql_real_connect(char *host,char *database,char *user,char *password,
   }
 
   mysql_init(&mysql);
-  init_connection_options(&mysql);
+  if (init_connection_options(&mysql))
+  {
+    (void) put_error(&mysql);
+    (void) fflush(stdout);
+    return ignore_errors ? -1 : 1;		// Abort
+  }
 
 #ifdef _WIN32
   uint cnv_errors;
@@ -5100,7 +5133,7 @@ sql_real_connect(char *host,char *database,char *user,char *password,
 
 
 /* Initialize options for the given connection handle. */
-static void
+static bool
 init_connection_options(MYSQL *mysql)
 {
   my_bool handle_expired= (opt_connect_expired_password || !status.batch) ?
@@ -5143,7 +5176,7 @@ init_connection_options(MYSQL *mysql)
     mysql_options(mysql, MYSQL_INIT_COMMAND, init_command);
   }
 
-  mysql_set_character_set(mysql, default_charset);
+  if (mysql_set_character_set(mysql, default_charset)) return true;
 
   if (opt_plugin_dir && *opt_plugin_dir)
     mysql_options(mysql, MYSQL_PLUGIN_DIR, opt_plugin_dir);
@@ -5162,6 +5195,7 @@ init_connection_options(MYSQL *mysql)
   mysql_options4(mysql, MYSQL_OPT_CONNECT_ATTR_ADD, "program_name", "mysql");
 
   mysql_options(mysql, MYSQL_OPT_CAN_HANDLE_EXPIRED_PASSWORDS, &handle_expired);
+  return false;
 }
 
 

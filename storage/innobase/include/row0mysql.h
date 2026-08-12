@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 2000, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2000, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -77,7 +85,7 @@ row_decompress_column(
 	ulint		dict_data_len,
 				/*!< in: optional dictionary data length */
 	row_prebuilt_t*	prebuilt);
-				/*!< in: use prebuilt->compress_heap only
+				/*!< in: use prebuilt->blob_heap only
 				here*/
 
 /** Compress blob/text/varchar column using zlib
@@ -147,7 +155,7 @@ row_mysql_store_blob_ref(
 				/*!< in: optional compression dictionary data
 				length */
 	row_prebuilt_t*	prebuilt);
-				/*<! in: use prebuilt->compress_heap only
+				/*<! in: use prebuilt->blob_heap only
 				here */
 /*******************************************************************//**
 Reads a reference to a BLOB in the MySQL format.
@@ -709,8 +717,8 @@ struct mysql_row_templ_t {
 					ROW_MYSQL_WHOLE_ROW */
 	ulint	icp_rec_field_no;	/*!< field number of the column in an
 					Innobase record in the current index;
-					not defined unless
-					index condition pushdown is used */
+					used to evaluate the pushed index
+					condition and/or end-range condition */
 	ulint	mysql_col_offset;	/*!< offset of the column in the MySQL
 					row format */
 	ulint	mysql_col_len;		/*!< length of the column in the MySQL
@@ -947,9 +955,9 @@ struct row_prebuilt_t {
 	ulint		n_fetch_cached;	/*!< number of not yet fetched rows
 					in fetch_cache */
 	mem_heap_t*	blob_heap;	/*!< in SELECTS BLOB fields are copied
-					to this heap */
-	mem_heap_t*	compress_heap;  /*!< memory heap used to compress
-					/decompress blob column*/
+					to this heap. It is also used to decompress compressed
+					column */
+	mem_heap_t*	compress_heap;  /*!< memory heap used to compress blob column*/
 	mem_heap_t*	old_vers_heap;	/*!< memory heap where a previous
 					version is built in consistent read */
 	bool		in_fts_query;	/*!< Whether we are in a FTS query */
@@ -1044,9 +1052,11 @@ struct SysIndexCallback {
 @param[in,out]	mysql_table	mysql table object
 @param[in]	old_table	during ALTER TABLE, this is the old table
 				or NULL.
-@param[in]	parent_update	update vector for the parent row
-@param[in]	foreign		foreign key information
-@param[in]	prebuilt	compress_heap must be taken from here
+@param[in]	cascade_update	update vector for the current table involved in
+				cascade update
+@param[in]	foreign		foreign key information [unused]
+@param[in]	prebuilt	provides pointer to blob_heap (used for decompression)
+                        and compress_heap (used for compression)
 @return the field filled with computed value */
 dfield_t*
 innobase_get_computed_value(
@@ -1059,7 +1069,7 @@ innobase_get_computed_value(
 	THD*			thd,
 	TABLE*			mysql_table,
 	const dict_table_t*	old_table,
-	upd_t*			parent_update,
+	upd_t*			cascade_update,
 	dict_foreign_t*		foreign,
 	row_prebuilt_t*		prebuilt);
 

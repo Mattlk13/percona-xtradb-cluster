@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -39,10 +47,6 @@ Created 3/26/1996 Heikki Tuuri
 
 /** The global data structure coordinating a purge */
 extern trx_purge_t*	purge_sys;
-
-/** A dummy undo record used as a return value when we have a whole undo log
-which needs no purge */
-extern trx_undo_rec_t	trx_purge_dummy_rec;
 
 /********************************************************************//**
 Calculates the file address of an undo log header when we have the file
@@ -150,8 +154,8 @@ struct purge_iter_t {
 of undo tablespace. */
 namespace undo {
 
-	typedef std::vector<ulint>		undo_spaces_t;
-	typedef	std::vector<trx_rseg_t*>	rseg_for_trunc_t;
+	typedef std::vector<ulint, ut_allocator<ulint> >	undo_spaces_t;
+	typedef std::vector<trx_rseg_t*, ut_allocator<trx_rseg_t*> >	rseg_for_trunc_t;
 
 	/** Magic Number to indicate truncate action is complete. */
 	const ib_uint32_t			s_magic = 76845412;
@@ -462,12 +466,9 @@ struct trx_purge_t{
 
 	undo::Truncate	undo_trunc;	/*!< Track UNDO tablespace marked
 					for truncate. */
-};
 
-/** Info required to purge a record */
-struct trx_purge_rec_t {
-	trx_undo_rec_t*	undo_rec;	/*!< Record to purge */
-	roll_ptr_t	roll_ptr;	/*!< File pointr to UNDO record */
+	mem_heap_t*	heap;		/*!< Heap for reading the undo log
+					records */
 };
 
 /**

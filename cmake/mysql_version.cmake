@@ -1,13 +1,20 @@
-# Copyright (c) 2009, 2016, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2009, 2023, Oracle and/or its affiliates.
 # 
 # This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; version 2 of the License.
+# it under the terms of the GNU General Public License, version 2.0,
+# as published by the Free Software Foundation.
+#
+# This program is also distributed with certain software (including
+# but not limited to OpenSSL) that is licensed under separate terms,
+# as designated in a particular file or component or in included license
+# documentation.  The authors of MySQL hereby grant you an additional
+# permission to link the program and your derivative works with the
+# separately licensed software that they have included with MySQL.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU General Public License, version 2.0, for more details.
 #
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
@@ -22,17 +29,17 @@ SET(SHARED_LIB_MINOR_VERSION "3")
 SET(PROTOCOL_VERSION "10")
 SET(DOT_FRM_VERSION "6")
 
-# Generate "something" to trigger cmake rerun when VERSION changes
+# Generate "something" to trigger cmake rerun when MYSQL_VERSION changes
 CONFIGURE_FILE(
-  ${CMAKE_SOURCE_DIR}/VERSION
+  ${CMAKE_SOURCE_DIR}/MYSQL_VERSION
   ${CMAKE_BINARY_DIR}/VERSION.dep
 )
 
-# Read value for a variable from VERSION.
+# Read value for a variable from MYSQL_VERSION.
 
 MACRO(MYSQL_GET_CONFIG_VALUE keyword var)
  IF(NOT ${var})
-   FILE (STRINGS ${CMAKE_SOURCE_DIR}/VERSION str REGEX "^[ ]*${keyword}=")
+   FILE (STRINGS ${CMAKE_SOURCE_DIR}/MYSQL_VERSION str REGEX "^[ ]*${keyword}=")
    IF(str)
      STRING(REPLACE "${keyword}=" "" str ${str})
      STRING(REGEX REPLACE  "[ ].*" ""  str "${str}")
@@ -53,12 +60,17 @@ MACRO(GET_MYSQL_VERSION)
   IF(NOT DEFINED MAJOR_VERSION OR
      NOT DEFINED MINOR_VERSION OR
      NOT DEFINED PATCH_VERSION)
-    MESSAGE(FATAL_ERROR "VERSION file cannot be parsed.")
+    MESSAGE(FATAL_ERROR "MYSQL_VERSION file cannot be parsed.")
   ENDIF()
 
   SET(VERSION
     "${MAJOR_VERSION}.${MINOR_VERSION}.${PATCH_VERSION}${EXTRA_VERSION}")
-  MESSAGE(STATUS "MySQL ${VERSION}")
+  IF(WITH_WSREP)
+    MESSAGE(STATUS "MySQL-WSREP ${VERSION}")
+    INCLUDE(wsrep_version)
+  ELSE()
+    MESSAGE(STATUS "MySQL ${VERSION}")
+  ENDIF()
   SET(MYSQL_BASE_VERSION
     "${MAJOR_VERSION}.${MINOR_VERSION}" CACHE INTERNAL "MySQL Base version")
   SET(MYSQL_NO_DASH_VERSION

@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 2014, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2014, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -421,6 +429,12 @@ public:
 		ulonglong*	first_value,
 		ulonglong*	nb_reserved_values);
 
+
+	/** Get partition row type
+	@param[in] Id of partition for which row type to be retrieved
+	@return Partition row type */
+	enum row_type get_partition_row_type(uint part_id);
+
 	int
 	cmp_ref(
 		const uchar*	ref1,
@@ -664,6 +678,10 @@ private:
 	when changing partitions. */
 	mem_heap_t**		m_blob_heap_parts;
 
+	/** compress_heap per partition. Synchronized with prebuilt->compress_heap
+	when changing partitions. */
+	mem_heap_t**		m_compress_heap_parts;
+
 	/** trx_id from the partitions table->def_trx_id. Keep in sync
 	with prebuilt->trx_id when changing partitions.
 	prebuilt only reflects the current partition! */
@@ -693,6 +711,9 @@ private:
 	/** New partitions during ADD/REORG/... PARTITION. */
 	Altered_partitions*	m_new_partitions;
 
+	/** Can reuse the template for the previous partition. */
+	bool			m_reuse_mysql_template;
+
 	/** Clear used ins_nodes and upd_nodes. */
 	void
 	clear_ins_upd_nodes();
@@ -700,6 +721,10 @@ private:
 	/** Clear the blob heaps for all partitions */
 	void
 	clear_blob_heaps();
+
+	/** Clear the compress heaps for all partitions */
+	void
+	clear_compress_heaps();
 
 	/** Reset state of file to after 'open'. This function is called
 	after every statement for all tables used by that statement. */
@@ -713,6 +738,14 @@ private:
 	/** Free the array that holds blob heaps for all partitions */
 	void
 	free_blob_heap_array();
+
+	/** Allocate the array to hold compress heaps for all partitions */
+	mem_heap_t**
+	alloc_compress_heap_array();
+
+	/** Free the array that holds compress heaps for all partitions */
+	void
+	free_compress_heap_array();
 
 	/** Changes the active index of a handle.
 	@param[in]	part_id	Use this partition.
@@ -1330,5 +1363,9 @@ protected:
 	info_low(
 		uint	flag,
 		bool	is_analyze);
+
+	bool can_reuse_mysql_template() {
+		return(m_reuse_mysql_template);
+	}
 };
 #endif /* ha_innopart_h */

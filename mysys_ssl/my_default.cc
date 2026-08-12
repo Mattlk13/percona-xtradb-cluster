@@ -1,13 +1,25 @@
-/* Copyright (c) 2000, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
+
+   Without limiting anything contained in the foregoing, this file,
+   which is part of C Driver for MySQL (Connector/C), is also subject to the
+   Universal FOSS Exception, version 1.0, a copy of which can be found at
+   http://oss.oracle.com/licenses/universal-foss-exception.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -86,7 +98,7 @@ C_MODE_END
 static const char *args_separator= "----args-separator----";
 inline static void set_args_separator(char** arg)
 {
-  DBUG_ASSERT(my_getopt_use_args_separator);
+  assert(my_getopt_use_args_separator);
   *arg= (char*)args_separator;
 }
 
@@ -116,7 +128,8 @@ static my_bool defaults_already_read= FALSE;
 /* The only purpose of this global array is to hold full name of my.cnf
  * which seems to be otherwise unavailable */
 char wsrep_defaults_file[FN_REFLEN + 10]={0,};
-char wsrep_defaults_group_suffix[FN_EXTLEN]={0,};
+static const char wsrep_defaults_group_suffix_empty= '\0';
+const char *wsrep_defaults_group_suffix= &wsrep_defaults_group_suffix_empty;
 #endif /* WITH_WREP */
 
 /* Which directories are searched for options (and in which order) */
@@ -557,7 +570,7 @@ int get_defaults_options(int argc, char **argv,
 #ifdef WITH_WSREP
       /* make sure we do this only once - for top-level file */
       if ('\0' == wsrep_defaults_group_suffix[0])
-        strncpy(wsrep_defaults_group_suffix, *group_suffix, sizeof(wsrep_defaults_group_suffix) - 1);
+        wsrep_defaults_group_suffix= *group_suffix;
 #endif /* WITH_WSREP */
 
       argc--;
@@ -933,8 +946,21 @@ static int search_default_file_with_ext(Process_option_func opt_handler,
   }
 #ifdef WITH_WSREP
   /* make sure we do this only once - for top-level file */
-  if ('\0' == wsrep_defaults_file[0])
+  if ('\0' == wsrep_defaults_file[0]) {
+    /* We are safe here to not truncate the filename, because of the check
+       done at the beginning of this function.
+       At this point 'name' is at most the sum of:
+       converted_dir_len + config_file: (FN_REFLEN-3)+1
+       dot: 1
+       ext: 4
+       terminating null: 1
+       => FN_REFLEN + 4
+       fn_format() which expands ~ to home directory path prevents overflowing
+       FN_REFLEN as well.
+        */
     strncpy(wsrep_defaults_file, name, sizeof(wsrep_defaults_file) - 1);
+    wsrep_defaults_file[sizeof(wsrep_defaults_file) - 1] = 0;
+  }
 #endif /* WITH_WSREP */
 
   while (mysql_file_getline(buff, sizeof(buff) - 1, fp, is_login_file))
@@ -1050,8 +1076,12 @@ static int search_default_file_with_ext(Process_option_func opt_handler,
       goto err;
     }
 
+    /* comments are not supported in login file */
+    if (!is_login_file)
+      end = remove_end_comment(ptr);
+    else
+      end = ptr + strlen(ptr);
 
-    end= remove_end_comment(ptr);
     if ((value= strchr(ptr, '=')))
       end= value;				/* Option without argument */
     for ( ; my_isspace(&my_charset_latin1, end[-1]) ; end--)
@@ -1331,7 +1361,7 @@ static int add_directory(MEM_ROOT *alloc, const char *dir, const char **dirs)
     return 1;  /* Failure */
   /* Should never fail if DEFAULT_DIRS_SIZE is correct size */
   err= array_append_string_unique(p, dirs, DEFAULT_DIRS_SIZE);
-  DBUG_ASSERT(err == FALSE);
+  assert(err == FALSE);
 
   return 0;
 }

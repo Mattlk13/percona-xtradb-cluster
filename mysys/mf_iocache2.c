@@ -1,15 +1,27 @@
-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2023, Oracle and/or its affiliates.
    Copyright (c) 2018, Percona and/or its affiliates. All rights reserved.
    Copyright (c) 2010, 2017, MariaDB
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
+
+   Without limiting anything contained in the foregoing, this file,
+   which is part of C Driver for MySQL (Connector/C), is also subject to the
+   Universal FOSS Exception, version 1.0, a copy of which can be found at
+   http://oss.oracle.com/licenses/universal-foss-exception.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -24,6 +36,8 @@
 #include <m_string.h>
 #include <stdarg.h>
 #include <m_ctype.h>
+
+#include "mysql/psi/mysql_file.h"
 
 /*
   Copy contents of an IO_CACHE to a file.
@@ -78,7 +92,7 @@ my_off_t my_b_append_tell(IO_CACHE* info)
     Sometimes we want to make sure that the variable is not put into
     a register in debugging mode so we can see its value in the core
   */
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 # define dbug_volatile volatile
 #else
 # define dbug_volatile
@@ -97,7 +111,7 @@ my_off_t my_b_append_tell(IO_CACHE* info)
   */
   mysql_mutex_lock(&info->append_buffer_lock);
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   /*
     Make sure EOF is where we think it is. Note that we cannot just use
     my_tell() because we have a reader thread that could have left the
@@ -110,8 +124,8 @@ my_off_t my_b_append_tell(IO_CACHE* info)
     /*
       Save the value of my_tell in res so we can see it when studying coredump
     */
-    DBUG_ASSERT(info->end_of_file - (info->append_read_pos-info->write_buffer)
-		== (res=mysql_file_tell(info->file,MYF(0))));
+    assert(info->end_of_file - (info->append_read_pos-info->write_buffer)
+           == (res=mysql_file_tell(info->file,MYF(0))));
     mysql_file_seek(info->file,save_pos,MY_SEEK_SET,MYF(0));
   }
 #endif  
@@ -205,7 +219,7 @@ size_t my_b_fill(IO_CACHE *info)
 
   if (info->myflags & MY_ENCRYPT)
   {
-    DBUG_ASSERT(info->read_pos == info->read_end);
+    assert(info->read_pos == info->read_end);
     return _my_b_read(info, 0, 0) ? 0 : info->read_end - info->read_pos;
   }
   pos_in_file= info->pos_in_file + (size_t) (info->read_end - info->buffer);
@@ -381,7 +395,7 @@ size_t my_b_vprintf(IO_CACHE *info, const char* fmt, va_list args)
       By this point, *fmt must be a percent;  Keep track of this location and
       skip over the percent character. 
     */
-    DBUG_ASSERT(*fmt == '%');
+    assert(*fmt == '%');
     backtrack= fmt;
     fmt++;
 

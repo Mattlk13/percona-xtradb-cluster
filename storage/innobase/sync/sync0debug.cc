@@ -1,6 +1,6 @@
 /*****************************************************************************
 
-Copyright (c) 2014, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2014, 2023, Oracle and/or its affiliates.
 
 Portions of this file contain modifications contributed and copyrighted by
 Google, Inc. Those modifications are gratefully acknowledged and are described
@@ -8,13 +8,21 @@ briefly in the InnoDB documentation. The contributions by Google are
 incorporated with their permission, and subject to the conditions contained in
 the file COPYING.Google.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -35,11 +43,12 @@ Created 2012-08-21 Sunny Bains
 #include "ut0new.h"
 #include "srv0start.h"
 
+#include <algorithm>
+#include <functional>
+#include <iostream>
 #include <map>
 #include <vector>
 #include <string>
-#include <algorithm>
-#include <iostream>
 
 #ifdef UNIV_DEBUG
 
@@ -470,6 +479,7 @@ LatchDebug::LatchDebug()
 	LEVEL_MAP_INSERT(SYNC_MONITOR_MUTEX);
 	LEVEL_MAP_INSERT(SYNC_ANY_LATCH);
 	LEVEL_MAP_INSERT(SYNC_DOUBLEWRITE);
+	LEVEL_MAP_INSERT(SYNC_BUF_CHUNKS);
 	LEVEL_MAP_INSERT(SYNC_BUF_FLUSH_LIST);
 	LEVEL_MAP_INSERT(SYNC_BUF_BLOCK);
 	LEVEL_MAP_INSERT(SYNC_BUF_PAGE_HASH);
@@ -520,6 +530,7 @@ LatchDebug::LatchDebug()
 	LEVEL_MAP_INSERT(SYNC_TREE_NODE);
 	LEVEL_MAP_INSERT(SYNC_TREE_NODE_FROM_HASH);
 	LEVEL_MAP_INSERT(SYNC_TREE_NODE_NEW);
+	LEVEL_MAP_INSERT(SYNC_ANALYZE_INDEX);
 	LEVEL_MAP_INSERT(SYNC_INDEX_TREE);
 	LEVEL_MAP_INSERT(SYNC_IBUF_PESS_INSERT_MUTEX);
 	LEVEL_MAP_INSERT(SYNC_IBUF_HEADER);
@@ -836,6 +847,7 @@ LatchDebug::check_order(
 		}
 		break;
 
+	case SYNC_BUF_CHUNKS:
 	case SYNC_BUF_FLUSH_LIST:
 	case SYNC_BUF_LRU_LIST:
 	case SYNC_BUF_FREE_LIST:
@@ -944,6 +956,11 @@ LatchDebug::check_order(
 	case SYNC_INDEX_TREE:
 
 		basic_check(latches, level, SYNC_TREE_NODE - 1);
+		break;
+
+	case SYNC_ANALYZE_INDEX:
+
+		basic_check(latches, level, SYNC_ANALYZE_INDEX - 1);
 		break;
 
 	case SYNC_IBUF_TREE_NODE:
@@ -1345,6 +1362,7 @@ sync_latch_meta_init()
 #else
 	LATCH_ADD_MUTEX(BUF_BLOCK_MUTEX, SYNC_BUF_BLOCK, PFS_NOT_INSTRUMENTED);
 #endif /* !PFS_SKIP_BUFFER_MUTEX_RWLOCK */
+	LATCH_ADD_MUTEX(BUF_POOL_CHUNKS, SYNC_BUF_CHUNKS, buf_pool_chunks_mutex_key);
 
 	LATCH_ADD_MUTEX(BUF_POOL_LRU_LIST, SYNC_BUF_LRU_LIST,
 			buf_pool_LRU_list_mutex_key);
@@ -1605,6 +1623,8 @@ sync_latch_meta_init()
 	LATCH_ADD_MUTEX(FIL_CRYPT_START_ROTATE_MUTEX, SYNC_NO_ORDER_CHECK,
 	    		PFS_NOT_INSTRUMENTED);
 
+	LATCH_ADD_MUTEX(ANALYZE_INDEX_MUTEX, SYNC_ANALYZE_INDEX,
+			analyze_index_mutex_key);
 
 	latch_id_t	id = LATCH_ID_NONE;
 

@@ -1,13 +1,20 @@
-/* Copyright (c) 2004, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2004, 2023, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation; version 2 of the License.
+  it under the terms of the GNU General Public License, version 2.0,
+  as published by the Free Software Foundation.
+
+  This program is also distributed with certain software (including
+  but not limited to OpenSSL) that is licensed under separate terms,
+  as designated in a particular file or component or in included license
+  documentation.  The authors of MySQL hereby grant you an additional
+  permission to link the program and your derivative works with the
+  separately licensed software that they have included with MySQL.
 
   This program is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
+  GNU General Public License, version 2.0, for more details.
 
   You should have received a copy of the GNU General Public License
   along with this program; if not, write to the Free Software
@@ -120,6 +127,16 @@ static int example_init_func(void *p)
   example_hton->flags=                     HTON_CAN_RECREATE;
   example_hton->system_database=   example_system_database;
   example_hton->is_supported_system_table= example_is_supported_system_table;
+
+  DBUG_RETURN(0);
+}
+
+
+static int example_deinit_func(void *p)
+{
+  DBUG_ENTER("example_deinit_func");;
+
+  assert(p);
 
   DBUG_RETURN(0);
 }
@@ -1051,7 +1068,7 @@ mysql_declare_plugin(example)
   "Example storage engine",
   PLUGIN_LICENSE_GPL,
   example_init_func,                            /* Plugin Init */
-  NULL,                                         /* Plugin Deinit */
+  example_deinit_func,                          /* Plugin Deinit */
   0x0001 /* 0.1 */,
   func_status,                                  /* status variables */
   example_system_variables,                     /* system variables */

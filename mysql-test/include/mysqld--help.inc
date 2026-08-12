@@ -19,7 +19,7 @@ perl;
   @skipvars=qw/basedir open-files-limit general-log-file plugin-dir
                pid-file slow-query-log-file
                datadir slave-load-tmpdir tmpdir socket table-definition-cache table-open-cache
-               tls-version secure-file-priv wsrep-node-name/;
+               tls-version secure-file-priv wsrep-node-name wsrep-data-home-dir version-suffix/;
                
   # Variables which we don't want to display in result file since
   # they depend on type of build
@@ -56,6 +56,7 @@ perl;
     s/\b196608\b/262144/;
     s/\b524288\b/262144/;
     s/\b393216\b/262144/;
+    s/\b2097152\b/262144/;
     # Replacing port number with string
     s/^port \d+/port ####/;
     # log-tc-size varies by platform

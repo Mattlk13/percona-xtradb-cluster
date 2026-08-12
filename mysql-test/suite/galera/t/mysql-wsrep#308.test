@@ -1,0 +1,28 @@
+--source include/have_debug.inc
+--source include/have_debug_sync.inc
+--source suite/galera/include/galera_have_debug_sync.inc
+--source include/have_innodb.inc
+--source include/galera_cluster.inc
+
+--connection node_2
+--let $wsrep_cluster_address_orig = `SELECT @@wsrep_cluster_address`
+
+--let $galera_sync_point = before_async_recv_process_sync
+--source include/galera_set_sync_point.inc
+
+--connection node_1
+CREATE TABLE t1 (f1 INTEGER) ENGINE=InnoDB;
+
+--connection node_2
+
+--disable_query_log
+--eval SET GLOBAL wsrep_cluster_address = '$wsrep_cluster_address_orig';
+--enable_query_log
+
+--source include/galera_clear_sync_point.inc
+
+--source include/wait_until_connected_again.inc
+--source include/galera_wait_ready.inc
+
+--connection node_1
+DROP TABLE t1;

@@ -37,6 +37,7 @@ Prefix: %{_sysconfdir}
 %define percona_server_version @@PERCONA_VERSION@@
 %define revision @@REVISION@@
 %define distribution  rhel%{redhatversion}
+%define xb_version @@XB_VERSION@@
 
 #
 %bcond_with tokudb
@@ -72,10 +73,6 @@ Prefix: %{_sysconfdir}
 
 %if %{undefined scons_args}
  %define scons_args %{nil}
-%endif
-
-%if %{undefined galera_version}
- %define galera_version 3.31
 %endif
 
 %if %{undefined galera_revision}
@@ -329,7 +326,7 @@ Prefix: %{_sysconfdir}
 %define license_files_server    LICENSE.mysql
 %define license_type            Commercial
 %else
-%define license_files_server    COPYING README
+%define license_files_server    README
 %define license_type            GPL
 %endif
 
@@ -346,6 +343,7 @@ Release:        %{release}
 Distribution:   %{distro_description}
 License:        Copyright (c) 2000, 2010, %{mysql_vendor}.  All rights reserved.  Use is subject to license terms. Under the GNU General Public License (http://www.gnu.org/licenses/).
 Source:         http://www.percona.com/redir/downloads/Percona-XtraDB-Cluster/LATEST/source/%{src_dir}.tar.gz
+Source999:      call-home.sh
 URL:            http://www.percona.com/
 Packager:       Percona MySQL Development Team <mysqldev@percona.com>
 Vendor:         %{percona_server_vendor}
@@ -414,8 +412,9 @@ Group:          Applications/Databases
 Requires:       %{distro_requires}
 Requires:	Percona-XtraDB-Cluster-client%{product_suffix} = %{version}-%{release}
 Requires:	Percona-XtraDB-Cluster-shared%{product_suffix} = %{version}-%{release}
-Requires:	percona-xtrabackup-24 >= 2.4.12 socat rsync iproute perl-DBI perl-DBD-MySQL lsof
+Requires:	percona-xtrabackup-24 >= %{xb_version} socat rsync iproute perl-DBI perl-DBD-MySQL lsof
 Requires:       perl(Data::Dumper) which qpress
+Requires:       curl
 %if 0%{?systemd}
 Requires(post):   systemd
 Requires(preun):  systemd
@@ -426,7 +425,10 @@ Requires(preun):  /sbin/chkconfig
 Requires(preun):  /sbin/service
 %endif
 Provides:       mysql-server MySQL-server
-Conflicts:	Percona-SQL-server-50 Percona-Server-server-51 Percona-Server-server-55 Percona-Server-server-56
+%if 0%{?rhel} == 8 || 0%{?rhel} == 9
+Obsoletes:      mariadb-connector-c-config
+%endif
+Conflicts:	Percona-SQL-server-50 Percona-Server-server-51 Percona-Server-server-55 Percona-Server-server-56 Percona-Server-server-57
 
 %description -n Percona-XtraDB-Cluster-server%{product_suffix}
 Percona XtraDB Cluster is based on the Percona Server database server and
@@ -616,7 +618,10 @@ This package contains the garb binary and init scripts.
 
 %if 0%{?rhel} == 8
 sed -i 's:#!/usr/bin/env python:#!/usr/bin/env python2:g' scripts/pyclustercheck
-sed -i 's:#!/usr/bin/env python:#!/usr/bin/env python2:g' mysql-test/suite/tokudb/t/*
+%endif
+
+%if 0%{?rhel} == 9
+sed -i 's:#!/usr/bin/env python:#!/usr/bin/env python3:g' scripts/pyclustercheck
 %endif
 
 #
@@ -680,18 +685,19 @@ mkdir debug
   # Attempt to remove any optimisation flags from the debug build
   CFLAGS=`echo " ${CFLAGS} " | \
             sed -e 's/ -O[0-9]* / /' \
-                -e 's/-Wp,-D_FORTIFY_SOURCE=2/ /' \
+                -e 's/-Wp,-D_FORTIFY_SOURCE=2/ -Wno-missing-field-initializers -Wno-error /' \
                 -e 's/ -unroll2 / /' \
                 -e 's/ -ip / /' \
                 -e 's/^ //' \
                 -e 's/ $//'`
-  CXXFLAGS=`echo " ${CXXFLAGS} " | \
-              sed -e 's/ -O[0-9]* / /' \
-                  -e 's/-Wp,-D_FORTIFY_SOURCE=2/ /' \
-                  -e 's/ -unroll2 / /' \
-                  -e 's/ -ip / /' \
-                  -e 's/^ //' \
-                  -e 's/ $//'`
+  CXXFLAGS="${CFLAGS}"
+  %if 0%{?rhel} == 9
+    CFLAGS=`echo " ${CFLAGS} " | \
+                sed -e 's/ -Wno-error / -Wno-error -Wno-error=odr -Wno-error=free-nonheap-object /' \
+                    -e 's:-specs=/usr/lib/rpm/redhat/redhat-annobin-cc1::'`
+    CXXFLAGS="${CFLAGS}"
+    echo "${CXXFLAGS}"
+  %endif
   # XXX: MYSQL_UNIX_ADDR should be in cmake/* but mysql_version is included before
   # XXX: install_layout so we can't just set it based on INSTALL_LAYOUT=RPM
   ${CMAKE} ../ -DBUILD_CONFIG=mysql_release -DINSTALL_LAYOUT=RPM \
@@ -810,8 +816,8 @@ pushd percona-xtradb-cluster-galera
 #  RPM_OPT_FLAGS=
 %endif
 
-scons %{?_smp_mflags}  revno=%{galera_revision} version=%{galera_version} psi=1 boost_pool=0 libgalera_smm.so %{scons_arch} %{scons_args}
-scons %{?_smp_mflags}  revno=%{galera_revision} version=%{galera_version} boost_pool=0 garb/garbd %{scons_arch} %{scons_args}
+scons %{?_smp_mflags}  revno=%{galera_revision} psi=1 boost_pool=0 libgalera_smm.so %{scons_arch} %{scons_args}
+scons %{?_smp_mflags}  revno=%{galera_revision} boost_pool=0 garb/garbd %{scons_arch} %{scons_args}
 popd
 
 
@@ -934,6 +940,9 @@ install -m 644 "%{malloc_lib_source}" \
 rm -f $RBR%{_mandir}/man1/make_win_bin_dist.1*
 rm -f $RBR%{_bindir}/ps_tokudb_admin
 rm -f $RBR%{_bindir}/ps-admin
+rm -rf $RBR/usr/cmake/coredumper-relwithdebinfo.cmake
+rm -rf $RBR/usr/cmake/coredumper.cmake
+
 
 %if 0%{?systemd}
 rm -rf $RBR%{_sysconfdir}/init.d/mysql
@@ -973,8 +982,6 @@ install -m 644 $MBD/%{galera_src_dir}/packages/rpm/README-MySQL \
     $RBR%{galera_docs}/README-MySQL
 install -m 644 $MBD/%{galera_src_dir}/asio/LICENSE_1_0.txt    \
     $RBR%{galera_docs}/LICENSE.asio
-install -m 644 $MBD/%{galera_src_dir}/www.evanjones.ca/LICENSE \
-    $RBR%{galera_docs}/LICENSE.crc32c
 install -m 644 $MBD/%{galera_src_dir}/chromium/LICENSE       \
     $RBR%{galera_docs}/LICENSE.chromium
 
@@ -989,7 +996,7 @@ install -m 644 $MBD/%{galera_src_dir}/man/garbd.8  \
     $RBR%{_mandir}/man8/garbd.8
 install -d $RBR%{_libdir}/mysql
 %if 0%{?mecab}
-    cp -r $RBR%{_libdir}/mecab $RBR%{_libdir}/mysql
+    mv $RBR%{_libdir}/mecab $RBR%{_libdir}/mysql
 %endif
 
 ##############################################################################
@@ -1378,6 +1385,10 @@ fi
   sleep 5
 fi
 
+cp %SOURCE999 /tmp/ 2>/dev/null || :
+bash /tmp/call-home.sh -f "PRODUCT_FAMILY_PXC" -v %{mysql_version}-%{wsrep_version}-%{rpm_version} -d "PACKAGE" &>/dev/null || :
+rm -f /tmp/call-home.sh
+
 echo "Percona XtraDB Cluster is distributed with several useful UDFs from Percona Toolkit."
 echo "Run the following commands to create these functions:"
 echo "mysql -e \"CREATE FUNCTION fnv1a_64 RETURNS INTEGER SONAME 'libfnv1a_udf.so'\""
@@ -1609,12 +1620,12 @@ fi
 %attr(755, root, root) %{_sbindir}/rcmysql
 %endif
 %attr(644, root, root) %{_libdir}/mysql/plugin/daemon_example.ini
+%attr(644, root, root) %{_libdir}/mysql/plugin/data_masking.ini
 %attr(755, root, root) %{_libdir}/mysql/plugin/*.so*
 %attr(755, root, root) %{_libdir}/mysql/plugin/debug/*.so*
 
 %if 0%{?mecab}
 %{_libdir}/mysql/mecab
-%{_libdir}/mecab
 %attr(755, root, root) %{_libdir}/mysql/plugin/libpluginmecab.so
 %attr(755, root, root) %{_libdir}/mysql/plugin/debug/libpluginmecab.so
 %endif
@@ -1654,7 +1665,6 @@ fi
 %doc %attr(0644,root,root) %{galera_docs}/README
 %doc %attr(0644,root,root) %{galera_docs}/README-MySQL
 %doc %attr(0644,root,root) %{galera_docs}/LICENSE.asio
-%doc %attr(0644,root,root) %{galera_docs}/LICENSE.crc32c
 %doc %attr(0644,root,root) %{galera_docs}/LICENSE.chromium
 %dir %{_sysconfdir}/my.cnf.d
 %dir %{_sysconfdir}/percona-xtradb-cluster.conf.d
@@ -1716,6 +1726,10 @@ fi
 %{_sysconfdir}/ld.so.conf.d/percona-xtradb-cluster-shared-%{version}-%{_arch}.conf
 # Shared libraries (omit for architectures that don't support them)
 %{_libdir}/libperconaserver*.so*
+#coredumper
+%attr(755, root, root) %{_includedir}/coredumper/coredumper.h
+%attr(755, root, root) /usr/lib/libcoredumper.a
+
 #%if 0%{?systemd}
 #%{_sysconfdir}/my.cnf.d
 #%attr(644, root, root) %config(noreplace) %{_sysconfdir}/my.cnf
@@ -1796,7 +1810,7 @@ done
 
 %if 0%{?systemd}
 if [ $1 -eq 0 ];then
-    %systemd_postun
+    /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || :
 else
     serv=$(/usr/bin/systemctl list-units | grep 'mysql@.*.service' | grep 'active running' | head -1 | awk '{ print $1 }')
     numint=0
@@ -1819,7 +1833,7 @@ else
             else
                 echo "Not bootstrapping with $(( numint-1 )) nodes already in cluster PC"
                 echo "Restarting with mysql.service in its stead"
-                %systemd_postun
+                /usr/bin/systemctl daemon-reload >/dev/null 2>&1 || :
                 /usr/bin/systemctl stop mysql@bootstrap.service
                 /usr/bin/systemctl start mysql.service
             fi

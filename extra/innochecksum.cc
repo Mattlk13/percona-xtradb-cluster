@@ -1,14 +1,21 @@
 /*
-   Copyright (c) 2005, 2018, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2005, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -317,7 +324,7 @@ ulong read_file(
 {
 	ulong bytes = 0;
 
-	DBUG_ASSERT(physical_page_size >= UNIV_ZIP_SIZE_MIN);
+	assert(physical_page_size >= UNIV_ZIP_SIZE_MIN);
 
 	if (partial_page_read) {
 		buf += UNIV_ZIP_SIZE_MIN;
@@ -922,10 +929,10 @@ static struct my_option innochecksum_options[] = {
     0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0},
   {"verbose", 'v', "Verbose (prints progress every 5 seconds).",
     &verbose, &verbose, 0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   {"debug", '#', "Output debug log. See " REFMAN "dbug-package.html",
     &dbug_setting, &dbug_setting, 0, GET_STR, OPT_ARG, 0, 0, 0, 0, 0, 0},
-#endif /* !DBUG_OFF */
+#endif /* !NDEBUG */
   {"count", 'c', "Print the count of pages in the file and exits.",
     &just_count, &just_count, 0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
   {"format_info", 'f', "Display information about the file format and exit",
@@ -966,7 +973,7 @@ static struct my_option innochecksum_options[] = {
 /* Print out the Innodb version and machine information. */
 static void print_version(void)
 {
-#ifdef DBUG_OFF
+#ifdef NDEBUG
 	printf("%s Ver %s, for %s (%s)\n",
 		my_progname, INNODB_VERSION_STR,
 		SYSTEM_TYPE, MACHINE_TYPE);
@@ -974,7 +981,7 @@ static void print_version(void)
 	printf("%s-debug Ver %s, for %s (%s)\n",
 		my_progname, INNODB_VERSION_STR,
 		SYSTEM_TYPE, MACHINE_TYPE);
-#endif /* DBUG_OFF */
+#endif /* NDEBUG */
 }
 
 static void usage(void)
@@ -998,7 +1005,7 @@ innochecksum_get_one_option(
 	char			*argument MY_ATTRIBUTE((unused)))
 {
 	switch (optid) {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 	case '#':
 		dbug_setting = argument
 			? argument
@@ -1006,7 +1013,7 @@ innochecksum_get_one_option(
 				 "d:o,/tmp/innochecksum.trace");
 		DBUG_PUSH(dbug_setting);
 		break;
-#endif /* !DBUG_OFF */
+#endif /* !NDEBUG */
 	case 'e':
 		use_end_page = true;
 		break;

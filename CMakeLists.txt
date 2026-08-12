@@ -1,14 +1,21 @@
-# Copyright (c) 2006, 2018, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2006, 2023, Oracle and/or its affiliates.
 # 
 # This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; version 2 of the License.
-# 
+# it under the terms of the GNU General Public License, version 2.0,
+# as published by the Free Software Foundation.
+#
+# This program is also distributed with certain software (including
+# but not limited to OpenSSL) that is licensed under separate terms,
+# as designated in a particular file or component or in included license
+# documentation.  The authors of MySQL hereby grant you an additional
+# permission to link the program and your derivative works with the
+# separately licensed software that they have included with MySQL.
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-# 
+# GNU General Public License, version 2.0, for more details.
+#
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
@@ -40,6 +47,19 @@ IF(CMAKE_VERSION VERSION_EQUAL "3.0.0" OR
    CMAKE_VERSION VERSION_GREATER "3.0.0")
  CMAKE_POLICY(SET CMP0045 OLD)
  CMAKE_POLICY(SET CMP0042 OLD)
+ENDIF()
+
+# In CMake 3.12 and above, the
+#
+# * ``check_include_file`` macro in the ``CheckIncludeFile`` module, the
+# * ``check_include_file_cxx`` macro in the
+#   ``CheckIncludeFileCXX`` module, and the
+# * ``check_include_files`` macro in the ``CheckIncludeFiles`` module
+#
+# now prefer to link the check executable to the libraries listed in the
+# ``CMAKE_REQUIRED_LIBRARIES`` variable.
+IF(POLICY CMP0075)
+  CMAKE_POLICY(SET CMP0075 OLD)
 ENDIF()
 
 MESSAGE(STATUS "Running cmake version ${CMAKE_VERSION}")
@@ -74,6 +94,8 @@ IF(NOT DEFINED MANUFACTURER)
   MARK_AS_ADVANCED(MANUFACTURER)
 ENDIF()
 
+#Caching for BUILD TESTING
+SET(BUILD_TESTING OFF CACHE BOOL "")
 
 # MAX_INDEXES - Set the maximum number of indexes per table, default 64U
 IF (NOT MAX_INDEXES)
@@ -129,12 +151,57 @@ ELSE()
   MARK_AS_ADVANCED(MYSQL_PROJECT_NAME)
 ENDIF()
 
-PROJECT(${MYSQL_PROJECT_NAME})
+# CMake version 3.22.1 and above
+# Policy CMP0048 is not set: project() command manages VERSION variables.
+INCLUDE(mysql_version)
+IF(POLICY CMP0048)
+  CMAKE_POLICY(SET CMP0048 NEW)
+  PROJECT(${MYSQL_PROJECT_NAME}
+    VERSION ${MAJOR_VERSION}.${MINOR_VERSION}.${PATCH_VERSION})
+ELSE()
+  PROJECT(${MYSQL_PROJECT_NAME})
+ENDIF()
+
+MACRO(REPORT_CXX_FLAGS)
+  MESSAGE(STATUS "CMAKE_C_FLAGS: ${CMAKE_C_FLAGS}")
+  FOREACH(BUILD_TYPE "" _DEBUG _RELWITHDEBINFO _RELEASE _MINSIZEREL)
+    SET(flag "CMAKE_CXX_FLAGS${BUILD_TYPE}")
+    MESSAGE(STATUS "${flag}: ${${flag}}")
+  ENDFOREACH()
+ENDMACRO()
+
+# STRING(APPEND ...) from cmake VERSION 3.4
+MACRO(STRING_APPEND STRING_VAR INPUT)
+  SET(${STRING_VAR} "${${STRING_VAR}}${INPUT}")
+ENDMACRO()
+
+MACRO(STRING_PREPEND STRING_VAR INPUT)
+  SET(${STRING_VAR} "${INPUT}${${STRING_VAR}}")
+ENDMACRO()
 
 SET(BUILD_IS_SINGLE_CONFIG TRUE)
 MESSAGE(STATUS "CMAKE_GENERATOR: ${CMAKE_GENERATOR}")
 IF(CMAKE_GENERATOR MATCHES "Visual Studio" OR CMAKE_GENERATOR STREQUAL "Xcode")
   SET(BUILD_IS_SINGLE_CONFIG FALSE)
+ENDIF()
+
+SET(BUILD_TESTING ON)
+INCLUDE(CTest)
+# Explicitly disabling BUILD_TESTING since other code is not ready to handle
+# BUILD_TESTING set. If you try to remove the directive and CMake configuration
+# and reconfiguration finishes successfully, remove the hack.
+SET(BUILD_TESTING OFF)
+
+IF(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  SET(MY_COMPILER_IS_CLANG 1)
+ELSEIF(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+  SET(MY_COMPILER_IS_GNU 1)
+ELSEIF(CMAKE_CXX_COMPILER_ID MATCHES "SunPro")
+  SET(MY_COMPILER_IS_SUNPRO 1)
+ENDIF()
+
+IF(MY_COMPILER_IS_CLANG OR MY_COMPILER_IS_GNU)
+  SET(MY_COMPILER_IS_GNU_OR_CLANG 1)
 ENDIF()
 
 # Maintainer mode is default on only for debug builds using GCC/G++
@@ -217,6 +284,8 @@ IF(UNIX)
   OPTION(WITH_INNODB_MEMCACHED "" OFF)
   OPTION(ENABLE_MEMCACHED_SASL "Enable SASL on InnoDB Memcached" OFF)
   OPTION(ENABLE_MEMCACHED_SASL_PWDB "Enable SASL on InnoDB Memcached" OFF)
+  FIND_PROGRAM(MY_DPKG_BUILDFLAGS dpkg-buildflags /bin /usr/bin)
+  FIND_PROGRAM(MY_RPM rpm /bin /usr/bin)
 ELSE()
   OPTION(WITH_INNODB_MEMCACHED "" OFF)
 ENDIF()
@@ -230,12 +299,51 @@ ENDIF()
 INCLUDE(CheckTypeSize)
 CHECK_TYPE_SIZE("void *" SIZEOF_VOIDP)
 MESSAGE(STATUS "SIZEOF_VOIDP ${SIZEOF_VOIDP}")
+# On some platforms, cmake may think that CMAKE_SIZEOF_VOID_P == 4
+# even if we have configured for 64bit build....
+SET(CMAKE_SIZEOF_VOID_P ${SIZEOF_VOIDP})
+
 IF(WITH_DEFAULT_COMPILER_OPTIONS)
   INCLUDE(${CMAKE_SOURCE_DIR}/cmake/build_configurations/compiler_options.cmake)
 ENDIF()
 IF(WITH_DEFAULT_FEATURE_SET)
   INCLUDE(${CMAKE_SOURCE_DIR}/cmake/build_configurations/feature_set.cmake)
 ENDIF()
+
+INCLUDE(compile_flags)
+INCLUDE(install_layout)
+
+# Add RPM or DEB platform flags for STANDALONE build.
+# Not for DEBUG builds, since both platforms use -O2 and _FORTIFY_SOURCE.
+IF(LINUX AND INSTALL_LAYOUT MATCHES "STANDALONE" AND (LINUX_DEB_PLATFORM OR LINUX_RPM_PLATFORM))
+  IF(CMAKE_BUILD_TYPE STREQUAL "Debug" OR WITH_DEBUG)
+    SET(WITH_PACKAGE_FLAGS_DEFAULT OFF)
+  ELSE()
+    SET(WITH_PACKAGE_FLAGS_DEFAULT ON)
+  ENDIF()
+  OPTION(WITH_PACKAGE_FLAGS "Use DEB/RPM compiler flags" ${WITH_PACKAGE_FLAGS_DEFAULT})
+ENDIF()
+
+# Do not set package specific flags if language flags already provided
+# in environment or on command line.
+IF(WITH_PACKAGE_FLAGS AND NOT CMAKE_C_FLAGS AND NOT CMAKE_CXX_FLAGS)
+  IF(LINUX_RPM_PLATFORM)
+    IF(MY_RPM)
+      ADD_LINUX_RPM_FLAGS()
+    ELSE()
+      MESSAGE(WARNING "rpm executable not found")
+    ENDIF()
+  ELSEIF(LINUX_DEB_PLATFORM)
+    IF(MY_DPKG_BUILDFLAGS)
+      ADD_LINUX_DEB_FLAGS()
+    ELSE()
+      MESSAGE(WARNING "dpkg-buildflags executable not found")
+      MESSAGE(WARNING "Please do 'apt install dpkg-dev'")
+    ENDIF()
+  ENDIF()
+ENDIF()
+
+INCLUDE(CMakePushCheckState)
 
 # Add macros
 INCLUDE(wsrep)
@@ -246,17 +354,17 @@ INCLUDE(lz4)
 INCLUDE(libevent)
 INCLUDE(ssl)
 INCLUDE(sasl)
+INCLUDE(ldap)
 INCLUDE(rpc)
 INCLUDE(readline)
 INCLUDE(protobuf)
-INCLUDE(mysql_version)
 INCLUDE(libutils)
 INCLUDE(dtrace)
 INCLUDE(plugin)
 INCLUDE(install_macros)
-INCLUDE(install_layout)
 INCLUDE(mysql_add_executable)
 INCLUDE(curl)
+INCLUDE(coredumper)
 INCLUDE(prepend_append_cflags_if_supported)
 
 # Handle options
@@ -287,23 +395,59 @@ ENDIF()
 IF(NOT WITHOUT_SERVER)
   OPTION (WITH_UNIT_TESTS "Compile MySQL with unit tests" ON)
 ENDIF()
+OPTION(WITH_AUTHENTICATION_LDAP
+  "Report error if the LDAP authentication plugin cannot be built." OFF)
+
 OPTION(FORCE_UNSUPPORTED_COMPILER "Disable compiler version checks" OFF)
 MARK_AS_ADVANCED(WITHOUT_SERVER DISABLE_SHARED FORCE_UNSUPPORTED_COMPILER)
+
+# Check whether a specific warning option is supported.
+# Intended use is primarily to silence warnings from third-party code.
+# If *our* code has warnings with gcc[56789] or clang[345678] the
+# code should be fixed, rather than silencing the compiler warnings.
+#
+# Returns the corresponding "-Wno-<option>" if supported, 0 otherwise.
+# WARNING_OPTION should be as found in clang/gcc documentation.
+# Note: Sun Studio accepts/ignores anything starting with "-W".
+#       Visual Studio has a few /W options, but are totally different.
+# Hence we check for gcc/clang only.
+# No return value for functions in cmake, so we use an output argument.
+FUNCTION(MY_CHECK_CXX_COMPILER_WARNING WARNING_OPTION RETURN_VALUE)
+  # Strip off possible leading -Wno- or -W
+  STRING(REGEX REPLACE "^-Wno-" "" WARNING_OPTION ${WARNING_OPTION})
+  STRING(REGEX REPLACE "^-W" "" WARNING_OPTION ${WARNING_OPTION})
+  # Use HAVE_CXX_W_warning_option as cache variable.
+  STRING(REPLACE "-" "_" VAR_NAME ${WARNING_OPTION})
+  STRING(REPLACE "=" "_" VAR_NAME ${VAR_NAME})
+  STRING(REPLACE "c++" "cpp" VAR_NAME ${VAR_NAME})
+  SET(VAR_NAME "HAVE_CXX_W_${VAR_NAME}")
+  IF(MY_COMPILER_IS_GNU_OR_CLANG)
+    MY_CHECK_CXX_COMPILER_FLAG("-W${WARNING_OPTION}" ${VAR_NAME})
+  ELSE()
+    SET(${VAR_NAME} 0 CACHE INTERNAL "-W${WARNING_OPTION} not supported")
+  ENDIF()
+  IF(${VAR_NAME})
+    SET(${RETURN_VALUE} "-Wno-${WARNING_OPTION}" PARENT_SCOPE)
+  ELSE()
+    SET(${RETURN_VALUE} 0 PARENT_SCOPE)
+  ENDIF()
+ENDFUNCTION()
 
 MACRO(MY_SANITIZER_CHECK SAN_OPT RESULT)
   MY_CHECK_C_COMPILER_FLAG("${SAN_OPT}" C_RESULT)
   MY_CHECK_CXX_COMPILER_FLAG("${SAN_OPT}" CXX_RESULT)
   IF(C_RESULT AND CXX_RESULT)
+    STRING_APPEND(CMAKE_C_FLAGS   " ${SAN_OPT}")
+    STRING_APPEND(CMAKE_CXX_FLAGS " ${SAN_OPT}")
     # We switch on basic optimization also for debug builds.
+    # We disable inlining for stack trace readability.
     # With optimization we may get some warnings, so we switch off -Werror
-    SET(CMAKE_C_FLAGS_DEBUG
-      "${CMAKE_C_FLAGS_DEBUG} ${SAN_OPT} -O1 -Wno-error -fPIC")
-    SET(CMAKE_C_FLAGS_RELWITHDEBINFO
-      "${CMAKE_C_FLAGS_RELWITHDEBINFO} ${SAN_OPT} -fPIC")
-    SET(CMAKE_CXX_FLAGS_DEBUG
-      "${CMAKE_CXX_FLAGS_DEBUG} ${SAN_OPT} -O1 -Wno-error -fPIC")
-    SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO
-      "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} ${SAN_OPT} -fPIC")
+    STRING_APPEND(CMAKE_C_FLAGS   " -O1 -fno-inline -fPIC")
+    STRING_APPEND(CMAKE_CXX_FLAGS " -O1 -fno-inline -fPIC")
+    IF(NOT SANITIZE_MAINTAINER_MODE)
+      SET(MYSQL_MAINTAINER_MODE OFF CACHE BOOL
+        "MySQL maintainer-specific development environment" FORCE)
+    ENDIF()
     SET(${RESULT} 1)
   ELSE()
     SET(${RESULT} 0)
@@ -311,24 +455,18 @@ MACRO(MY_SANITIZER_CHECK SAN_OPT RESULT)
 ENDMACRO()
 
 OPTION(WITH_ASAN "Enable address sanitizer" OFF)
-OPTION(WITH_ASAN_SCOPE "Enable -fsanitize-address-use-after-scope" OFF)
 IF(WITH_ASAN)
   MY_SANITIZER_CHECK("-fsanitize=address" WITH_ASAN_OK)
   IF(WITH_ASAN_OK)
+    OPTION(WITH_ASAN_SCOPE "Enable -fsanitize-address-use-after-scope" ON)
     SET(HAVE_ASAN 1)
     # This works with clang, but not gcc it seems.
     MY_CHECK_CXX_COMPILER_FLAG(
       "-fsanitize=address -fsanitize-address-use-after-scope"
       HAVE_SANITIZE_SCOPE)
     IF(WITH_ASAN_SCOPE AND HAVE_SANITIZE_SCOPE)
-      SET(CMAKE_C_FLAGS_DEBUG
-        "${CMAKE_C_FLAGS_DEBUG} -fsanitize-address-use-after-scope")
-      SET(CMAKE_C_FLAGS_RELWITHDEBINFO
-        "${CMAKE_C_FLAGS_RELWITHDEBINFO} -fsanitize-address-use-after-scope")
-      SET(CMAKE_CXX_FLAGS_DEBUG
-        "${CMAKE_CXX_FLAGS_DEBUG} -fsanitize-address-use-after-scope")
-      SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO
-        "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -fsanitize-address-use-after-scope")
+      STRING_APPEND(CMAKE_C_FLAGS   " -fsanitize-address-use-after-scope")
+      STRING_APPEND(CMAKE_CXX_FLAGS " -fsanitize-address-use-after-scope")
     ENDIF()
   ELSE()
     MESSAGE(FATAL_ERROR "Do not know how to enable address sanitizer")
@@ -362,30 +500,29 @@ IF(WITH_ASAN AND WITH_MSAN)
 ENDIF()
 
 
-# Always enable debug sync for debug builds.
-SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -DENABLED_DEBUG_SYNC")
-SET(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -DENABLED_DEBUG_SYNC")
- 
 # Older versions of ccache must be disabled: export CCACHE_DISABLE=1
 # See http://www.cmake.org/Wiki/CTest/Coverage
 OPTION(ENABLE_GCOV "Enable gcov (debug, Linux builds only)" OFF)
 IF (ENABLE_GCOV AND NOT WIN32 AND NOT APPLE)
-  SET(CMAKE_CXX_FLAGS_DEBUG
-    "${CMAKE_CXX_FLAGS_DEBUG} -fprofile-arcs -ftest-coverage -DHAVE_GCOV")
-  SET(CMAKE_C_FLAGS_DEBUG
-    "${CMAKE_C_FLAGS_DEBUG} -fprofile-arcs -ftest-coverage -DHAVE_GCOV")
-  SET(CMAKE_EXE_LINKER_FLAGS_DEBUG
-    "${CMAKE_EXE_LINKER_FLAGS_DEBUG} -fprofile-arcs -ftest-coverage -lgcov")
+  STRING_APPEND(CMAKE_C_FLAGS   " -fprofile-arcs -ftest-coverage -DHAVE_GCOV")
+  STRING_APPEND(CMAKE_CXX_FLAGS " -fprofile-arcs -ftest-coverage -DHAVE_GCOV")
+  STRING_APPEND(CMAKE_EXE_LINKER_FLAGS " -fprofile-arcs -ftest-coverage -lgcov")
 ENDIF()
 
 OPTION(ENABLE_GPROF "Enable gprof (optimized, Linux builds only)" OFF)
 IF (ENABLE_GPROF AND NOT WIN32 AND NOT APPLE)
-  SET(CMAKE_C_FLAGS_RELWITHDEBINFO
-    "${CMAKE_C_FLAGS_RELWITHDEBINFO} -pg")
-  SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO
-    "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} -pg")
-  SET(CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO
-    "${CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO} -pg")
+  STRING_APPEND(CMAKE_C_FLAGS " -pg")
+  STRING_APPEND(CMAKE_CXX_FLAGS " -pg")
+  STRING_APPEND(CMAKE_EXE_LINKER_FLAGS " -pg")
+ENDIF()
+
+# Linker/binutils bug in Fedora 28, Ubuntu 16.04, Debian 8 and Debian 9,
+# undefined reference to symbol '__bss_start'
+IF(LINUX_FEDORA_28 OR LINUX_UBUNTU_16_04 OR LINUX_DEBIAN_8 OR LINUX_DEBIAN_9)
+  IF(NOT CMAKE_CXX_LINK_FLAGS MATCHES "-fuse-ld=lld" AND
+     NOT CMAKE_CXX_LINK_FLAGS MATCHES "-fuse-ld=gold")
+    STRING_APPEND(CMAKE_CXX_LINK_FLAGS " -Wl,--copy-dt-needed-entries")
+  ENDIF()
 ENDIF()
 
 IF(CMAKE_SYSTEM_NAME MATCHES "Linux")
@@ -404,12 +541,8 @@ IF(REPRODUCIBLE_BUILD)
     SET(DEBUG_PREFIX_FLAGS "${DEBUG_PREFIX_FLAGS} -gno-record-gcc-switches")
   ENDIF()
 
-  SET(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} ${DEBUG_PREFIX_FLAGS}")
-  SET(CMAKE_C_FLAGS_RELWITHDEBINFO
-    "${CMAKE_C_FLAGS_RELWITHDEBINFO} ${DEBUG_PREFIX_FLAGS}")
-  SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} ${DEBUG_PREFIX_FLAGS}")
-  SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO
-    "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} ${DEBUG_PREFIX_FLAGS}")
+  STRING_APPEND(CMAKE_C_FLAGS   " ${DEBUG_PREFIX_FLAGS}")
+  STRING_APPEND(CMAKE_CXX_FLAGS " ${DEBUG_PREFIX_FLAGS}")
 
   SET(CMAKE_C_LINK_FLAGS "${CMAKE_C_LINK_FLAGS} -Wl,--build-id=none")
   SET(CMAKE_CXX_LINK_FLAGS "${CMAKE_C_LINK_FLAGS} -Wl,--build-id=none")
@@ -423,6 +556,8 @@ OPTION(ENABLED_LOCAL_INFILE
 MARK_AS_ADVANCED(ENABLED_LOCAL_INFILE)
 
 OPTION(OPTIMIZER_TRACE "Support tracing of Optimizer" ON)
+
+OPTION (WITH_COREDUMPER "Enable support for coredumper library" ON)
 
 #
 # Options related to client-side protocol tracing
@@ -453,22 +588,13 @@ IF(WITH_TEST_TRACE_PLUGIN AND NOT CMAKE_BUILD_TYPE MATCHES "Debug")
           Set WITH_TEST_TRACE_PLUGIN to OFF or WITH_DEBUG to ON.")
 ENDIF()
 
-# Set DBUG_OFF and other optional release-only flags for non-debug project types
+# Set NDEBUG for non-debug project types
 FOREACH(BUILD_TYPE RELEASE RELWITHDEBINFO MINSIZEREL)
   FOREACH(LANG C CXX)
-    SET(CMAKE_${LANG}_FLAGS_${BUILD_TYPE} 
-     "${CMAKE_${LANG}_FLAGS_${BUILD_TYPE}} -DDBUG_OFF -DNDEBUG")
+    # Prepend so options can be overwritten
+    STRING_PREPEND(CMAKE_${LANG}_FLAGS_${BUILD_TYPE} "-DNDEBUG ")
   ENDFOREACH()
 ENDFOREACH()
-
-IF(NOT CMAKE_BUILD_TYPE
-    AND NOT CMAKE_GENERATOR MATCHES "Visual Studio" 
-    AND NOT CMAKE_GENERATOR MATCHES "Xcode") 
-    # This is the case of no CMAKE_BUILD_TYPE choosen, typical for VS and Xcode
-    # or if custom C flags are set. In VS and Xcode for non-Debug configurations 
-    # DBUG_OFF is already correctly set.
-    ADD_DEFINITIONS(-DDBUG_OFF)
-ENDIF()
 
 # Add safemutex for debug configurations
 # PS-enabled SAFE_MUTEX (starting from 5.7.22) but PXC can't enable it.
@@ -478,11 +604,15 @@ ENDIF()
 # SAFE_MUTEX should be enabled for all instrument or none.
 # Since PXC cause is mix-match latter become true for PXC.
 IF(NOT WITH_INNODB_MEMCACHED)
-    FOREACH(LANG C CXX)
-        SET(CMAKE_${LANG}_FLAGS_DEBUG
-        "${CMAKE_${LANG}_FLAGS_DEBUG} -DSAFE_MUTEX")
-    ENDFOREACH()
+  FOREACH(LANG C CXX)
+    STRING_PREPEND(CMAKE_${LANG}_FLAGS_DEBUG "-DSAFE_MUTEX ")
+  ENDFOREACH()
 ENDIF()
+
+# Enable debug sync for debug builds.
+FOREACH(LANG C CXX)
+  STRING_PREPEND(CMAKE_${LANG}_FLAGS_DEBUG "-DENABLED_DEBUG_SYNC ")
+ENDFOREACH()
 
 
 # Set commonly used variables
@@ -547,22 +677,26 @@ ADD_DEFINITIONS(-D__STDC_WANT_LIB_EXT1__=1)
 # Run platform tests
 INCLUDE(configure.cmake)
 
+IF(APPLE)
+  # Homebrew default location is
+  IF(APPLE_ARM)
+    SET(HOMEBREW_HOME "/opt/homebrew/opt")
+  ELSE()
+    SET(HOMEBREW_HOME "/usr/local/opt")
+  ENDIF()
+ENDIF()
+
 # Common defines and includes
 ADD_DEFINITIONS(-DHAVE_CONFIG_H)
+ADD_DEFINITIONS(-DLZ4_DISABLE_DEPRECATE_WARNINGS) # C++14 deprecation warnings in LZ4.
 INCLUDE_DIRECTORIES(
   ${CMAKE_CURRENT_BINARY_DIR}/include
   ${CMAKE_SOURCE_DIR}/extra/rapidjson/include
   ${CMAKE_CURRENT_BINARY_DIR}/libbinlogevents/include
   ${CMAKE_SOURCE_DIR}/libbinlogevents/export)
 # Add bundled or system zlib.
-MYSQL_CHECK_ZLIB_WITH_COMPRESS()
-IF(BUILD_BUNDLED_ZLIB)
-  INCLUDE_DIRECTORIES(SYSTEM
-    ${CMAKE_CURRENT_SOURCE_DIR}/zlib
-    ${CMAKE_CURRENT_BINARY_DIR}/zlib
-    )
-ENDIF()
-# Add bundled yassl/taocrypt or system openssl.
+MYSQL_CHECK_ZLIB()
+# Add openssl.
 MYSQL_CHECK_SSL()
 # Add system/bundled editline.
 MYSQL_CHECK_EDITLINE()
@@ -572,12 +706,16 @@ MYSQL_CHECK_LIBEVENT()
 MYSQL_CHECK_LZ4()
 # Add SASL library
 MYSQL_CHECK_SASL()
+# Add LDAP library
+MYSQL_CHECK_LDAP()
 # Add protoc and libprotobuf
 IF(NOT WITHOUT_SERVER)
   MYSQL_CHECK_PROTOBUF()
 ENDIF()
 # Try and set CURL_LIBRARY
 MYSQL_CHECK_CURL()
+# Add coredumper
+MYSQL_CHECK_COREDUMPER()
 
 # Check for SYS_thread_selfid system call
 CHECK_C_SOURCE_COMPILES("
@@ -668,6 +806,11 @@ ADD_SUBDIRECTORY(libbinlogevents)
 ADD_SUBDIRECTORY(libbinlogstandalone)
 IF(WITH_WSREP)
 ADD_SUBDIRECTORY(wsrep)
+ENDIF()
+
+# gcc9 will not allow CTORs to do memset(this, 0, sizeof(*this));
+IF(CMAKE_COMPILER_IS_GNUCXX AND NOT GXX_VERSION VERSION_LESS 9)
+  STRING_APPEND(CMAKE_CXX_FLAGS " -Wno-class-memaccess")
 ENDIF()
 
 IF(NOT WITHOUT_SERVER)
@@ -783,13 +926,14 @@ ENDIF()
 # RPM installs documentation directly from the source tree
 #
 IF(NOT INSTALL_LAYOUT MATCHES "RPM")
-  INSTALL(FILES COPYING LICENSE.mysql 
-  DESTINATION ${INSTALL_DOCREADMEDIR} 
-  COMPONENT Readme
-  OPTIONAL
-  )
-  INSTALL(FILES README.MySQL DESTINATION ${INSTALL_DOCREADMEDIR} COMPONENT Readme)
-  INSTALL(FILES ${CMAKE_BINARY_DIR}/Docs/INFO_SRC ${CMAKE_BINARY_DIR}/Docs/INFO_BIN DESTINATION ${INSTALL_DOCDIR})
+  INSTALL(FILES
+    README
+    LICENSE
+    DESTINATION ${INSTALL_DOCREADMEDIR} COMPONENT Readme)
+  INSTALL(FILES
+    ${CMAKE_BINARY_DIR}/Docs/INFO_SRC
+    ${CMAKE_BINARY_DIR}/Docs/INFO_BIN
+    DESTINATION ${INSTALL_DOCDIR} COMPONENT Info)
   INSTALL(FILES Docs/README-wsrep DESTINATION ${INSTALL_DOCREADMEDIR} COMPONENT Readme)
   # MYSQL_DOCS_LOCATON is used in "make dist", points to the documentation directory
   SET(MYSQL_DOCS_LOCATION "" CACHE PATH "Location from where documentation is copied")
@@ -808,18 +952,28 @@ ENDIF()
 
 INCLUDE(CPack)
 
-# C compiler flags consist of:
+# C/CXX compiler flags consist of:
 # CPPFLAGS        Taken from environment, see above.
 # ADD_DEFINITIONS In each individual CMakeLists.txt
-# CMAKE_C_FLAGS   From command line.
+# CMAKE_CXX_FLAGS From command line.
 #                 We extend these in maintainer.cmake
-# ENV{CFLAGS}     From environment, but environment is ignored if
-#                 CMAKE_C_FLAGS is also given on command line
-# CMAKE_C_FLAGS_${CMAKE_BUILD_TYPE}
 #                 We extend these in compiler_options.cmake
+# ENV{CXXFLAGS}   From environment, but environment is ignored if
+#                 CMAKE_CXX_FLAGS is also given on command line
+# CMAKE_CXX_FLAGS_${CMAKE_BUILD_TYPE}, typical initial cmake values:
+#      DEBUG          -g
+#      RELWITHDEBINFO -O2 -g -DNDEBUG
+#      RELEASE        -O3 -DNDEBUG
+#      MINSIZEREL     -Os -DNDEBUG
+#
+# The compiler command line is
+# g++ DEFINITIONS CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_<configuration>
+#
+# So, if you want to use '-O3' for a RELWITHDEBINFO build, you should do:
+# cmake -DCMAKE_CXX_FLAGS_RELWITHDEBINFO="-O3 -g -DNDEBUG"
 #
 # Note that CMakeCache.txt contains cmake builtins for these variables,
-# *not* the values that will actually be used:
+# *not* the values that will actually be used, which we report here:
 
 
 IF(BUILD_IS_SINGLE_CONFIG)
@@ -827,20 +981,9 @@ IF(BUILD_IS_SINGLE_CONFIG)
 ENDIF()
 GET_PROPERTY(cwd_definitions DIRECTORY PROPERTY COMPILE_DEFINITIONS)
 MESSAGE(STATUS "COMPILE_DEFINITIONS: ${cwd_definitions}")
-MESSAGE(STATUS "CMAKE_C_FLAGS: ${CMAKE_C_FLAGS}")
-MESSAGE(STATUS "CMAKE_CXX_FLAGS: ${CMAKE_CXX_FLAGS}")
+REPORT_CXX_FLAGS()
 MESSAGE(STATUS "CMAKE_C_LINK_FLAGS: ${CMAKE_C_LINK_FLAGS}")
 MESSAGE(STATUS "CMAKE_CXX_LINK_FLAGS: ${CMAKE_CXX_LINK_FLAGS}")
-IF(CMAKE_BUILD_TYPE AND BUILD_IS_SINGLE_CONFIG)
-  STRING(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKEBT)
-  MESSAGE(STATUS "CMAKE_C_FLAGS_${CMAKEBT}: ${CMAKE_C_FLAGS_${CMAKEBT}}")
-  MESSAGE(STATUS "CMAKE_CXX_FLAGS_${CMAKEBT}: ${CMAKE_CXX_FLAGS_${CMAKEBT}}")
-ENDIF()
-IF(NOT BUILD_IS_SINGLE_CONFIG)
-  MESSAGE(STATUS "CMAKE_C_FLAGS_DEBUG: ${CMAKE_C_FLAGS_DEBUG}")
-  MESSAGE(STATUS "CMAKE_CXX_FLAGS_DEBUG: ${CMAKE_CXX_FLAGS_DEBUG}")
-  MESSAGE(STATUS
-    "CMAKE_C_FLAGS_RELWITHDEBINFO: ${CMAKE_C_FLAGS_RELWITHDEBINFO}")
-  MESSAGE(STATUS
-    "CMAKE_CXX_FLAGS_RELWITHDEBINFO: ${CMAKE_CXX_FLAGS_RELWITHDEBINFO}")
-ENDIF()
+MESSAGE(STATUS "CMAKE_EXE_LINKER_FLAGS ${CMAKE_EXE_LINKER_FLAGS}")
+MESSAGE(STATUS "CMAKE_MODULE_LINKER_FLAGS ${CMAKE_MODULE_LINKER_FLAGS}")
+MESSAGE(STATUS "CMAKE_SHARED_LINKER_FLAGS ${CMAKE_SHARED_LINKER_FLAGS}")

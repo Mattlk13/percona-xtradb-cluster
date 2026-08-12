@@ -1,15 +1,21 @@
 # -*- cperl -*-
-# Copyright (c) 2007, 2015 Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2007, 2023, Oracle and/or its affiliates.
 #
-# This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU Library General Public
-# License as published by the Free Software Foundation; version 2
-# of the License.
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License, version 2.0,
+# as published by the Free Software Foundation.
+#
+# This program is also distributed with certain software (including
+# but not limited to OpenSSL) that is licensed under separate terms,
+# as designated in a particular file or component or in included license
+# documentation.  The authors of MySQL hereby grant you an additional
+# permission to link the program and your derivative works with the
+# separately licensed software that they have included with MySQL.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-# Library General Public License for more details.
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License, version 2.0, for more details.
 #
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
@@ -227,8 +233,12 @@ sub shutdown {
   my $shutdown_timeout= shift;
   my @processes= @_;
   _verbose("shutdown, timeout: $shutdown_timeout, @processes");
+  my %shutdown_status = (
+    failed => 0,
+    killed => 0,
+  );
 
-  return if (@processes == 0);
+  return %shutdown_status if (@processes == 0);
 
   # Call shutdown function if process has one, else
   # use kill
@@ -254,8 +264,9 @@ sub shutdown {
     if ($ret != 0) {
       push(@kill_processes, $proc);
     }
-    # Only wait for the first process with shutdown timeout
-    $shutdown_timeout= 0;
+    else {
+      $shutdown_status{failed}= 1 if $? >> 8 != 0 and $? >> 8 != 62;
+    }
   }
 
   # Wait infinitely for those process
@@ -268,10 +279,13 @@ sub shutdown {
       push(@kill_processes, $proc);
       # Try one more time, best option...
     }
+    else {
+      $shutdown_status{killed}= 1 if $? >> 8 != 0 and $? >> 8 != 62;
+    }
   }
 
   # Return if all servers has exited
-  return if (@kill_processes == 0);
+  return %shutdown_status if (@kill_processes == 0);
 
   foreach my $proc (@kill_processes){
     $proc->start_kill();
@@ -279,9 +293,10 @@ sub shutdown {
 
   foreach my $proc (@kill_processes){
     $proc->wait_one(undef);
+    $shutdown_status{killed}= 1 if $? >> 8 != 0 and $? >> 8 != 62;
   }
 
-  return;
+  return %shutdown_status;
 }
 
 

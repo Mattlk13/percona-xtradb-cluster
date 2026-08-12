@@ -73,12 +73,13 @@ void audit_log_flush(audit_log_buffer_t *log)
 
   if (log->flush_pos >= log->write_pos % log->size)
   {
-    log->state= LOG_RECORD_INCOMPLETE;
+    log->state = (log->write_pos % log->size == 0)
+                    ? LOG_RECORD_COMPLETE : LOG_RECORD_INCOMPLETE;
     mysql_mutex_unlock(&log->mutex);
     log->write_func(log->write_func_data,
                     log->buf + log->flush_pos,
                     log->size - log->flush_pos,
-                    LOG_RECORD_INCOMPLETE);
+                    log->state);
     mysql_mutex_lock(&log->mutex);
     log->flush_pos= 0;
     log->write_pos%= log->size;
@@ -94,7 +95,7 @@ void audit_log_flush(audit_log_buffer_t *log)
     log->flush_pos+= flushlen;
     log->state= LOG_RECORD_COMPLETE;
   }
-  DBUG_ASSERT(log->write_pos >= log->flush_pos);
+  assert(log->write_pos >= log->flush_pos);
   mysql_cond_broadcast(&log->flushed_cond);
   mysql_mutex_unlock(&log->mutex);
 }
@@ -182,6 +183,15 @@ void audit_log_buffer_resume(audit_log_buffer_t *log)
 
 int audit_log_buffer_write(audit_log_buffer_t *log, const char *buf, size_t len)
 {
+  DBUG_EXECUTE_IF("audit_log_write_full_buffer", {
+    if (len > log->size) {
+      len = log->size - log->write_pos;
+    }
+    else {
+      return 0;
+    }
+  });
+
   if (len > log->size)
   {
     if (!log->drop_if_full)
@@ -205,7 +215,7 @@ loop:
     if (wrlen < len)
       memcpy(log->buf, buf + wrlen, len - wrlen);
     log->write_pos= log->write_pos + len;
-    DBUG_ASSERT(log->write_pos >= log->flush_pos);
+    assert(log->write_pos >= log->flush_pos);
   }
   else
   {

@@ -31,6 +31,7 @@
 #define WSREP_CLUSTER_NAME "my_wsrep_cluster"
 
 const  char* wsrep_provider         = 0;
+bool         wsrep_provider_set     = false;
 const  char* wsrep_provider_options = 0;
 const  char* wsrep_cluster_address  = 0;
 const  char* wsrep_cluster_name     = 0;
@@ -43,6 +44,7 @@ ulong   wsrep_reject_queries;
 int wsrep_init_vars()
 {
   wsrep_provider        = my_strdup(key_memory_wsrep, WSREP_NONE, MYF(MY_WME));
+  wsrep_provider_set    = false;
   wsrep_provider_options= my_strdup(key_memory_wsrep, "", MYF(MY_WME));
   wsrep_cluster_address = my_strdup(key_memory_wsrep, "", MYF(MY_WME));
   wsrep_cluster_name    = my_strdup(key_memory_wsrep, WSREP_CLUSTER_NAME, MYF(MY_WME));
@@ -155,6 +157,19 @@ static int wsrep_start_position_verify (const char* start_str)
 @return false if no error encountered with check else return true. */
 bool wsrep_start_position_check (sys_var *self, THD* thd, set_var* var)
 {
+    /* Allow setting wsrep_start_position:
+    1. During SST - always (this is used by mysqldump sst)
+    2. After boot - only when wsrep_provider=none
+    In other words, prohibit wsrep_start_position setting
+    if we are after SST and wsrep provider is loaded. */
+  if (!wsrep_sst_in_progress() && (strcmp(wsrep_provider, WSREP_NONE)))
+  {
+    my_message(ER_UNKNOWN_ERROR,
+              "wsrep_start_position can be set during server boot"
+              " or before loading wsrep_provider", MYF(0));
+    return true;
+  }
+
   char start_pos_buf[FN_REFLEN];
 
   if ((! var->save_result.string_value.str) ||
@@ -371,6 +386,8 @@ bool wsrep_provider_update (sys_var *self, THD* thd, enum_var_type type)
   }
   free(tmp);
 
+  wsrep_provider_set = (wsrep_provider != NULL) && strcmp(wsrep_provider, WSREP_NONE) != 0;
+
   // we sure don't want to use old address with new provider
   wsrep_cluster_address_init(NULL);
   wsrep_provider_options_init(NULL);
@@ -396,6 +413,7 @@ void wsrep_provider_init (const char* value)
 
   if (wsrep_provider) my_free((void *)wsrep_provider);
   wsrep_provider = my_strdup(key_memory_wsrep, value, MYF(0));
+  wsrep_provider_set = (wsrep_provider != NULL) && strcmp(wsrep_provider, WSREP_NONE) != 0;
 }
 
 bool wsrep_provider_options_check (sys_var *self, THD* thd, set_var* var)

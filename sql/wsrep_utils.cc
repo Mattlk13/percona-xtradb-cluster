@@ -814,6 +814,7 @@ thd::thd (my_bool won) : init(), ptr(new THD)
     ptr->thread_stack= (char*) &ptr;
     ptr->store_globals();
     ptr->variables.option_bits&= ~OPTION_BIN_LOG; // disable binlog
+    ptr->variables.option_bits|= OPTION_BIN_LOG_INTERNAL_OFF;
     ptr->variables.wsrep_on = won;
     ptr->m_security_ctx->set_master_access(~(ulong)0);
     lex_start(ptr);
@@ -875,6 +876,15 @@ unsigned int wsrep_check_ip (const char* const addr)
   return ret;
 }
 
+/* Returns guessed IP.
+   buf      buffer where to store guessed IP zero-terminated string
+   buf_len  length of buf
+   returns  length of string representing IP stored in buf (witnout trailing 0)
+            or 0 in case of failure.
+   In case of success, buffer is filled with IP zero-ended string.
+   This funcion takes care of string fit into the buf. If buf is too small,
+   warning is printed and zero is returned.
+   In case of failure, buf content is not modified. */
 size_t wsrep_guess_ip (char* buf, size_t buf_len)
 {
   size_t ip_len = 0;
@@ -889,7 +899,11 @@ size_t wsrep_guess_ip (char* buf, size_t buf_len)
     }
 
     if (INADDR_ANY != ip_type) {
-      strncpy (buf, my_bind_addr_str, buf_len);
+      if (strlen(my_bind_addr_str) >= buf_len) {
+        WSREP_WARN("default_ip(): buffer too short: %zu <= %zd", buf_len, strlen(my_bind_addr_str));
+        return 0;
+      }
+      strncpy(buf, my_bind_addr_str, buf_len);
       return strlen(buf);
     }
   }

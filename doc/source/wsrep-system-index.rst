@@ -61,7 +61,7 @@ For more information, see :ref:`pxc-maint-mode`.
    :default: ``10`` (ten seconds)
 
 Defines the transition period
-when you change :variable:`pxc_maint_mode` to ``SHUTDOWN`` or ``MAINTENANCE``.
+when you change :variable:`pxc_maint_mode` to ``SHUTDOWN``.
 By default, the period is set to 10 seconds,
 which should be enough for most transactions to finish.
 You can increase the value to accommodate for longer-running transactions.
@@ -115,7 +115,8 @@ or the node is bootstrapping, then :variable:`pxc_strict_mode` defaults to
    * ``wsrep_replicate_myisam=OFF``
    * ``binlog_format=ROW``
    * ``log_output=FILE`` or ``log_output=NONE`` or ``log_output=FILE,NONE``
-   * ``tx_isolation=SERIALIZABLE``
+  
+   The ``SERIALIZABLE`` method of isolation is not allowed in ``ENFORCING`` mode.
 
 For more information, see :ref:`pxc-strict-mode`.
 
@@ -142,7 +143,7 @@ It is enabled by default.
 
 Automatic adjustment may not be desirable depending on application's use
 and assumptions of auto-increments.
-It can be disabled in master-slave clusters.
+It can be disabled in source-replica clusters.
 
 .. variable:: wsrep_causal_reads
 
@@ -153,9 +154,9 @@ It can be disabled in master-slave clusters.
    :dyn: Yes
    :default: ``OFF``
 
-In some cases, the master may apply events faster than a slave,
-which can cause master and slave to become out of sync for a brief moment.
-When this variable is set to ``ON``, the slave will wait
+In some cases, the source may apply events faster than a replica,
+which can cause source and replica to become out of sync for a brief moment.
+When this variable is set to ``ON``, the replica will wait
 until that event is applied before doing any other queries.
 Enabling this variable will result in larger latencies.
 
@@ -214,12 +215,12 @@ you should pass the ``--wsrep-new-cluster`` option when starting.
    :cli: ``--wsrep-cluster-name``
    :conf: Yes
    :scope: Global
-   :dyn: Yes
+   :dyn: No
    :default: ``my_wsrep_cluster``
 
 Specifies the name of the cluster and should be identical on all nodes.
 
-.. note:: It should not exceed 32 characters.
+.. note:: It should not exceed 32 characters. A node cannot join the cluster if the cluster names do not match. You must re-bootstrap the cluster after a name change.
 
 .. variable:: wsrep_convert_lock_to_trx
 
@@ -234,7 +235,7 @@ Defines whether locking sessions should be converted into transactions.
 By default, this is disabled.
 
 Enabling this variable can help older applications to work
-in a multi-master setup by converting ``LOCK/UNLOCK TABLES`` statements
+in a multi-source setup by converting ``LOCK/UNLOCK TABLES`` statements
 into ``BEGIN/COMMIT`` statements.
 It is not the same as support for locking sessions,
 but it does prevent the database from ending up
@@ -512,7 +513,7 @@ identify the given node in the cluster as the alternative to using the node addr
    :dyn: Yes
 
 Specifies the `notification command
-<http://galeracluster.com/documentation-webpages/notificationcmd.html>`_
+<https://galeracluster.com/library/documentation/notification-cmd.html>`_
 that the node should execute
 whenever cluster membership or local node status changes.
 This can be used for alerting or to reconfigure load balancers.
@@ -526,16 +527,16 @@ This can be used for alerting or to reconfigure load balancers.
 
 .. variable:: wsrep_on
 
-   :version 5.6.27-25.13: Variable available only in session scope
    :cli: No
    :conf: No
    :scope: Session
    :dyn: Yes
    :default: ``ON``
 
-Defines whether updates from the current session should be replicated.
-If disabled, it does not cause the node to leave the cluster
-and the node continues to communicate with other nodes.
+Defines if current session transaction changes for a node are replicated to the cluster.
+
+If set to ``OFF`` for a session, no transaction changes are replicated in that session. The setting does not cause the node to leave the cluster, and the node communicates with other nodes.
+
 
 .. variable:: wsrep_OSU_method
 
@@ -571,6 +572,12 @@ The following methods are available:
   in the sequence of incoming transactions,
   and this DDL execution has to happen with high priority.
 
+  .. important::
+
+     Under the ``TOI`` method, when DDL operations are performed,
+     |abbr-mdl| is ignored. If |abbr-mdl| is important, use the ``RSU``
+     method.
+
 * ``RSU``: When the *Rolling Schema Upgrade* method is selected,
   DDL statements won't be replicated across the cluster.
   Instead, it's up to the user to run them on each node separately.
@@ -605,7 +612,7 @@ The following methods are available:
    :default: ``OFF``
 
 Defines whether the node should use transparent handling
-of preordered replication events (like replication from traditional master).
+of preordered replication events (like replication from traditional source).
 By default, this is disabled.
 
 If you enable this variable, such events will be applied locally first
@@ -736,9 +743,9 @@ the whole DDL statement is not put under TOI.
    :dyn: Yes
    :default: ``OFF``
 
-Defines whether replication slave should be restarted
+Defines whether replication replica should be restarted
 when the node joins back to the cluster.
-Enabling this can be useful because asynchronous replication slave thread
+Enabling this can be useful because asynchronous replication replica thread
 is stopped when the node tries to apply the next replication event
 while the node is in non-primary state.
 
@@ -769,7 +776,7 @@ autocommit transactions won't be retried.
    :scope: Global
    :dyn: Yes
    :default: ``5000``
-   :range:  From ``5000`` (5 millisecons) to ``31536000000000`` (365 days)
+   :range:  From ``5000`` (5 milliseconds) to ``31536000000000`` (365 days)
 
 Specifies the timeout in microseconds to allow active connection to complete
 COMMIT action before starting RSU.
@@ -778,9 +785,9 @@ While running RSU it is expected that user has isolated the node and there is
 no active traffic executing on the node. RSU has a check to ensure this, and
 waits for any active connection in ``COMMIT`` state before starting RSU.
 
-By default this check has timeout of 5 millisecons, but in some cases
+By default this check has timeout of 5 milliseconds, but in some cases
 COMMIT is taking longer. This variable sets the timeout, and has allowed values
-from the range of (5 millisecons, 365 days). The value is to be set in
+from the range of (5 milliseconds, 365 days). The value is to be set in
 microseconds. Unit of variable is in micro-secs so set accordingly.
 
 .. note:: RSU operation will not auto-stop node from receiving active traffic.
@@ -823,18 +830,14 @@ If any replication consistency problems are encountered,
 it's recommended to set this back to ``1`` to see if that resolves the issue.
 The default value can be increased for better throughput.
 
-You may want to increase it as suggested
-`in Codership documentation for flow control
-<http://galeracluster.com/documentation-webpages/nodestates.html#flow-control>`_:
-when the node is in ``JOINED`` state,
-increasing the number of slave threads can speed up the catchup to ``SYNCED``.
+Review the `Galera Cluster documentation for flow control
+<https://galeracluster.com/library/documentation/node-states.html>`__ for suggested settings.
 
 You can also estimate the optimal value for this from
-:variable:`wsrep_cert_deps_distance` as suggested `on this page
-<http://galeracluster.com/documentation-webpages/monitoringthecluster.html#checking-the-replication-health>`_.
+:variable:`wsrep_cert_deps_distance` as suggested `in the Galera Cluster documentation <https://galeracluster.com/library/training/tutorials/galera-monitoring.html>`_.
 
 For more configuration tips, see `this document
-<http://galeracluster.com/documentation-webpages/configurationtips.html#setting-parallel-slave-threads>`_.
+<https://galeracluster.com/library/kb/parallel-slave-threads.html>`_.
 
 .. variable:: wsrep_slave_UK_checks
 
@@ -939,7 +942,7 @@ Available values are:
 * ``xtrabackup-v2``: Uses |Percona XtraBackup| to perform SST.
   This method requires :variable:`wsrep_sst_auth`
   to be set up with credentials (``<user>:<password>``) on the donor node.
-  Privileges and perimssions for running |Percona XtraBackup|
+  Privileges and permissions for running |Percona XtraBackup|
   can be found `in Percona XtraBackup documentation
   <https://www.percona.com/doc/percona-xtrabackup/2.4/using_xtrabackup/privileges.html>`_.
 
@@ -959,7 +962,7 @@ Available values are:
      or ``localhost``, and will cause startup to fail in this case.
 
 * ``<custom_script_name>``: Galera supports `Scriptable State Snapshot Transfer
-  <http://galeracluster.com/documentation-webpages/statetransfer.html#scriptable-state-snapshot-transfer>`_.
+  <https://galeracluster.com/library/documentation/scriptable-sst.html>`_.
   This enables users to create their own custom scripts for performing SST.
   For example, you can create a script :file:`/usr/bin/wsrep_MySST.sh`
   and specify ``MySST`` for this variable to run your custom SST script.
@@ -971,7 +974,7 @@ Available values are:
   because it could lead to data inconsistency across the nodes.
 
 .. note:: Only ``xtrabackup-v2`` and ``rsync`` provide support
-   for clusters with GTIDs and async slaves.
+   for clusters with GTIDs and async replicas.
 
 .. variable:: wsrep_sst_receive_address
 
@@ -1038,3 +1041,4 @@ is determined by bitmask:
 .. note:: Setting :variable:`wsrep_sync_wait` to ``1`` is the equivalent
    of setting the deprecated :variable:`wsrep_causal_reads` to ``ON``.
 
+.. |abbr-mdl| replace:: :abbr:`MDL (Metadata Locking)`

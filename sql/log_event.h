@@ -1,13 +1,20 @@
-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -100,12 +107,12 @@ int ignored_error_code(int err_code);
    @param COND   Condition to check
    @param ERRNO  Error number to return in non-debug builds
 */
-#ifdef DBUG_OFF
+#ifdef NDEBUG
 #define ASSERT_OR_RETURN_ERROR(COND, ERRNO) \
   do { if (!(COND)) return ERRNO; } while (0)
 #else
 #define ASSERT_OR_RETURN_ERROR(COND, ERRNO) \
-  DBUG_ASSERT(COND)
+  assert(COND)
 #endif
 
 #define LOG_READ_EOF    -1
@@ -1114,10 +1121,10 @@ private:
   */
   virtual void set_mts_isolate_group()
   {
-    DBUG_ASSERT(ends_group() ||
-                get_type_code() == binary_log::QUERY_EVENT ||
-                get_type_code() == binary_log::EXEC_LOAD_EVENT ||
-                get_type_code() == binary_log::EXECUTE_LOAD_QUERY_EVENT);
+    assert(ends_group() ||
+           get_type_code() == binary_log::QUERY_EVENT ||
+           get_type_code() == binary_log::EXEC_LOAD_EVENT ||
+           get_type_code() == binary_log::EXECUTE_LOAD_QUERY_EVENT);
     common_header->flags |= LOG_EVENT_MTS_ISOLATE_F;
   }
 
@@ -1750,7 +1757,7 @@ public:
     Log_event(header(), footer(), Log_event::EVENT_NO_CACHE, Log_event::EVENT_IMMEDIATE_LOGGING),
     crypto_scheme(crypto_scheme_arg), key_version(key_version_arg)
   {
-    DBUG_ASSERT(crypto_scheme == 1);
+    assert(crypto_scheme == 1);
     is_valid_param= crypto_scheme == 1;
     memcpy(nonce, nonce_arg, Binlog_crypt_data::BINLOG_NONCE_LENGTH);
   }
@@ -1946,6 +1953,14 @@ public:
   {
     is_valid_param= true;
   }
+#ifdef WITH_WSREP
+  Intvar_log_event(uchar type_arg, ulonglong val_arg)
+  : binary_log::Intvar_event(type_arg, val_arg),
+    Log_event(header(), footer())
+  {
+    is_valid_param= true;
+  }
+#endif  /* WITH_WSREP */
 #ifdef HAVE_REPLICATION
   int pack_info(Protocol* protocol);
 #endif /* HAVE_REPLICATION */
@@ -2789,8 +2804,8 @@ private:
 */
 class Unknown_log_event: public binary_log::Unknown_event , public Log_event
 {
-public:
   enum { UNKNOWN, ENCRYPTED } what;
+public:
   /**
     Even if this is an unknown event, we still pass description_event to
     Log_event's ctor, this way we can extract maximum information from the
@@ -2896,7 +2911,7 @@ public:
 #ifdef MYSQL_CLIENT
   table_def *create_table_def()
   {
-    DBUG_ASSERT(m_colcnt > 0);
+    assert(m_colcnt > 0);
     return new table_def(m_coltype, m_colcnt, m_field_metadata,
                          m_field_metadata_size, m_null_bits, m_flags);
   }
@@ -3118,7 +3133,7 @@ public:
           We should just compare bitmaps for Delete, Write
           or Update rows events.
         */
-        DBUG_ASSERT(0);
+        assert(0);
     }
     return res;
   }
@@ -3241,7 +3256,7 @@ private:
   int unpack_current_row(const Relay_log_info *const rli,
                          MY_BITMAP const *cols)
   {
-    DBUG_ASSERT(m_table);
+    assert(m_table);
 
     ASSERT_OR_RETURN_ERROR(m_curr_row <= m_rows_end, HA_ERR_CORRUPT_EVENT);
     return ::unpack_row(rli, m_table, m_width, m_curr_row, cols,
@@ -3278,7 +3293,7 @@ private:
    */
   inline bool is_auto_inc_in_extra_columns()
   {
-    DBUG_ASSERT(m_table);
+    assert(m_table);
     return (m_table->next_number_field &&
             m_table->next_number_field->field_index >= m_width);
   }
@@ -3394,6 +3409,31 @@ private:
      performed.
    */
   int do_table_scan_and_update(Relay_log_info const *rli);
+
+  /**
+    Seek past the after-image of an update event, in case a row was processed
+    without reading the after-image.
+
+    An update event may process a row without reading the after-image,
+    e.g. in case of ignored or idempotent errors.  To ensure that the
+    read position for the next row is correct, we need to seek past
+    the after-image.
+
+    @param rli The applier context
+
+    @param curr_bi_start The read position of the beginning of the
+    before-image. (The function compares this with m_curr_row to know
+    if the after-image has been read or not.)
+
+    @retval 0 Success
+    @retval ER_* Error code returned by unpack_current_row
+  */
+  virtual int skip_after_image_for_update_event(const Relay_log_info *rli
+                                                MY_ATTRIBUTE((unused)),
+                                                const uchar *curr_bi_start
+                                                MY_ATTRIBUTE((unused))) {
+    return 0;
+  }
 
   /**
     Initializes scanning of rows. Opens an index and initailizes an iterator
@@ -3643,6 +3683,10 @@ protected:
   virtual int do_before_row_operations(const Slave_reporting_capability *const);
   virtual int do_after_row_operations(const Slave_reporting_capability *const,int);
   virtual int do_exec_row(const Relay_log_info *const);
+
+  int skip_after_image_for_update_event(const Relay_log_info *rli,
+                                        const uchar *curr_bi_start);
+
 #endif /* defined(MYSQL_SERVER) && defined(HAVE_REPLICATION) */
 };
 
@@ -3787,7 +3831,7 @@ public:
     DBUG_PRINT("enter", ("incident: %d", incident));
     if (incident > INCIDENT_NONE && incident < INCIDENT_COUNT)
       is_valid_param= true;
-    DBUG_ASSERT(message == NULL && message_length == 0);
+    assert(message == NULL && message_length == 0);
     DBUG_VOID_RETURN;
   }
 
@@ -3802,7 +3846,7 @@ public:
     DBUG_PRINT("enter", ("incident: %d", incident));
     if (incident > INCIDENT_NONE && incident < INCIDENT_COUNT)
       is_valid_param= true;
-    DBUG_ASSERT(message == NULL && message_length == 0);
+    assert(message == NULL && message_length == 0);
     if (!(message= (char*) my_malloc(key_memory_Incident_log_event_message,
                                            msg.length+1, MYF(MY_WME))))
     {

@@ -1,14 +1,21 @@
 /*
-   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -139,7 +146,7 @@ static struct my_option my_long_options[] =
    "Number of iterations to make. This works with -i (--sleep) only.",
    &nr_iterations, &nr_iterations, 0, GET_UINT,
    REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
-#ifdef DBUG_OFF
+#ifdef NDEBUG
   {"debug", '#', "This is a non-debug version. Catch this and exit.",
    0, 0, 0, GET_DISABLED, OPT_ARG, 0, 0, 0, 0, 0, 0},
   {"debug-check", OPT_DEBUG_CHECK, "This is a non-debug version. Catch this and exit.",
@@ -913,7 +920,7 @@ static int execute_commands(MYSQL *mysql,int argc, char **argv)
 	return -1;
       }
 
-      DBUG_ASSERT(mysql_num_rows(res) < MAX_MYSQL_VAR);
+      assert(mysql_num_rows(res) < MAX_MYSQL_VAR);
 
       if (!opt_vertical)
 	print_header(res);
@@ -1040,8 +1047,12 @@ static int execute_commands(MYSQL *mysql,int argc, char **argv)
     }
     case ADMIN_PASSWORD:
     {
+#ifdef WITH_WSREP
       const int buff_len=128;
       char buff[buff_len];
+#else
+      char buff[128];
+#endif /* WITH_WSREP */
       time_t start_time;
       char *typed_password= NULL, *verified= NULL, *tmp= NULL;
       bool log_off= true, err= false;

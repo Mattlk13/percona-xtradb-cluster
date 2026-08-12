@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 2007, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2007, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -743,8 +751,6 @@ public:
 	@param[in, out] wait_for	The lock that the the joining
 					transaction is waiting for
 	@param[in] prdt			Predicate [optional]
-	@param[in,out] c_lock		conflicting lock
-	@param[in,out] thr		query thread handler
 	@return DB_LOCK_WAIT, DB_DEADLOCK, or DB_QUE_THR_SUSPENDED, or
 		DB_SUCCESS_LOCKED_REC; DB_SUCCESS_LOCKED_REC means that
 		there was a deadlock, but another transaction was chosen
@@ -876,12 +882,12 @@ private:
 	@param[in] add_to_hash	If the lock should be added to the hash table
 	@param[in,out] c_lock	conflicting lock
 	@param[in,out] thr	query thread handler */
-	void lock_add(lock_t* lock, bool add_to_hash
 #ifdef WITH_WSREP
-		,lock_t* const	c_lock,
-		que_thr_t*	thr
+	void lock_add(lock_t* lock, bool add_to_hash, lock_t* const	c_lock,
+                que_thr_t* thr);
+#else
+	 void lock_add(lock_t* lock, bool add_to_hash);
 #endif /* WITH_WSREP */
-		     );
 
 	/**
 	Check and resolve any deadlocks

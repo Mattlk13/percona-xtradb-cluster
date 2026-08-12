@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 2005, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2005, 2024, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -490,7 +498,8 @@ row_merge_buf_redundant_convert(
 @param[in,out]	v_heap		heap memory to process data for virtual column
 @param[in,out]	my_table	mysql table object
 @param[in]	trx		transaction object
-@param[in]	prebuilt	compress_heap must be taken from here
+@param[in]	prebuilt	provides pointer to blob_heap (used for decompression)
+                        and compress_heap (used for compression)
 @return number of rows added, 0 if out of space */
 static
 ulint
@@ -1350,24 +1359,24 @@ row_merge_write_rec_low(
 /*====================*/
 	byte*		b,	/*!< out: buffer */
 	ulint		e,	/*!< in: encoded extra_size */
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 	ulint		size,	/*!< in: total size to write */
 	int		fd,	/*!< in: file descriptor */
 	ulint		foffs,	/*!< in: file offset */
-#endif /* !DBUG_OFF */
+#endif /* !NDEBUG */
 	const mrec_t*	mrec,	/*!< in: record to write */
 	const ulint*	offsets)/*!< in: offsets of mrec */
-#ifdef DBUG_OFF
+#ifdef NDEBUG
 # define row_merge_write_rec_low(b, e, size, fd, foffs, mrec, offsets)	\
 	row_merge_write_rec_low(b, e, mrec, offsets)
-#endif /* DBUG_OFF */
+#endif /* NDEBUG */
 {
 	DBUG_ENTER("row_merge_write_rec_low");
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 	const byte* const end = b + size;
-#endif /* DBUG_OFF */
-	DBUG_ASSERT(e == rec_offs_extra_size(offsets) + 1);
+#endif /* NDEBUG */
+	assert(e == rec_offs_extra_size(offsets) + 1);
 	DBUG_PRINT("ib_merge_sort",
 		   ("%p,fd=%d,%lu: %s",
 		    reinterpret_cast<const void*>(b), fd, ulong(foffs),
@@ -1381,7 +1390,7 @@ row_merge_write_rec_low(
 	}
 
 	memcpy(b, mrec - rec_offs_extra_size(offsets), rec_offs_size(offsets));
-	DBUG_ASSERT(b + rec_offs_size(offsets) == end);
+	assert(b + rec_offs_size(offsets) == end);
 	DBUG_VOID_RETURN;
 }
 
@@ -1699,7 +1708,8 @@ ALTER TABLE. stage->n_pk_recs_inc() will be called for each record read and
 stage->inc() will be called for each page read.
 @param[in]	eval_table	mysql table used to evaluate virtual column
 				value, see innobase_get_computed_value().
-@param[in]	prebuilt	compress_heap must be taken from here
+@param[in]	prebuilt	provides pointer to blob_heap (used for decompression)
+                        and compress_heap (used for compression)
 @return DB_SUCCESS or error */
 static MY_ATTRIBUTE((warn_unused_result))
 dberr_t
@@ -1944,11 +1954,11 @@ row_merge_read_clustered_index(
 				}
 			}
 
-#ifdef DBUG_OFF
+#ifdef NDEBUG
 # define dbug_run_purge	false
-#else /* DBUG_OFF */
+#else /* NDEBUG */
 			bool	dbug_run_purge = false;
-#endif /* DBUG_OFF */
+#endif /* NDEBUG */
 			DBUG_EXECUTE_IF(
 				"ib_purge_on_create_index_page_switch",
 				dbug_run_purge = true;);
@@ -2164,9 +2174,15 @@ end_of_index:
 			ut_ad(add_autoinc
 			      < dict_table_get_n_user_cols(new_table));
 
-			const dfield_t*	dfield;
+			dfield_t *dfield = dtuple_get_nth_field(row, add_autoinc);
+			if (num_spatial > 0) {
+				/* Perform a deep copy of the field because for
+				spatial indexes, the default tuple allocation is
+				overwritten, as tuples are processed at the end
+				of the page. */
+				dfield_dup(dfield, sp_heap);
+			}
 
-			dfield = dtuple_get_nth_field(row, add_autoinc);
 			if (dfield_is_null(dfield)) {
 				goto write_buffers;
 			}
@@ -4330,6 +4346,11 @@ row_merge_create_index(
 		this index, to ensure read consistency. */
 		ut_ad(index->trx_id == trx->id);
 	} else {
+		/* In case we were unable to assign an undo record for this index
+		we won't free index memory object */
+		if (err == DB_TOO_MANY_CONCURRENT_TRXS) {
+			dict_mem_index_free(index);
+		}
 		index = NULL;
 	}
 
@@ -4430,7 +4451,8 @@ this function and it will be passed to other functions for further accounting.
 @param[in]	add_v		new virtual columns added along with indexes
 @param[in]	eval_table	mysql table used to evaluate virtual column
 				value, see innobase_get_computed_value().
-@param[in]	prebuilt	compress_heap must be taken from here
+@param[in]	prebuilt	provides pointer to blob_heap (used for decompression)
+                        and compress_heap (used for compression)
 @return DB_SUCCESS or error code */
 dberr_t
 row_merge_build_indexes(
@@ -4712,21 +4734,23 @@ wait_again:
 		if (indexes[i]->type & DICT_FTS) {
 			row_fts_psort_info_destroy(psort_info, merge_info);
 			fts_psort_initiated = false;
-		} else if (error != DB_SUCCESS || !online) {
-			/* Do not apply any online log. */
-		} else if (old_table != new_table) {
-			ut_ad(!sort_idx->online_log);
-			ut_ad(sort_idx->online_status
-			      == ONLINE_INDEX_COMPLETE);
-		} else {
+		} else if (error == DB_SUCCESS &&
+			   !dict_table_is_temporary(indexes[i]->table)) {
 			ut_ad(need_flush_observer);
-
 			flush_observer->flush();
 			row_merge_write_redo(indexes[i]);
 
-			DEBUG_SYNC_C("row_log_apply_before");
-			error = row_log_apply(trx, sort_idx, table, stage);
-			DEBUG_SYNC_C("row_log_apply_after");
+			if (old_table != new_table) {
+				ut_ad(!sort_idx->online_log);
+				ut_ad(sort_idx->online_status
+				      == ONLINE_INDEX_COMPLETE);
+			/* Do not apply any online log if not online. */
+			} else if (online) {
+				DEBUG_SYNC_C("row_log_apply_before");
+				error = row_log_apply(trx, sort_idx, table,
+						stage);
+				DEBUG_SYNC_C("row_log_apply_after");
+			}
 		}
 
 		if (error != DB_SUCCESS) {

@@ -1,6 +1,6 @@
 /***********************************************************************
 
-Copyright (c) 1995, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2023, Oracle and/or its affiliates.
 Copyright (c) 2009, 2016, Percona Inc.
 
 Portions of this file contain modifications contributed and copyrighted
@@ -10,14 +10,21 @@ documentation. The contributions by Percona Inc. are incorporated with
 their permission, and subject to the conditions contained in the file
 COPYING.Percona.
 
-This program is free software; you can redistribute it and/or modify it
-under the terms of the GNU General Public License as published by the
-Free Software Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but
-WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
-Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -47,6 +54,7 @@ Created 10/21/1995 Heikki Tuuri
 #include "os0file.ic"
 #endif
 
+#include "page0page.h"
 #include "srv0srv.h"
 #include "srv0start.h"
 #include "fil0fil.h"
@@ -241,7 +249,7 @@ struct Slot {
 	bool			is_reserved;
 
 	/** time when reserved */
-	time_t			reservation_time;
+	ib_time_monotonic_t	reservation_time;
 
 	/** buffer used in i/o */
 	byte*			buf;
@@ -688,6 +696,13 @@ private:
 		MY_ATTRIBUTE((warn_unused_result));
 #endif /* LINUX_NATIVE_AIO */
 
+	/** Submit buffered AIO requests on the array to the kernel.
+	(low level function).
+	@param[in] acquire_mutex specifies whether to lock array mutex
+	@param[in] array for which to submit IO */
+	static void os_aio_dispatch_read_array_submit_low_for_array(
+		bool acquire_mutex MY_ATTRIBUTE((unused)), const AIO* arr);
+
 private:
 	typedef std::vector<Slot> Slots;
 
@@ -806,7 +821,7 @@ ulint	os_n_pending_writes = 0;
 /** Number of pending read operations */
 ulint	os_n_pending_reads = 0;
 
-time_t	os_last_printout;
+ib_time_monotonic_t	os_last_printout;
 bool	os_has_said_disk_full	= false;
 
 /** Default Zip compression level */
@@ -1070,7 +1085,7 @@ private:
 
 		version = mach_read_from_1(src + FIL_PAGE_VERSION);
 
-		ut_a(version == 1);
+		ut_a(Compression::is_valid_page_version(version));
 
 		/* Includes the page header size too */
 		ulint		size = compressed_page_size(slot);
@@ -1159,7 +1174,7 @@ os_file_compressed_page_size(const byte* buf)
 
 	if (type == FIL_PAGE_COMPRESSED) {
 		ulint	version = mach_read_from_1(buf + FIL_PAGE_VERSION);
-		ut_a(version == 1);
+		ut_a(Compression::is_valid_page_version(version));
 		return(mach_read_from_2(buf + FIL_PAGE_COMPRESS_SIZE_V1));
 	}
 
@@ -1178,7 +1193,7 @@ os_file_original_page_size(const byte* buf)
 	if (type == FIL_PAGE_COMPRESSED) {
 
 		ulint	version = mach_read_from_1(buf + FIL_PAGE_VERSION);
-		ut_a(version == 1);
+		ut_a(Compression::is_valid_page_version(version));
 
 		return(mach_read_from_2(buf + FIL_PAGE_ORIGINAL_SIZE_V1));
 	}
@@ -1484,7 +1499,7 @@ os_file_compress_page(
 	/* Add compression control information. Required for decompressing. */
 	mach_write_to_2(dst + FIL_PAGE_TYPE, FIL_PAGE_COMPRESSED);
 
-	mach_write_to_1(dst + FIL_PAGE_VERSION, 1);
+	mach_write_to_1(dst + FIL_PAGE_VERSION, Compression::FIL_PAGE_VERSION_2);
 
 	mach_write_to_1(dst + FIL_PAGE_ALGORITHM_V1, compression.m_type);
 
@@ -1750,12 +1765,8 @@ os_file_read_string(
 
 static
 dberr_t
-verify_post_encryption_checksum(
-	const IORequest&type,
-	Encryption	&encryption,
-	byte*		buf,
-	ulint		src_len,
-	ulint		offset)
+verify_post_encryption_checksum(const IORequest &type, Encryption &encryption,
+				byte *buf, ulint src_len)
 {
 	bool is_crypt_checksum_correct = false; // For MK encryption is_crypt_checksum_correct stays false
 	ulint original_type = static_cast<uint16_t>(
@@ -1770,7 +1781,7 @@ verify_post_encryption_checksum(
 							ENCRYPTION_ZIP_PAGE_KEYRING_ENCRYPTION_MAGIC_LEN) == 0;
 		} else
 			is_crypt_checksum_correct = fil_space_verify_crypt_checksum(buf, src_len, type.is_page_zip_compressed(),
-										    encryption.is_encrypted_and_compressed(buf), offset);
+										    encryption.is_encrypted_and_compressed(buf));
 
 		if (encryption.m_encryption_rotation == Encryption::NO_ROTATION && !is_crypt_checksum_correct) { // There is no re-encryption going on
 			ulint space_id = mach_read_from_4(buf + FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID);
@@ -1827,8 +1838,8 @@ load_key_needed_for_decryption(
 			key_version_read_from_page= mach_read_from_4(buf + FIL_PAGE_ENCRYPTION_KEY_VERSION);
 		}
 
-		ut_ad(key_version_read_from_page != ENCRYPTION_KEY_VERSION_INVALID &&
-		      key_version_read_from_page != ENCRYPTION_KEY_VERSION_NOT_ENCRYPTED);
+		ut_ad(key_version_read_from_page != ENCRYPTION_KEY_VERSION_INVALID);
+		ut_ad(key_version_read_from_page != ENCRYPTION_KEY_VERSION_NOT_ENCRYPTED);
 
 		// in rare cases - when (re-)encryption was aborted there can be pages encrypted with
 		// different key versions in a given tablespace - retrieve needed key here
@@ -1919,7 +1930,7 @@ os_file_io_complete(
 
 		if (is_page_encrypted)
 		{
-			dberr_t err = verify_post_encryption_checksum(type, encryption, buf, src_len, offset);
+			dberr_t err = verify_post_encryption_checksum(type, encryption, buf, src_len);
 			if (err != DB_SUCCESS)
 				return err;
 
@@ -1976,7 +1987,7 @@ os_file_io_complete(
 
 		//TODO:Robert czy bez type.is_page_zip_compressed to działa - powinno
 		ut_ad(!was_page_encrypted || //!type.is_page_zip_compressed() ||
-		fil_space_verify_crypt_checksum(buf, src_len, type.is_page_zip_compressed(), encryption.is_encrypted_and_compressed(buf), offset));
+		fil_space_verify_crypt_checksum(buf, src_len, type.is_page_zip_compressed(), encryption.is_encrypted_and_compressed(buf)));
 	}
 #endif
 
@@ -2164,6 +2175,12 @@ os_file_get_parent_dir(
 	/* Check for the root of a drive. */
 	if (os_file_is_root(path, last_slash)) {
 		return(NULL);
+	}
+
+	if (last_slash - path < 0) {
+		/* Sanity check, it prevents gcc from trying to handle this case which
+		 * results in warnings for some optimized builds */
+		return (NULL);
 	}
 
 	/* Non-trivial directory component */
@@ -2420,7 +2437,9 @@ os_file_encrypt_log(
 	byte*		buf_ptr;
 	Block*		block = NULL;
 
-	ut_ad(type.is_write() && type.is_encrypted() && type.is_log());
+	ut_ad(type.is_write());
+	ut_ad(type.is_encrypted());
+	ut_ad(type.is_log());
 	ut_ad(*n % OS_FILE_LOG_BLOCK_SIZE == 0);
 
 	if (*n <= BUFFER_BLOCK_SIZE - os_io_ptr_align) {
@@ -3043,11 +3062,25 @@ void
 AIO::os_aio_dispatch_read_array_submit_low(
 	bool acquire_mutex MY_ATTRIBUTE((unused)))
 {
+	os_aio_dispatch_read_array_submit_low_for_array(acquire_mutex, s_reads);
+	if (s_ibuf != NULL) {
+		os_aio_dispatch_read_array_submit_low_for_array(acquire_mutex, s_ibuf);
+	}
+}
+
+/** Submit buffered AIO requests on the array to the kernel.
+(low level function).
+@param[in] acquire_mutex specifies whether to lock array mutex
+@param[in] array for which to submit IO */
+void
+AIO::os_aio_dispatch_read_array_submit_low_for_array(
+	bool acquire_mutex MY_ATTRIBUTE((unused)), const AIO* arr)
+{
 	if (!srv_use_native_aio) {
 		return;
 	}
 #if defined(LINUX_NATIVE_AIO)
-	AIO* array = AIO::s_reads;
+	const AIO* array = arr;
 	ulint total_submitted = 0;
 	if (acquire_mutex)
 		array->acquire();
@@ -3136,7 +3169,7 @@ AIO::linux_dispatch(Slot* slot, bool should_buffer)
 	ulint	io_ctx_index = slot->pos / slots_per_segment;
 
 	if (should_buffer) {
-		ut_ad(this == s_reads);
+		ut_ad(this == s_reads || this == s_ibuf);
 
 		acquire();
 		/* There are m_slots.size() elements in m_pending,
@@ -3153,7 +3186,7 @@ AIO::linux_dispatch(Slot* slot, bool should_buffer)
 		m_pending[n] = iocb;
 		++count;
 		if (count == slots_per_segment) {
-			AIO::os_aio_dispatch_read_array_submit_low(false);
+			AIO::os_aio_dispatch_read_array_submit_low_for_array(false, this);
 		}
 		release();
 		return(true);
@@ -3676,8 +3709,10 @@ os_file_create_simple_func(
 	*success = false;
 
 	int		create_flag;
+#ifdef WITH_INNODB_DISALLOW_WRITES
 	if (create_mode != OS_FILE_OPEN && create_mode != OS_FILE_OPEN_RAW)
 		WAIT_ALLOW_WRITES();
+#endif
 
 	ut_a(!(create_mode & OS_FILE_ON_ERROR_SILENT));
 	ut_a(!(create_mode & OS_FILE_ON_ERROR_NO_EXIT));
@@ -4012,8 +4047,10 @@ os_file_create_func(
 	bool		on_error_silent;
 	pfs_os_file_t	file;
 
+#ifdef WITH_INNODB_DISALLOW_WRITES
 	if (create_mode != OS_FILE_OPEN && create_mode != OS_FILE_OPEN_RAW)
 		WAIT_ALLOW_WRITES();
+#endif
 
 	*success = false;
 
@@ -4190,8 +4227,10 @@ os_file_create_simple_no_error_handling_func(
 	pfs_os_file_t	file;
 	int		create_flag;
 
+#ifdef WITH_INNODB_DISALLOW_WRITES
 	if (create_mode != OS_FILE_OPEN && create_mode != OS_FILE_OPEN_RAW)
 		WAIT_ALLOW_WRITES();
+#endif
 
 	ut_a(!(create_mode & OS_FILE_ON_ERROR_SILENT));
 	ut_a(!(create_mode & OS_FILE_ON_ERROR_NO_EXIT));
@@ -4369,11 +4408,8 @@ future.
 @param[in]	advice	advice for access pattern
 @return true if success */
 bool
-os_file_advise(
-	pfs_os_file_t   file,   /*!< in, own: handle to a file */
-	os_offset_t     offset, /*!< in: file region offset  */
-	os_offset_t     len,    /*!< in: file region length  */
-	ulint		advice)	/*!< in: advice for access pattern */
+os_file_advise(pfs_os_file_t file, os_offset_t offset, os_offset_t len,
+	       ulint advice)
 {
 #ifdef __WIN__
 	return(true);
@@ -6147,7 +6183,7 @@ os_file_write_page(
 	if ((ulint) n_bytes != n && !os_has_said_disk_full) {
 
 		ib::error()
-			<< "Write to file " << name << "failed at offset "
+			<< "Write to file " << name << " failed at offset "
 			<< offset << ", " << n
 			<< " bytes should have been written,"
 			" only " << n_bytes << " were written."
@@ -6195,7 +6231,7 @@ os_file_pread(
 {
 	++os_n_file_reads;
 
-	const ib_uint64_t start_time = trx_stats::start_io_read(trx, n);
+	const ib_time_monotonic_us_t start_time = trx_stats::start_io_read(trx, n);
 
 	(void) os_atomic_increment_ulint(&os_n_pending_reads, 1);
 	MONITOR_ATOMIC_INC(MONITOR_OS_PENDING_READS);
@@ -7225,7 +7261,7 @@ AIO::start(
 		os_aio_segment_wait_events[i] = os_event_create(0);
 	}
 
-	os_last_printout = ut_time();
+	os_last_printout = ut_time_monotonic();
 
 	return(true);
 }
@@ -7315,6 +7351,7 @@ os_fusionio_get_sector_size()
 		/* Try to write the file with different sector size
 		alignment. */
 		ptr = static_cast<byte*>(ut_malloc_nokey(2 * MAX_SECTOR_SIZE));
+		UNIV_MEM_VALID(ptr, 2 * MAX_SECTOR_SIZE);
 
 		while (sector_size <= MAX_SECTOR_SIZE) {
 			block_ptr = static_cast<byte*>(
@@ -7602,7 +7639,7 @@ AIO::reserve_slot(
 	}
 
 	slot->is_reserved = true;
-	slot->reservation_time = ut_time();
+	slot->reservation_time = ut_time_monotonic();
 	slot->m1       = m1;
 	slot->m2       = m2;
 	slot->file     = file;
@@ -8554,9 +8591,10 @@ private:
 	@param[in]	slot		The slot to check */
 	void select_if_older(Slot* slot)
 	{
-		ulint	age;
+		int64_t time_diff = ut_time_monotonic() -
+					slot->reservation_time;
 
-		age = (ulint) difftime(ut_time(), slot->reservation_time);
+		const uint64_t age = time_diff > 0 ? (uint64_t) time_diff : 0;
 
 		if ((age >= 2 && age > m_oldest)
 		    || (age >= 2
@@ -8935,9 +8973,9 @@ AIO::print_all(FILE* file)
 void
 os_aio_print(FILE*	file)
 {
-	time_t		current_time;
-	double		time_elapsed;
-	double		avg_bytes_read;
+	ib_time_monotonic_t 		current_time;
+	double	 			time_elapsed;
+	double				avg_bytes_read;
 
 	for (ulint i = 0; i < srv_n_file_io_threads; ++i) {
 		fprintf(file, "I/O thread %lu state: %s (%s)",
@@ -8959,8 +8997,8 @@ os_aio_print(FILE*	file)
 	AIO::print_all(file);
 
 	putc('\n', file);
-	current_time = ut_time();
-	time_elapsed = 0.001 + difftime(current_time, os_last_printout);
+	current_time = ut_time_monotonic();
+	time_elapsed = 0.001 + (current_time - os_last_printout);
 
 	fprintf(file,
 		"Pending flushes (fsync) log: " ULINTPF "; "
@@ -9024,7 +9062,7 @@ os_aio_refresh_stats()
 
 	os_bytes_read_since_printout = 0;
 
-	os_last_printout = ut_time();
+	os_last_printout = ut_time_monotonic();
 }
 
 /** Checks that all slots in the system have been freed, that is, there are
@@ -9155,6 +9193,9 @@ os_free_block(Block* block)
 
 #endif /* !UNIV_INNOCHECKSUM */
 
+/** Minimum length needed for encryption */
+const unsigned int MIN_ENCRYPTION_LEN = 2 * MY_AES_BLOCK_SIZE + FIL_PAGE_DATA;
+
 /**
 @param[in]      type            The compression type
 @return the string representation */
@@ -9199,6 +9240,17 @@ Compression::is_compressed_page(const byte* page)
 	return(mach_read_from_2(page + FIL_PAGE_TYPE) == FIL_PAGE_COMPRESSED);
 }
 
+bool
+Compression::is_compressed_encrypted_page(const byte *page) {
+	return (mach_read_from_2(page + FIL_PAGE_TYPE) ==
+		FIL_PAGE_COMPRESSED_AND_ENCRYPTED);
+}
+
+bool
+Compression::is_valid_page_version(uint8_t version) {
+	return (version == FIL_PAGE_VERSION_1 || version == FIL_PAGE_VERSION_2);
+}
+
 /** Deserizlise the page header compression meta-data
 @param[in]	page		Pointer to the page header
 @param[out]	control		Deserialised data */
@@ -9207,7 +9259,7 @@ Compression::deserialize_header(
 	const byte*		page,
 	Compression::meta_t*	control)
 {
-	ut_ad(is_compressed_page(page));
+	ut_ad(is_compressed_page(page) || is_compressed_encrypted_page(page));
 
 	control->m_version = static_cast<uint8_t>(
 		mach_read_from_1(page + FIL_PAGE_VERSION));
@@ -9251,9 +9303,9 @@ Compression::deserialize(
 
 	byte*	ptr = src + FIL_PAGE_DATA;
 
-	ut_ad(header.m_version == 1);
+	ut_ad(is_valid_page_version(header.m_version));
 
-	if (header.m_version != 1
+	if (!is_valid_page_version(header.m_version)
 	    || header.m_original_size < UNIV_PAGE_SIZE_MIN - (FIL_PAGE_DATA + 8)
 	    || header.m_original_size > UNIV_PAGE_SIZE_MAX - FIL_PAGE_DATA
 	    || dst_len < header.m_original_size + FIL_PAGE_DATA) {
@@ -9309,29 +9361,11 @@ Compression::deserialize(
 
 	case Compression::LZ4:
 
-		if (dblwr_recover) {
-
-			ret = LZ4_decompress_safe(
-				reinterpret_cast<char*>(ptr),
-				reinterpret_cast<char*>(dst),
-				header.m_compressed_size,
-				header.m_original_size);
-
-		} else {
-
-			/* This can potentially read beyond the input
-			buffer if the data is malformed. According to
-			the LZ4 documentation it is a little faster
-			than the above function. When recovering from
-			the double write buffer we can afford to us the
-			slower function above. */
-
-			ret = LZ4_decompress_fast(
-				reinterpret_cast<char*>(ptr),
-				reinterpret_cast<char*>(dst),
-				header.m_original_size);
-		}
-
+                ret = LZ4_decompress_safe(
+                        reinterpret_cast<char*>(ptr),
+                        reinterpret_cast<char*>(dst),
+                        header.m_compressed_size,
+                        header.m_original_size);
 		if (ret < 0) {
 
 			if (block != NULL) {
@@ -9796,7 +9830,12 @@ Encryption::get_master_key(ulint* master_key_id,
 	int	ret;
 
 	memset(key_name, 0, ENCRYPTION_KEY_LEN);
-	*version = Encryption::ENCRYPTION_VERSION_2;
+	*version = Encryption::ENCRYPTION_VERSION_3;
+
+	DBUG_EXECUTE_IF("force_v2_encryption",{
+			*version = Encryption::ENCRYPTION_VERSION_2;
+			});
+
 
 	if (Encryption::master_key_id == 0) {
 		/* If m_master_key is 0, means there's no encrypted
@@ -9914,15 +9953,21 @@ bool Encryption::fill_encryption_info(byte*	key,
 
 	if (version == ENCRYPTION_VERSION_1) {
 		memcpy(ptr, ENCRYPTION_KEY_MAGIC_V1, ENCRYPTION_MAGIC_SIZE);
-	} else {
+	} else if (version == ENCRYPTION_VERSION_2) {
 		memcpy(ptr, ENCRYPTION_KEY_MAGIC_V2, ENCRYPTION_MAGIC_SIZE);
+	} else  {
+		memcpy(ptr, ENCRYPTION_KEY_MAGIC_V3, ENCRYPTION_MAGIC_SIZE);
 	}
 	ptr += ENCRYPTION_MAGIC_SIZE;
 
 	mach_write_to_4(ptr, master_key_id);
-	ptr += sizeof(master_key_id);
+	if (version == ENCRYPTION_VERSION_3) {
+		ptr += sizeof(uint32);
+	} else {
+		ptr += sizeof(master_key_id);
+	}
 
-	if (version == ENCRYPTION_VERSION_2) {
+	if (version >= ENCRYPTION_VERSION_2) {
 		memcpy(ptr, uuid, ENCRYPTION_SERVER_UUID_LEN);
 		ptr += ENCRYPTION_SERVER_UUID_LEN;
 	}
@@ -9979,13 +10024,17 @@ Encryption::decode_encryption_info(byte*	key,
 	if (memcmp(ptr, ENCRYPTION_KEY_MAGIC_V1,
 		     ENCRYPTION_MAGIC_SIZE) == 0) {
 		version = ENCRYPTION_VERSION_1;
-	} else {
+	} else if (memcmp(ptr, ENCRYPTION_KEY_MAGIC_V2,
+		     ENCRYPTION_MAGIC_SIZE) == 0) {
 		version = ENCRYPTION_VERSION_2;
+	} else {
+		version = ENCRYPTION_VERSION_3;
 	}
 
 	/* Check magic. */
-	if (version == ENCRYPTION_VERSION_2
-	    && memcmp(ptr, ENCRYPTION_KEY_MAGIC_V2, ENCRYPTION_MAGIC_SIZE) != 0) {
+	if (version >= ENCRYPTION_VERSION_2
+	    && memcmp(ptr, ENCRYPTION_KEY_MAGIC_V2, ENCRYPTION_MAGIC_SIZE) != 0
+	    && memcmp(ptr, ENCRYPTION_KEY_MAGIC_V3, ENCRYPTION_MAGIC_SIZE) != 0) {
 		/* We ignore report error for recovery,
 		since the encryption info maybe hasn't writen
 		into datafile when the table is newly created. */
@@ -9996,10 +10045,14 @@ Encryption::decode_encryption_info(byte*	key,
 
 	/* Get master key id. */
 	const ulint m_key_id = mach_read_from_4(ptr);
-	ptr += sizeof(ptr);
+	if (version == ENCRYPTION_VERSION_3) {
+		ptr += sizeof(uint32);
+	} else {
+		ptr += sizeof(ptr);
+	}
 
 	/* Get server uuid. */
-	if (version == ENCRYPTION_VERSION_2) {
+	if (version >= ENCRYPTION_VERSION_2) {
 		memset(srv_uuid, 0, ENCRYPTION_SERVER_UUID_LEN + 1);
 		memcpy(srv_uuid, ptr, ENCRYPTION_SERVER_UUID_LEN);
 		ptr += ENCRYPTION_SERVER_UUID_LEN;
@@ -10100,19 +10153,6 @@ Encryption::decode_encryption_info(byte*	key,
 	return(true);
 }
 
-/** Check if page is encrypted page or not
-@param[in]	page	page which need to check
-@return true if it is an encrypted page */
-bool
-Encryption::is_encrypted_page(const byte* page)
-{
-	ulint	page_type = mach_read_from_2(page + FIL_PAGE_TYPE);
-
-	return(page_type == FIL_PAGE_ENCRYPTED
-	       || page_type == FIL_PAGE_COMPRESSED_AND_ENCRYPTED
-	       || page_type == FIL_PAGE_ENCRYPTED_RTREE);
-}
-
 bool
 Encryption::is_encrypted_and_compressed(const byte *page)
 {
@@ -10125,9 +10165,8 @@ Encryption::is_encrypted_and_compressed(const byte *page)
 @param[in]	block	log block to check
 @return true if it is an encrypted block */
 bool
-Encryption::is_encrypted_log(const byte* block)
-{
-	return(log_block_get_encrypt_bit(block));
+Encryption::is_encrypted_log(const byte *block) {
+	return (log_block_get_encrypt_bit(block));
 }
 
 /** Encrypt the redo log block.
@@ -10136,12 +10175,9 @@ Encryption::is_encrypted_log(const byte* block)
 @param[in,out]	dst_ptr		destination area
 @return true if success. */
 bool
-Encryption::encrypt_log_block(
-	const IORequest&	type,
-	byte*			src_ptr,
-	byte*			dst_ptr)
-{
-	byte		remain_buf[MY_AES_BLOCK_SIZE * 2];
+Encryption::encrypt_log_block(const IORequest &type, byte* src_ptr,
+			      byte* dst_ptr) {
+	byte remain_buf[MY_AES_BLOCK_SIZE * 2];
 
 #ifdef UNIV_ENCRYPT_DEBUG
 	fprintf(stderr, "Encrypting block %lu.\n",
@@ -10150,8 +10186,12 @@ Encryption::encrypt_log_block(
 	fprintf(stderr, "\n");
 #endif
 	/* This is data size which need to encrypt. */
-	const ulint data_len = OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_HDR_SIZE;
-	const ulint main_len = (data_len / MY_AES_BLOCK_SIZE) * MY_AES_BLOCK_SIZE;
+	const ulint unencrypted_trailer_size =
+	    (m_type == Encryption::KEYRING) ? LOG_BLOCK_TRL_SIZE : 0;
+	const ulint data_len = OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_HDR_SIZE -
+			       unencrypted_trailer_size;
+	const ulint main_len =
+	    (data_len / MY_AES_BLOCK_SIZE) * MY_AES_BLOCK_SIZE;
 	ulint remain_len = data_len - main_len;
 
 	/* Encrypt the block. */
@@ -10160,74 +10200,79 @@ Encryption::encrypt_log_block(
 	ut_ad(memcmp(src_ptr, dst_ptr, LOG_BLOCK_HDR_SIZE) == 0);
 
 	switch (m_type) {
-	case Encryption::NONE:
-		ut_error;
+		case Encryption::NONE:
+			ut_error;
 
-	case Encryption::AES: {
-		lint			elen;
+		case Encryption::KEYRING:
+		case Encryption::AES: {
+			lint elen;
 
-		ut_ad(m_klen == ENCRYPTION_KEY_LEN);
-
-		elen = my_aes_encrypt(
-			src_ptr + LOG_BLOCK_HDR_SIZE,
-			static_cast<uint32>(main_len),
-			dst_ptr + LOG_BLOCK_HDR_SIZE,
-			reinterpret_cast<unsigned char*>(m_key),
-			static_cast<uint32>(m_klen),
-			my_aes_256_cbc,
-			reinterpret_cast<unsigned char*>(m_iv),
-			false);
-
-		if (elen == MY_AES_BAD_DATA) {
-			return(false);
-		}
-
-		const ulint len = static_cast<ulint>(elen);
-		ut_ad(len == main_len);
-
-		/* Copy remaining bytes. */
-		memcpy(dst_ptr + LOG_BLOCK_HDR_SIZE + len,
-		       src_ptr + LOG_BLOCK_HDR_SIZE + len,
-		       OS_FILE_LOG_BLOCK_SIZE
-		       - LOG_BLOCK_HDR_SIZE - len);
-
-		/* Encrypt the remaining bytes. Since my_aes_encrypt
-		request the content which need to encrypt is
-		multiple of MY_AES_BLOCK_SIZE, but the block
-		content is possiblly not, so, we need to handle
-		the tail bytes first. */
-		if (remain_len != 0) {
-			remain_len = MY_AES_BLOCK_SIZE * 2;
+			ut_ad(m_klen == ENCRYPTION_KEY_LEN);
 
 			elen = my_aes_encrypt(
-				dst_ptr + LOG_BLOCK_HDR_SIZE
-					+ data_len - remain_len,
-				static_cast<uint32>(remain_len),
-				remain_buf,
-				reinterpret_cast<unsigned char*>(m_key),
-				static_cast<uint32>(m_klen),
-				my_aes_256_cbc,
-				reinterpret_cast<unsigned char*>(m_iv),
-				false);
+			    src_ptr + LOG_BLOCK_HDR_SIZE,
+			    static_cast<uint32>(main_len),
+			    dst_ptr + LOG_BLOCK_HDR_SIZE,
+			    reinterpret_cast<unsigned char *>(m_key),
+			    static_cast<uint32>(m_klen), my_aes_256_cbc,
+			    reinterpret_cast<unsigned char *>(m_iv), false);
 
 			if (elen == MY_AES_BAD_DATA) {
-				return(false);
+				return (false);
 			}
 
-			memcpy(dst_ptr + LOG_BLOCK_HDR_SIZE
-			       + data_len - remain_len,
-			       remain_buf, remain_len);
+			const ulint len = static_cast<ulint>(elen);
+			ut_ad(len == main_len);
+
+			/* Copy remaining bytes. */
+			memcpy(dst_ptr + LOG_BLOCK_HDR_SIZE + len,
+			       src_ptr + LOG_BLOCK_HDR_SIZE + len,
+			       OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_HDR_SIZE -
+				   len);
+
+			/* Encrypt the remaining bytes. Since my_aes_encrypt
+			request the content which need to encrypt is
+			multiple of MY_AES_BLOCK_SIZE, but the block
+			content is possiblly not, so, we need to handle
+			the tail bytes first. */
+			if (remain_len != 0) {
+				remain_len = MY_AES_BLOCK_SIZE * 2;
+
+				elen = my_aes_encrypt(
+				    dst_ptr + LOG_BLOCK_HDR_SIZE + data_len -
+					remain_len,
+				    static_cast<uint32>(remain_len),
+				    remain_buf,
+				    reinterpret_cast<unsigned char *>(m_key),
+				    static_cast<uint32>(m_klen),
+				    my_aes_256_cbc,
+				    reinterpret_cast<unsigned char *>(m_iv),
+				    false);
+
+				if (elen == MY_AES_BAD_DATA) {
+					return (false);
+				}
+
+				memcpy(dst_ptr + LOG_BLOCK_HDR_SIZE +
+					   data_len - remain_len,
+				       remain_buf, remain_len);
+			}
+
+			break;
 		}
 
-		break;
-	}
-
-	default:
-		ut_error;
+		default:
+			ut_error;
 	}
 
 	/* Set the encrypted flag. */
 	log_block_set_encrypt_bit(dst_ptr, true);
+
+	if (m_type == Encryption::KEYRING) {
+		const ulint crc = log_block_calc_checksum_crc32(dst_ptr);
+		log_block_set_checksum(dst_ptr, crc + m_key_version);
+	}
+
 
 #ifdef UNIV_ENCRYPT_DEBUG
 	fprintf(stderr, "Encrypted block %lu.\n",
@@ -10235,29 +10280,26 @@ Encryption::encrypt_log_block(
 	ut_print_buf_hex(std::cerr, dst_ptr, OS_FILE_LOG_BLOCK_SIZE);
 	fprintf(stderr, "\n");
 
-	byte*	check_buf = static_cast<byte*>(
-		ut_malloc_nokey(OS_FILE_LOG_BLOCK_SIZE));
-	byte*	buf2 = static_cast<byte*>(
-		ut_malloc_nokey(OS_FILE_LOG_BLOCK_SIZE));
+	byte* check_buf =
+	    static_cast<byte *>(ut_malloc_nokey(OS_FILE_LOG_BLOCK_SIZE));
+	byte* buf2 =
+	    static_cast<byte *>(ut_malloc_nokey(OS_FILE_LOG_BLOCK_SIZE));
 
 	memcpy(check_buf, dst_ptr, OS_FILE_LOG_BLOCK_SIZE);
-	dberr_t err = decrypt_log(type, check_buf,
-				  OS_FILE_LOG_BLOCK_SIZE,
+	dberr_t err = decrypt_log(type, check_buf, OS_FILE_LOG_BLOCK_SIZE,
 				  buf2, OS_FILE_LOG_BLOCK_SIZE);
-	if (err != DB_SUCCESS
-	    || memcmp(src_ptr, check_buf,
-		      OS_FILE_LOG_BLOCK_SIZE) != 0) {
-		ut_print_buf_hex(std::cerr, src_ptr,
-			     OS_FILE_LOG_BLOCK_SIZE);
+	if (err != DB_SUCCESS ||
+	    memcmp(src_ptr, check_buf, OS_FILE_LOG_BLOCK_SIZE) != 0) {
+		ut_print_buf_hex(std::cerr, src_ptr, OS_FILE_LOG_BLOCK_SIZE);
 		ut_print_buf_hex(std::cerr, check_buf,
-			     OS_FILE_LOG_BLOCK_SIZE);
+				 OS_FILE_LOG_BLOCK_SIZE);
 		ut_ad(0);
 	}
 	ut_free(buf2);
 	ut_free(check_buf);
 #endif
 
-	return(true);
+	return (true);
 }
 
 /** Encrypt the redo log data contents.
@@ -10267,16 +10309,11 @@ Encryption::encrypt_log_block(
 @param[in,out]	dst		destination area
 @param[in,out]	dst_len		Size of the destination in bytes
 @return buffer data, dst_len will have the length of the data */
-byte*
-Encryption::encrypt_log(
-	const IORequest&	type,
-	byte*			src,
-	ulint			src_len,
-	byte*			dst,
-	ulint*			dst_len)
-{
-	byte*		src_ptr = src;
-	byte*		dst_ptr = dst;
+byte *
+Encryption::encrypt_log(const IORequest &type, byte* src, ulint src_len,
+			byte* dst, ulint* dst_len) {
+	byte* src_ptr = src;
+	byte* dst_ptr = dst;
 
 	ut_ad(type.is_log());
 	ut_ad(src_len % OS_FILE_LOG_BLOCK_SIZE == 0);
@@ -10286,10 +10323,9 @@ Encryption::encrypt_log(
 	while (src_ptr != src + src_len) {
 		if (!encrypt_log_block(type, src_ptr, dst_ptr)) {
 			*dst_len = src_len;
-				ib::error()
-					<< " Can't encrypt data of"
-					<< " redo log";
-			return(src);
+			ib::error() << " Can't encrypt data of"
+				    << " redo log";
+			return (src);
 		}
 
 		src_ptr += OS_FILE_LOG_BLOCK_SIZE;
@@ -10297,8 +10333,8 @@ Encryption::encrypt_log(
 	}
 
 #ifdef UNIV_ENCRYPT_DEBUG
-	byte*	check_buf = static_cast<byte*>(ut_malloc_nokey(src_len));
-	byte*	buf2 = static_cast<byte*>(ut_malloc_nokey(src_len));
+	byte* check_buf = static_cast<byte *>(ut_malloc_nokey(src_len));
+	byte* buf2 = static_cast<byte *>(ut_malloc_nokey(src_len));
 
 	memcpy(check_buf, dst, src_len);
 
@@ -10312,10 +10348,24 @@ Encryption::encrypt_log(
 	ut_free(check_buf);
 #endif
 
-	return(dst);
+	return (dst);
 }
 
+
 #endif
+
+/** Check if page is encrypted page or not
+@param[in]	page	page which need to check
+@return true if it is an encrypted page */
+bool
+Encryption::is_encrypted_page(const byte* page)
+{
+	ulint	page_type = mach_read_from_2(page + FIL_PAGE_TYPE);
+
+	return(page_type == FIL_PAGE_ENCRYPTED
+				 || page_type == FIL_PAGE_COMPRESSED_AND_ENCRYPTED
+				 || page_type == FIL_PAGE_ENCRYPTED_RTREE);
+}
 
 /** Encrypt the page data contents. Page type can't be
 FIL_PAGE_ENCRYPTED, FIL_PAGE_COMPRESSED_AND_ENCRYPTED,
@@ -10334,15 +10384,12 @@ Encryption::encrypt(
 	byte*			dst,
 	ulint*			dst_len)
 {
-	ulint		len = 0;
-	ulint		page_type = mach_read_from_2(src + FIL_PAGE_TYPE);
-	ulint		data_len;
-	ulint		main_len;
-	ulint		remain_len;
-	byte		remain_buf[MY_AES_BLOCK_SIZE * 2];
-
+	ut_ad(m_type != Encryption::NONE);
+	ut_ad(m_type != Encryption::KEYRING || m_key != NULL);
 	/* For encrypting redo log, take another way. */
 	ut_ad(!type.is_log());
+	/* Shouldn't encrypte an already encrypted page. */
+	ut_ad(!is_encrypted_page(src));
 
 #ifdef UNIV_ENCRYPT_DEBUG
 	ulint space_id =
@@ -10353,33 +10400,41 @@ Encryption::encrypt(
 		space_id, page_no, src_len);
 #endif
 
+	const uint16_t page_type = mach_read_from_2(src + FIL_PAGE_TYPE);
 	// Destination header might need to acommodate key_version and checksum after encryption
 	const uint DST_HEADER_SIZE = (m_type == Encryption::KEYRING && page_type == FIL_PAGE_COMPRESSED)
 				     ? FIL_PAGE_DATA + 8 : FIL_PAGE_DATA;
 
-	/* Shouldn't encrypte an already encrypted page. */
-	ut_ad(page_type != FIL_PAGE_ENCRYPTED
-	      && page_type != FIL_PAGE_COMPRESSED_AND_ENCRYPTED
-	      && page_type != FIL_PAGE_ENCRYPTED_RTREE);
-
-	ut_ad(m_type != Encryption::NONE);
-	ut_ad(m_type != Encryption::KEYRING || m_key != NULL);
-
 	/* This is data size which need to encrypt. */
-	if (m_type == Encryption::KEYRING && page_type == FIL_PAGE_COMPRESSED) {
-		data_len = src_len - DST_HEADER_SIZE; // We need those 8 bytes for key_version and post-encryption checksum
-		//ut_ad((uint)(*(src + src_len -8)) == 0); // There need to be at least 8 bytes left
-	} else if (m_type == Encryption::KEYRING && !type.is_page_zip_compressed()) {
-		data_len = src_len - DST_HEADER_SIZE - 4; // For keyring encryption we do not encrypt last four bytes which are equal to the LSN bytes in header
-							  // So they are not encrypted anyways
-	} else
-	  data_len = src_len - DST_HEADER_SIZE;
+	ulint src_enc_len = src_len;
 
-	main_len = (data_len / MY_AES_BLOCK_SIZE) * MY_AES_BLOCK_SIZE;
-	remain_len = data_len - main_len;
+	/* In FIL_PAGE_VERSION_2, we encrypt the actual compressed data length. */
+	if (page_type == FIL_PAGE_COMPRESSED) {
+		src_enc_len = mach_read_from_2(src + FIL_PAGE_COMPRESS_SIZE_V1) +
+									FIL_PAGE_DATA;
+		/* Extend src_enc_len if needed */
+		if (src_enc_len < MIN_ENCRYPTION_LEN) {
+			src_enc_len = MIN_ENCRYPTION_LEN;
+		}
+		ut_a(src_enc_len <= src_len);
+	}
+
+	/* Total length of the data to encrypt. */
+	ulint data_len = 0;
+	if (m_type == Encryption::KEYRING && page_type == FIL_PAGE_COMPRESSED) {
+		data_len = src_enc_len - FIL_PAGE_DATA;
+		// We need those 8 bytes for key_version and post-encryption checksum
+		// There need to be at least 8 bytes left
+		//ut_ad((uint)(*(src + src_len -8)) == 0);
+	} else if (m_type == Encryption::KEYRING && !type.is_page_zip_compressed()) {
+		// For keyring encryption we do not encrypt last four bytes which are
+		// equal to the LSN bytes in header so they are not encrypted anyway
+		data_len = src_enc_len - FIL_PAGE_DATA - 4;
+	} else {
+		data_len = src_enc_len - FIL_PAGE_DATA;
+	}
 
 	/* Only encrypt the data + trailer, leave the header alone */
-
 	switch (m_type) {
 	case Encryption::NONE:
 		ut_error;
@@ -10388,20 +10443,27 @@ Encryption::encrypt(
 		//fallthrough
 
 	case Encryption::AES: {
-		lint			elen;
-
 		ut_ad(m_klen == ENCRYPTION_KEY_LEN);
 		ut_ad(m_iv != NULL);
 
-		elen = my_aes_encrypt(
-			src + FIL_PAGE_DATA,
-			static_cast<uint32>(main_len),
-			dst + DST_HEADER_SIZE,
-			reinterpret_cast<unsigned char*>(m_key),
-			static_cast<uint32>(m_klen),
-			my_aes_256_cbc,
-			reinterpret_cast<unsigned char*>(m_iv),
-			false);
+		/* Server encryption functions expect input data to be in
+		multiples of MY_AES_BLOCK SIZE. Therefore we encrypt the
+		overlapping data of the chunk_len and trailer_len twice.
+		First we encrypt the bigger chunk of data then we do the
+		trailer. The trailer encryption block starts at
+		2 * MY_AES_BLOCK_SIZE bytes offset from the end of the enc_len.
+		During decryption we do the reverse of the above process. */
+		ut_ad(data_len >= 2 * MY_AES_BLOCK_SIZE);
+
+		const ulint chunk_len = (data_len / MY_AES_BLOCK_SIZE) * MY_AES_BLOCK_SIZE;
+		ulint remain_len = data_len - chunk_len;
+
+		lint elen = my_aes_encrypt(
+			src + FIL_PAGE_DATA, static_cast<uint32>(chunk_len),
+			dst + DST_HEADER_SIZE, reinterpret_cast<byte *>(m_key),
+			static_cast<uint32>(m_klen), my_aes_256_cbc,
+			reinterpret_cast<byte *>(m_iv), false);
+
 		ut_ad(elen != MY_AES_BAD_DATA);
 
 		if (elen == MY_AES_BAD_DATA) {
@@ -10424,27 +10486,25 @@ Encryption::encrypt(
 			return(src);
 		}
 
-		len = static_cast<ulint>(elen);
-		ut_ad(len == main_len);
+		const ulint len = static_cast<ulint>(elen);
+		ut_ad(len == chunk_len);
 
-		/* Copy remaining bytes and page tailer. */
-		memcpy(dst + DST_HEADER_SIZE + len,
-		       src + FIL_PAGE_DATA + len,
-		       src_len - FIL_PAGE_DATA - len);
-
-		/* Encrypt the remain bytes. */
+		/* Encrypt the trailing bytes. */
 		if (remain_len != 0) {
-			remain_len = MY_AES_BLOCK_SIZE * 2;
+			/* Copy remaining bytes and page trailer. */
+			memcpy(dst + DST_HEADER_SIZE + len,
+			       src + FIL_PAGE_DATA + len,
+			       remain_len);
+
+			const ulint trailer_len = MY_AES_BLOCK_SIZE * 2;
+			byte buf[trailer_len];
 
 			elen = my_aes_encrypt(
-				dst + DST_HEADER_SIZE + data_len - remain_len,
-				static_cast<uint32>(remain_len),
-				remain_buf,
+				dst + DST_HEADER_SIZE + data_len - trailer_len,
+				static_cast<uint32>(trailer_len), buf,
 				reinterpret_cast<unsigned char*>(m_key),
-				static_cast<uint32>(m_klen),
-				my_aes_256_cbc,
-				reinterpret_cast<unsigned char*>(m_iv),
-				false);
+				static_cast<uint32>(m_klen), my_aes_256_cbc,
+				reinterpret_cast<byte *>(m_iv), false);
 
 			ut_ad(elen != MY_AES_BAD_DATA);
 
@@ -10468,10 +10528,11 @@ Encryption::encrypt(
 				return(src);
 			}
 
-			memcpy(dst + DST_HEADER_SIZE + data_len - remain_len,
-			       remain_buf, remain_len);
-		}
+      ut_a(static_cast<ulint>(elen) == trailer_len);
 
+			memcpy(dst + DST_HEADER_SIZE + data_len - trailer_len,
+			       buf, trailer_len);
+		}
 
 		break;
 	}
@@ -10494,8 +10555,7 @@ Encryption::encrypt(
 			     dst+FIL_PAGE_TYPE+2,
 			     FIL_PAGE_DATA-FIL_PAGE_TYPE-2) == 0);
 	} else if (page_type == FIL_PAGE_RTREE) {
-		/* If the page is R-tree page, we need to save original
-		type. */
+		/* If the page is R-tree page, we need to save original type. */
 		mach_write_to_2(dst + FIL_PAGE_TYPE, FIL_PAGE_ENCRYPTED_RTREE);
 	} else{
 		mach_write_to_2(dst + FIL_PAGE_TYPE, FIL_PAGE_ENCRYPTED);
@@ -10547,8 +10607,7 @@ Encryption::encrypt(
 
 		#ifdef UNIV_ENCRYPT_DEBUG
 		ut_ad(type.is_page_zip_compressed() ||
-		fil_space_verify_crypt_checksum(dst, *dst_len, type.is_page_zip_compressed(), type.is_compressed(),
-						page_no)); // This works only for not zipped compressed pages
+		fil_space_verify_crypt_checksum(dst, *dst_len, type.is_page_zip_compressed(), type.is_compressed())); // This works only for not zipped compressed pages
 		#endif 
 	}
 
@@ -10598,19 +10657,17 @@ Encryption::encrypt(
           ut_free(check_buf);
 
           ut_ad(type.is_page_zip_compressed() ||
-                fil_space_verify_crypt_checksum(dst, *dst_len, type.is_page_zip_compressed(), type.is_compressed(),
-                                                page_no));
+                fil_space_verify_crypt_checksum(dst, *dst_len, type.is_page_zip_compressed(), type.is_compressed()));
 
           ut_ad(type.is_page_zip_compressed() ||
-                fil_space_verify_crypt_checksum(dst, *dst_len, type.is_page_zip_compressed(), type.is_compressed(),
-                                                page_no));
+                fil_space_verify_crypt_checksum(dst, *dst_len, type.is_page_zip_compressed(), type.is_compressed()));
         }
 #endif
 	fprintf(stderr, "Encrypted page:%lu.%lu\n", space_id, page_no);
 
 #endif
 #endif
-	*dst_len = src_len;
+
 #ifdef UNIV_ENCRYPT_DEBUG
 	fprintf(stderr, "Robert:Encrypted page:%lu.%lu\n", space_id, page_no);
 #endif
@@ -10618,6 +10675,15 @@ Encryption::encrypt(
 #if !defined(UNIV_INNOCHECKSUM)
         srv_stats.pages_encrypted.inc();
 #endif
+
+	/* Add padding 0 for unused portion */
+	if (src_len > src_enc_len) {
+		memset(dst + DST_HEADER_SIZE + data_len, 0,
+					 src_len - DST_HEADER_SIZE - data_len);
+	}
+
+	*dst_len = src_len;
+
 	return(dst);
 }
 
@@ -10630,90 +10696,104 @@ Encryption::encrypt(
 @param[in,out]	dst		Scratch area to use for decryption
 @return DB_SUCCESS or error code */
 dberr_t
-Encryption::decrypt_log_block(
-	const IORequest&	type,
-	byte*			src,
-	byte*			dst)
-{
-	byte		remain_buf[MY_AES_BLOCK_SIZE * 2];
+Encryption::decrypt_log_block(const IORequest &type, byte* src, byte* dst) {
+	byte remain_buf[MY_AES_BLOCK_SIZE * 2];
 
-	const ulint data_len = OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_HDR_SIZE;
-	const ulint main_len = (data_len / MY_AES_BLOCK_SIZE) * MY_AES_BLOCK_SIZE;
+	const ulint unencrypted_trailer_size =
+	    (m_type == Encryption::KEYRING) ? LOG_BLOCK_TRL_SIZE : 0;
+	const ulint data_len = OS_FILE_LOG_BLOCK_SIZE - LOG_BLOCK_HDR_SIZE -
+			       unencrypted_trailer_size;
+	const ulint main_len =
+	    (data_len / MY_AES_BLOCK_SIZE) * MY_AES_BLOCK_SIZE;
 	ulint remain_len = data_len - main_len;
-	byte*		ptr = src + LOG_BLOCK_HDR_SIZE;
+	byte* ptr = src + LOG_BLOCK_HDR_SIZE;
 
 	switch (m_type) {
-	case Encryption::AES: {
-		lint			elen;
+		case Encryption::KEYRING: {
+			const ulint block_crc =
+			    log_block_calc_checksum_crc32(src);
+			const ulint written_crc = log_block_get_checksum(src);
 
-		/* First decrypt the last 2 blocks data of data, since
-		data is no block aligned. */
-		if (remain_len != 0) {
-			ut_ad(m_klen == ENCRYPTION_KEY_LEN);
+			const ulint enc_key_version = written_crc - block_crc;
 
-			remain_len = MY_AES_BLOCK_SIZE * 2;
+			if (m_key_version != enc_key_version &&
+			    enc_key_version != REDO_LOG_ENCRYPT_NO_VERSION) {
+				redo_log_key* mkey =
+				    redo_log_key_mgr.load_key_version(
+					NULL, enc_key_version);
+				m_key_version = mkey->version;
+				m_key = reinterpret_cast<unsigned char *>(
+				    mkey->key);
+			}
+		}
+		/* FALLTHROUGH */
+		case Encryption::AES: {
+			lint elen;
 
-			/* Copy the last 2 blocks. */
-			memcpy(remain_buf,
-			       ptr + data_len - remain_len,
-			       remain_len);
+			/* First decrypt the last 2 blocks data of data, since
+			data is no block aligned. */
+			if (remain_len != 0) {
+				ut_ad(m_klen == ENCRYPTION_KEY_LEN);
 
-			elen = my_aes_decrypt(
-				remain_buf,
-				static_cast<uint32>(remain_len),
-				dst + data_len - remain_len,
-				reinterpret_cast<unsigned char*>(m_key),
-				static_cast<uint32>(m_klen),
-				my_aes_256_cbc,
-				reinterpret_cast<unsigned char*>(m_iv),
-				false);
-			if (elen == MY_AES_BAD_DATA) {
-				return(DB_IO_DECRYPT_FAIL);
+				remain_len = MY_AES_BLOCK_SIZE * 2;
+
+				/* Copy the last 2 blocks. */
+				memcpy(remain_buf,
+				       ptr + data_len - remain_len,
+				       remain_len);
+
+				elen = my_aes_decrypt(
+				    remain_buf,
+				    static_cast<uint32>(remain_len),
+				    dst + data_len - remain_len,
+				    reinterpret_cast<unsigned char *>(m_key),
+				    static_cast<uint32>(m_klen),
+				    my_aes_256_cbc,
+				    reinterpret_cast<unsigned char *>(m_iv),
+				    false);
+				if (elen == MY_AES_BAD_DATA) {
+					return (DB_IO_DECRYPT_FAIL);
+				}
+
+				/* Copy the other data bytes to temp area. */
+				memcpy(dst, ptr, data_len - remain_len);
+			} else {
+				ut_ad(data_len == main_len);
+
+				/* Copy the data bytes to temp area. */
+				memcpy(dst, ptr, data_len);
 			}
 
-			/* Copy the other data bytes to temp area. */
-			memcpy(dst, ptr, data_len - remain_len);
-		} else {
-			ut_ad(data_len == main_len);
+			/* Then decrypt the main data */
+			elen = my_aes_decrypt(
+			    dst, static_cast<uint32>(main_len), ptr,
+			    reinterpret_cast<unsigned char *>(m_key),
+			    static_cast<uint32>(m_klen), my_aes_256_cbc,
+			    reinterpret_cast<unsigned char *>(m_iv), false);
+			if (elen == MY_AES_BAD_DATA) {
+				return (DB_IO_DECRYPT_FAIL);
+			}
 
-			/* Copy the data bytes to temp area. */
-			memcpy(dst, ptr, data_len);
+			ut_ad(static_cast<ulint>(elen) == main_len);
+
+			/* Copy the remaining bytes. */
+			memcpy(ptr + main_len, dst + main_len,
+			       data_len - main_len);
+
+			break;
 		}
 
-		/* Then decrypt the main data */
-		elen = my_aes_decrypt(
-				dst,
-				static_cast<uint32>(main_len),
-				ptr,
-				reinterpret_cast<unsigned char*>(m_key),
-				static_cast<uint32>(m_klen),
-				my_aes_256_cbc,
-				reinterpret_cast<unsigned char*>(m_iv),
-				false);
-		if (elen == MY_AES_BAD_DATA) {
-			return(DB_IO_DECRYPT_FAIL);
-		}
-
-		ut_ad(static_cast<ulint>(elen) == main_len);
-
-		/* Copy the remaining bytes. */
-		memcpy(ptr + main_len, dst + main_len, data_len - main_len);
-
-		break;
-	}
-
-	default:
-		ib::error()
-			<< "Encryption algorithm support missing: "
-			<< Encryption::to_string(m_type);
-		return(DB_UNSUPPORTED);
+		default:
+			ib::error()
+			    << "Encryption algorithm support missing: "
+			    << Encryption::to_string(m_type);
+			return (DB_UNSUPPORTED);
 	}
 
 	ptr -= LOG_BLOCK_HDR_SIZE;
 
 #ifdef UNIV_ENCRYPT_DEBUG
-	fprintf(stderr, "Decrypted block %lu.\n",
-		log_block_get_hdr_no(ptr));
+	fprintf(stderr, "Decrypted block %lu.\n", log_block_get_hdr_no(ptr));
 	ut_print_buf_hex(std::cerr, ptr, OS_FILE_LOG_BLOCK_SIZE);
 	fprintf(stderr, "\n");
 #endif
@@ -10721,7 +10801,12 @@ Encryption::decrypt_log_block(
 	/* Reset the encrypted flag. */
 	log_block_set_encrypt_bit(ptr, false);
 
-	return(DB_SUCCESS);
+	if (m_type == Encryption::KEYRING) {
+		const ulint crc = log_block_calc_checksum_crc32(src);
+		log_block_set_checksum(src, crc);
+	}
+
+	return (DB_SUCCESS);
 }
 
 /** Decrypt the log data contents.
@@ -10733,16 +10818,11 @@ Encryption::decrypt_log_block(
 @param[in]	dst_len		Size of the scratch area in bytes
 @return DB_SUCCESS or error code */
 dberr_t
-Encryption::decrypt_log(
-	const IORequest&	type,
-	byte*			src,
-	ulint			src_len,
-	byte*			dst,
-	ulint			dst_len)
-{
-	Block*		block;
-	byte*		ptr = src;
-	dberr_t		ret;
+Encryption::decrypt_log(const IORequest &type, byte* src, ulint src_len,
+			byte* dst, ulint dst_len) {
+	Block*  block;
+	byte*   ptr = src;
+	dberr_t ret;
 
 	ut_ad(type.is_log());
 
@@ -10781,7 +10861,7 @@ Encryption::decrypt_log(
 				os_free_block(block);
 			}
 
-			return(ret);
+			return (ret);
 		}
 
 		ptr += OS_FILE_LOG_BLOCK_SIZE;
@@ -10791,9 +10871,8 @@ Encryption::decrypt_log(
 		os_free_block(block);
 	}
 
-	return(DB_SUCCESS);
+	return (DB_SUCCESS);
 }
-
 #endif
 
 /** Decrypt the page data contents. Page type must be FIL_PAGE_ENCRYPTED,
@@ -10843,7 +10922,16 @@ Encryption::decrypt(
 			mach_read_from_2(src + FIL_PAGE_COMPRESS_SIZE_V1))
 			+ FIL_PAGE_DATA;
 #ifndef UNIV_INNOCHECKSUM
-		src_len = ut_calc_align(src_len, type.block_size());
+		Compression::meta_t header;
+		Compression::deserialize_header(src, &header);
+		if (header.m_version == Compression::FIL_PAGE_VERSION_1) {
+			src_len = ut_calc_align(src_len, type.block_size());
+		} else {
+			/* Extend src_len if needed */
+			if (src_len < MIN_ENCRYPTION_LEN) {
+				src_len = MIN_ENCRYPTION_LEN;
+			}
+		}
 #endif
 	}
 #ifdef UNIV_ENCRYPT_DEBUG
@@ -10878,10 +10966,15 @@ Encryption::decrypt(
 
 	ut_ad(m_key != NULL);
 
-	data_len = src_len - HEADER_SIZE;
+  data_len = src_len - HEADER_SIZE;
 
-	if (page_type == FIL_PAGE_ENCRYPTED && m_type == Encryption::KEYRING && !type.is_page_zip_compressed()) {
-		data_len -= 4; //last 4 bytes are not encrypted
+	if (m_type == Encryption::KEYRING
+			&& page_type == FIL_PAGE_COMPRESSED_AND_ENCRYPTED) {
+		// There are 8 bytes after the header used for key_version and checksum
+		data_len += 8;
+	} else if (page_type == FIL_PAGE_ENCRYPTED && m_type == Encryption::KEYRING
+						 && !type.is_page_zip_compressed()) {
+		data_len -= 4;  // Last 4 bytes are not encrypted
 	}
 
 	main_len = (data_len / MY_AES_BLOCK_SIZE) * MY_AES_BLOCK_SIZE;

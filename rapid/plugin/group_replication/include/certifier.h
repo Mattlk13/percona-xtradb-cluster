@@ -1,13 +1,20 @@
-/* Copyright (c) 2014, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2014, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software Foundation,
@@ -70,7 +77,7 @@ public:
   */
   size_t unlink()
   {
-    DBUG_ASSERT(reference_counter > 0);
+    assert(reference_counter > 0);
     return --reference_counter;
   }
 
@@ -426,7 +433,7 @@ private:
   /**
     Is certifier initialized.
   */
-  bool initialized;
+  int32 initialized;
 
   /**
     Variable to store the sidno used for transactions which will be logged
@@ -533,7 +540,7 @@ private:
 
   bool inline is_initialized()
   {
-    return initialized;
+    return my_atomic_load32(&initialized);
   }
 
   void clear_certification_info();
@@ -559,7 +566,7 @@ private:
   int64 parallel_applier_last_committed_global;
   int64 parallel_applier_sequence_number;
 
-#if !defined(DBUG_OFF)
+#if !defined(NDEBUG)
   bool certifier_garbage_collection_block;
   bool same_member_message_discarded;
 #endif

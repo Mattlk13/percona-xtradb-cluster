@@ -33,14 +33,17 @@
 #
 
 # encryption specific variables.
+OS=$(uname)
 ealgo=""
 ekey=""
 ekeyfile=""
 encrypt=0
 ieopts=""
-xbstreameopts=""
-xbstreameopts_sst=""
-xbstreameopts_other=""
+xbstream_eopts=""
+xbstream_eopts_sst=""
+xbstream_eopts_other=""
+
+xbstream_opts=""
 
 nproc=1
 ecode=0
@@ -157,6 +160,9 @@ IST_FILE="xtrabackup_ist"
 # from the donor to the joiner
 SST_INFO_FILE="sst_info"
 
+# Used to pass status of pipelined processes executed in background
+PIPESTATUS_FILE="pipestatus"
+
 # Setting the path for ss and ip
 # ss: is utility to investigate socket, ip for network routes.
 export PATH="/usr/sbin:/sbin:$PATH"
@@ -190,6 +196,135 @@ timeit()
         extcode=$?
     fi
     return $extcode
+}
+
+# Helper function executed in background by interruptable_timeout function.
+# As it is executed in background it will return PIPESTATUS in the file
+# specified in argument.
+timeout_delegate(){
+    local stage=$1
+    shift
+    local status_file=$1
+    shift
+    local cmd="$@"
+    local x1 x2 took piperc
+
+    if [[ $ttime -eq 1 ]]; then 
+        x1=$(date +%s)
+        wsrep_log_debug "Evaluating $cmd"
+        eval "$cmd; piperc=( "\${PIPESTATUS[@]}" )"
+        x2=$(date +%s)
+        took=$(( x2-x1 ))
+        wsrep_log_debug "NOTE: $stage took $took seconds"
+        totime=$(( totime+took ))
+    else 
+        wsrep_log_debug "Evaluating $cmd"
+        eval "$cmd; piperc=( "\${PIPESTATUS[@]}" )"
+    fi
+
+    echo ${piperc[@]} > $status_file
+}
+
+# Execute provided command within provided time window.
+# Return:
+# Array consisting of error code of timeout followed by 
+# command PIPESTATUS array.
+# 0 - success
+# 124 - timeout
+interruptable_timeout() {
+    local tmt=$1
+    shift
+    local stage=$1
+    shift
+    local cmd="$@"
+    local result=0
+    local pid piperesult
+
+    # Add 20 seconds for requested timeout to allow graceful shutdown.
+    tmt=$((tmt+20))
+
+    # Start the command in background and monitor if it is alive.
+    # If still alive after timeout, kill it.
+    timeout_delegate "$stage" "${tmpdirbase}/$PIPESTATUS_FILE" "$cmd" &
+    pid=$!
+
+    while kill -0 $pid 2> /dev/null; do
+        if [[ $tmt -eq 20 ]];then
+          # Send SIGTERM to allow graceful shutdown
+          wsrep_log_info "Trying to terminate ($pid) $cmd with SIGTERM"
+          pkill -SIGTERM -P $pid
+          result=124
+        fi 
+
+        if [[ $tmt -eq 10 ]];then
+          # Still alive after SIGTERM? Send SIGKILL.
+          wsrep_log_info "Trying to terminate ($pid) $cmd with SIGKILL"
+          pkill -SIGKILL -P $pid
+          result=124
+        fi 
+        
+        if [[ $tmt -eq 0 ]];then
+          # Still alive after SIGKILL? Give up.
+          wsrep_log_error "Unable to stop command: $cmd"
+          result=124
+          break
+        fi 
+
+        sleep 1
+        tmt=$((tmt-1))
+    done
+    
+    if [[ $result -eq 0 ]];then
+      piperesult=(`cat ${tmpdirbase}/$PIPESTATUS_FILE`)
+    fi
+
+    piperesult=( $result "${piperesult[@]}" )
+    echo ${piperesult[@]}
+}
+
+# Monitor progress of SST and kill the process if stalled.
+monitor_sst_progress() {
+  local tmpsstdir=$1
+  shift
+  local pid=$1
+  shift
+  local timeout=$1
+  shift
+  local current_timeout=0
+  local previous_size=0
+  sleep=5
+  if [[ ${timeout} -eq 0 ]]; then
+    return;
+  fi
+
+  while true; do
+    kill -0 $pid 2> /dev/null
+    if [[ $? -ne 0 ]]; then
+      break;
+    fi
+    if [[ ! -d ${tmpsstdir} ]]; then
+      break;
+    fi
+
+    current_size=$(du -b -s ${tmpsstdir} | awk '{print $1}')
+    if [[ ${current_size} -eq  ${previous_size} ]]; then
+      current_timeout=$((current_timeout + 1))
+      sleep=1
+    else
+      # Reset timeout and set sleep back to 5 seconds.
+      current_timeout=0
+      sleep=5
+      previous_size=${current_size}
+    fi
+
+    if [[ ${current_timeout} -eq  ${timeout} ]]; then
+      wsrep_log_error "Killing SST ($pid) with SIGKILL after stalling for ${current_timeout} seconds"
+      pkill -SIGKILL -P ${pid} 2> /dev/null
+      break;
+    fi
+
+    sleep ${sleep};
+  done
 }
 
 #
@@ -269,13 +404,13 @@ get_keys()
 
         if [[ "$WSREP_SST_OPT_ROLE" == "joiner" ]]; then
             # Decryption is done by xbstream for SST
-            xbstreameopts_sst=" --decrypt=$ealgo $encrypt_opts --encrypt-threads=$encrypt_threads "
-            xbstreameopts_other=""
+            xbstream_eopts_sst=" --decrypt=$ealgo $encrypt_opts --encrypt-threads=$encrypt_threads "
+            xbstream_eopts_other=""
             ieopts=""
         else
             # Encryption is done by xtrabackup for SST
-            xbstreameopts_sst=""
-            xbstreameopts_other=""
+            xbstream_eopts_sst=""
+            xbstream_eopts_other=""
             ieopts=" --encrypt=$ealgo $encrypt_opts --encrypt-threads=$encrypt_threads "
         fi
     else
@@ -430,8 +565,21 @@ get_transfer()
                 tcmd="nc $ncsockopt -dl ${TSST_PORT}"
             fi
         else
+            # Check to see if netcat supports the '-N' flag.
+            #      -N Shutdown the network socket after EOF on stdin
+            # If it supports the '-N' flag, then we need to use the '-N'
+            # flag, otherwise the transfer will stay open after the file
+            # transfer and cause the command to timeout.
+            # Older versions of netcat did not need this flag and will
+            # return an error if the flag is used.
+            #
+            tcmd_extra=""
+            if nc -h 2>&1 | grep -qw -- -N; then
+                tcmd_extra+=" -N "
+            fi
+
             # netcat doesn't understand [] around IPv6 address
-            tcmd="nc ${REMOTEIP//[\[\]]/} ${TSST_PORT}"
+            tcmd="nc ${tcmd_extra} ${REMOTEIP//[\[\]]/} ${TSST_PORT}"
         fi
     else
         tfmt='socat'
@@ -445,6 +593,18 @@ get_transfer()
 
         donor_extra=""
         joiner_extra=""
+
+        local socat_donor_connect_timeout=
+        local socat_T=
+        if [[ ${WSREP_SST_DONOR_TIMEOUT} -ne 0 ]]; then
+            wsrep_log_debug "Using donor connect timeout ${WSREP_SST_DONOR_TIMEOUT} sec (for 1 retry)"
+            socat_donor_connect_timeout=",connect-timeout=${WSREP_SST_DONOR_TIMEOUT}"
+        fi
+        if [[ ${WSREP_SST_IDLE_TIMEOUT} -ne 0 ]]; then
+            wsrep_log_debug "Using donor idle timeout ${WSREP_SST_IDLE_TIMEOUT} sec"
+            socat_T=" -T ${WSREP_SST_IDLE_TIMEOUT}"
+        fi
+
         if [[ $encrypt -eq 2 || $encrypt -eq 3 || $encrypt -eq 4 ]]; then
             if ! socat -V | grep -q WITH_OPENSSL; then
                 wsrep_log_error "******************* FATAL ERROR ********************** "
@@ -463,6 +623,15 @@ get_transfer()
                 exit 2
             fi
 
+            # Convert the dhparams path into an absolute path
+            if [[ -n $ssl_dhparams ]]; then
+                pushd "$DATA" &>/dev/null
+                ssl_dhparams=$(get_absolute_path "$ssl_dhparams")
+                popd &>/dev/null
+
+                wsrep_log_debug "dhparams (absolute) : $ssl_dhparams"
+            fi
+
             # socat versions < 1.7.3 will have 512-bit dhparams (too small)
             #       so create 2048-bit dhparams and send that as a parameter
             # socat version >= 1.7.3, checks to see if the peername matches the hostname
@@ -472,12 +641,28 @@ get_transfer()
                 if [[ "$WSREP_SST_OPT_ROLE"  == "joiner" ]]; then
                     # dhparams check (will create ssl_dhparams if needed)
                     check_for_dhparams
-                    joiner_extra=",dhparam=$ssl_dhparams"
+                    joiner_extra+=",dhparam=$ssl_dhparams"
                 fi
             fi
             if check_for_version "$SOCAT_VERSION" "1.7.3"; then
                 donor_extra=',commonname=""'
             fi
+            # disable SNI if socat supports it
+            if check_for_version "$SOCAT_VERSION" "1.7.4"; then
+                donor_extra+=',no-sni=1'
+            fi
+
+            # PXC-3508 : If 'ssl_dhparams' option has been set, then always add it
+            # to the socat command (both donor and joiner)
+            if [[ -n $ssl_dhparams ]]; then
+                if [[ ! $donor_extra =~ dhparam= ]]; then
+                    donor_extra+=",dhparam=$ssl_dhparams"
+                fi
+                if [[ ! $joiner_extra =~ dhparam= ]]; then
+                    joiner_extra+=",dhparam=$ssl_dhparams"
+                fi
+            fi
+
         fi
 
         # prepend a comma if it's not already there
@@ -488,6 +673,14 @@ get_transfer()
         if [[ $encrypt -eq 2 ]]; then
             wsrep_log_warning "**** WARNING **** encrypt=2 is deprecated and will be removed in a future release"
             wsrep_log_debug "Using openssl based encryption with socat: with crt and ca"
+
+            pushd "$DATA" &>/dev/null
+            tcert=$(get_absolute_path "$tcert")
+            tca=$(get_absolute_path "$tca")
+            popd &>/dev/null
+
+            wsrep_log_debug "tcert (absolute) : $tcert"
+            wsrep_log_debug "tca (absolute) : $tca"
 
             verify_file_exists "$tcert" "Both certificate and CA files are required." \
                                         "Please check the 'tcert' option.           "
@@ -501,11 +694,19 @@ get_transfer()
                 tcmd="socat -u openssl-listen:${TSST_PORT},reuseaddr,cert=${tcert},cafile=${tca}${joiner_extra}${sockopt} stdio"
             else
                 wsrep_log_debug "Encrypting with CERT: $tcert, CA: $tca"
-                tcmd="socat -u stdio openssl-connect:${REMOTEIP}:${TSST_PORT},cert=${tcert},cafile=${tca}${donor_extra}${sockopt}"
+                tcmd="socat ${socat_T} -u stdio openssl-connect:${REMOTEIP}:${TSST_PORT},cert=${tcert},cafile=${tca}${donor_extra}${sockopt}${socat_donor_connect_timeout}"
             fi
         elif [[ $encrypt -eq 3 ]];then
             wsrep_log_warning "**** WARNING **** encrypt=3 is deprecated and will be removed in a future release"
             wsrep_log_debug "Using openssl based encryption with socat: with key and crt"
+
+            pushd "$DATA" &>/dev/null
+            tcert=$(get_absolute_path "$tcert")
+            tkey=$(get_absolute_path "$tkey")
+            popd &>/dev/null
+
+            wsrep_log_debug "tcert (absolute) : $tcert"
+            wsrep_log_debug "tkey (absolute) : $tkey"
 
             verify_file_exists "$tcert" "Both certificate and key files are required." \
                                         "Please check the 'tcert' option.            "
@@ -519,10 +720,20 @@ get_transfer()
                 tcmd="socat -u openssl-listen:${TSST_PORT},reuseaddr,cert=${tcert},key=${tkey},verify=0${joiner_extra}${sockopt} stdio"
             else
                 wsrep_log_debug "Encrypting with CERT: $tcert, KEY: $tkey"
-                tcmd="socat -u stdio openssl-connect:${REMOTEIP}:${TSST_PORT},cert=${tcert},key=${tkey},verify=0${sockopt}"
+                tcmd="socat ${socat_T} -u stdio openssl-connect:${REMOTEIP}:${TSST_PORT},cert=${tcert},key=${tkey},verify=0${donor_extra}${sockopt}${socat_donor_connect_timeout}"
             fi
         elif [[ $encrypt -eq 4 ]]; then
             wsrep_log_debug "Using openssl based encryption with socat: with key, crt, and ca"
+
+            pushd "$DATA" &>/dev/null
+            ssl_ca=$(get_absolute_path "$ssl_ca")
+            ssl_cert=$(get_absolute_path "$ssl_cert")
+            ssl_key=$(get_absolute_path "$ssl_key")
+            popd &>/dev/null
+
+            wsrep_log_debug "ssl_ca (absolute) : $ssl_ca"
+            wsrep_log_debug "ssl_cert (absolute) : $ssl_cert"
+            wsrep_log_debug "ssl_key (absolute) : $ssl_key"
 
             verify_file_exists "$ssl_ca" "CA, certificate, and key files are required." \
                                          "Please check the 'ssl-ca' option.           "
@@ -540,7 +751,7 @@ get_transfer()
                 tcmd="socat -u openssl-listen:${TSST_PORT},reuseaddr,cert=${ssl_cert},key=${ssl_key},cafile=${ssl_ca},verify=1${joiner_extra}${sockopt} stdio"
             else
                 wsrep_log_debug "Encrypting with CERT: $ssl_cert, KEY: $ssl_key, CA: $ssl_ca"
-                tcmd="socat -u stdio openssl-connect:${REMOTEIP}:${TSST_PORT},cert=${ssl_cert},key=${ssl_key},cafile=${ssl_ca},verify=1${donor_extra}${sockopt}"
+                tcmd="socat ${socat_T} -u stdio openssl-connect:${REMOTEIP}:${TSST_PORT},cert=${ssl_cert},key=${ssl_key},cafile=${ssl_ca},verify=1${donor_extra}${sockopt}${socat_donor_connect_timeout}"
             fi
 
         else
@@ -549,9 +760,15 @@ get_transfer()
             fi
 
             if [[ "$WSREP_SST_OPT_ROLE"  == "joiner" ]]; then
-                tcmd="socat -u TCP-LISTEN:${TSST_PORT},reuseaddr${sockopt} stdio"
+                # PXC-3767 - IPv6 support in PXC (wsrep_sst_xtrabackup-v2)
+                # socat require TCP6-LISTEN to work with ip version6 addresses
+                if [[ "$WSREP_SST_OPT_HOST" =~ .*:.* ]]; then
+                    tcmd="socat -u TCP6-LISTEN:${TSST_PORT},reuseaddr${sockopt} stdio"
+                else
+                    tcmd="socat -u TCP-LISTEN:${TSST_PORT},reuseaddr${sockopt} stdio"
+                fi
             else
-                tcmd="socat -u stdio TCP:${REMOTEIP}:${TSST_PORT}${sockopt}"
+                tcmd="socat ${socat_T} -u stdio TCP:${REMOTEIP}:${TSST_PORT}${sockopt}${socat_donor_connect_timeout}"
             fi
         fi
     fi
@@ -668,7 +885,7 @@ read_cnf()
     iopts=$(parse_cnf sst inno-backup-opts "")
     iapts=$(parse_cnf sst inno-apply-opts "")
     impts=$(parse_cnf sst inno-move-opts "")
-    stimeout=$(parse_cnf sst sst-initial-timeout 100)
+    stimeout=$WSREP_SST_JOINER_TIMEOUT
     ssyslog=$(parse_cnf sst sst-syslog 0)
     ssystag=$(parse_cnf mysqld_safe syslog-tag "${SST_SYSLOG_TAG:-}")
     ssystag+="-"
@@ -730,11 +947,11 @@ read_cnf()
         done
     fi
 
-    # Retry the connection 30 times (at 1-second intervals)
     if [[ ! "$sockopt" =~ retry= ]]; then
         sockopt+=",retry=30"
     fi
 
+    xbstream_opts=$(parse_cnf sst xbstream-opts "")
 }
 
 #
@@ -789,12 +1006,12 @@ adjust_progress()
 #
 get_stream()
 {
-    if [[ $sfmt == 'xbstream' ]]; then
-        wsrep_log_debug "Streaming with xbstream"
-        if [[ "$WSREP_SST_OPT_ROLE"  == "joiner" ]]; then
-            strmcmd="xbstream \$xbstreameopts -x"
+    if [[ $sfmt == 'xbstream' ]];then 
+        wsrep_log_info "Streaming with xbstream"
+        if [[ "$WSREP_SST_OPT_ROLE"  == "joiner" ]];then
+            strmcmd="xbstream -x $xbstream_opts \$xbstream_eopts"
         else
-            strmcmd="xbstream \$xbstreameopts -c \${FILE_TO_STREAM}"
+            strmcmd="xbstream -c $xbstream_opts \$xbstream_eopts \${FILE_TO_STREAM}"
         fi
     else
         sfmt="tar"
@@ -813,7 +1030,9 @@ get_stream()
 get_proc()
 {
     set +e
-    nproc=$(grep -c processor /proc/cpuinfo)
+    nproc=1
+    [ "$OS" = "Linux" ] && nproc=$(grep -c processor /proc/cpuinfo)
+    [ "$OS" = "Darwin" -o "$OS" = "FreeBSD" ] && nproc=$(sysctl -n hw.ncpu)
     [[ -z $nproc || $nproc -eq 0 ]] && nproc=1
     set -e
 }
@@ -848,7 +1067,8 @@ cleanup_joiner()
         rm -f "${XB_DONOR_KEYRING_FILE_PATH}"
     fi
 
-    # Final cleanup
+
+    # Final cleanup 
     pgid=$(ps -o pgid= $$ | grep -o '[0-9]*')
 
     # This means no setsid done in mysqld.
@@ -1164,7 +1384,7 @@ recv_data_from_donor_to_joiner()
     local msg=$2
     local tmt=$3
     local checkf=$4
-    local ltcmd
+    local ltcmd=$tcmd
 
     if [[ ! -d ${dir} ]]; then
         # This indicates that IST is in progress
@@ -1174,16 +1394,12 @@ recv_data_from_donor_to_joiner()
     pushd ${dir} 1>/dev/null
     set +e
 
-    if [[ $tmt -gt 0 && -x `which timeout` ]]; then
-        if timeout --help | grep -q -- '-k'; then
-            ltcmd="timeout -k $(( tmt+10 )) $tmt $tcmd"
-        else
-            ltcmd="timeout -s9 $tmt $tcmd"
-        fi
-        timeit "$msg" "$ltcmd | $strmcmd; RC=( "\${PIPESTATUS[@]}" )"
+    if [[ $tmt -gt 0 ]];then 
+         RC=(`interruptable_timeout $tmt "$msg" "$tcmd | $strmcmd"`)
     else
         timeit "$msg" "$tcmd | $strmcmd; RC=( "\${PIPESTATUS[@]}" )"
     fi
+
 
     set -e
     popd 1>/dev/null
@@ -1194,9 +1410,17 @@ recv_data_from_donor_to_joiner()
         return
     fi
 
+    # In case of SIGTERM, RC is not valid
+    if [[ ${#RC[@]} -lt 1 ]];then
+        wsrep_log_error "******************* FATAL ERROR ********************** "
+        wsrep_log_error "SST script interrupted"
+        wsrep_log_error "******************* FATAL ERROR ********************** "
+        exit 32
+    fi
+
     if [[ ${RC[0]} -eq 124 ]]; then
         wsrep_log_error "******************* FATAL ERROR ********************** "
-        wsrep_log_error "Possible timeout in receving first data from donor in gtid/keyring stage"
+        wsrep_log_error "Possible timeout in receiving first data from donor in gtid/keyring stage"
         wsrep_log_error "****************************************************** "
         exit 32
     fi
@@ -1204,7 +1428,7 @@ recv_data_from_donor_to_joiner()
     for ecode in "${RC[@]}";do
         if [[ $ecode -ne 0 ]]; then
             wsrep_log_error "******************* FATAL ERROR ********************** "
-            wsrep_log_error "Error while getting data from donor node: " \
+            wsrep_log_error "Error while getting data from donor node: "\
                             "exit codes: ${RC[@]}"
             wsrep_log_error "****************************************************** "
             exit 32
@@ -1251,7 +1475,24 @@ send_data_from_donor_to_joiner()
 
     pushd ${dir} 1>/dev/null
     set +e
-    timeit "$msg" "$strmcmd | $tcmd; RC=( "\${PIPESTATUS[@]}" )"
+
+
+    # Implement retry logic ourselves, as nc needs it, and socat has a bug
+    # when retry is used together with timeout
+    local rc=1
+    local counter=1
+
+    # remove the retry parameter from the command
+    local ltcmd=$(echo $tcmd | sed s/,retry=[0-9]*//)
+
+    while [[ $rc -ne 0 && counter -le 30 ]]; do
+        timeit "$msg" "$strmcmd | $ltcmd; RC=( "\${PIPESTATUS[@]}" )"
+        # Retry if socat/nc returns an error
+        rc=${RC[1]}
+        counter=$((counter+1))
+        sleep 1
+    done
+
     set -e
     popd 1>/dev/null
 
@@ -1259,7 +1500,7 @@ send_data_from_donor_to_joiner()
     for ecode in "${RC[@]}";do
         if [[ $ecode -ne 0 ]]; then
             wsrep_log_error "******************* FATAL ERROR ********************** "
-            wsrep_log_error "Error while sending data to joiner node: " \
+            wsrep_log_error "Error while sending data to joiner node: "\
                             "exit codes: ${RC[@]}"
             wsrep_log_error "****************************************************** "
             exit 32
@@ -1268,7 +1509,8 @@ send_data_from_donor_to_joiner()
 }
 
 # Returns the version string in a standardized format
-# Input "1.2.3" => echoes "010203"
+# Input
+#   "1.2.3" => echoes "010203"
 # Wrongly formatted values => echoes "000000"
 normalize_version()
 {
@@ -1276,9 +1518,9 @@ normalize_version()
     local minor=0
     local patch=0
 
-    # Only parses purely numeric version numbers, 1.2.3 
+    # Only parses purely numeric version numbers, 1.2.3
     # Everything after the first three values are ignored
-    if [[ $1 =~ ^([0-9]+)\.([0-9]+)\.?([0-9]*)([\.0-9])*$ ]]; then
+    if [[ $1 =~ ^([0-9]+)\.([0-9]+)\.?([0-9]*)([^ ])* ]]; then
         major=${BASH_REMATCH[1]}
         minor=${BASH_REMATCH[2]}
         patch=${BASH_REMATCH[3]}
@@ -1405,8 +1647,13 @@ fi
 #
 # 2.4.12: XB fixed bugs like keyring is empty + move-back stage now uses params from
 #         my.cnf.
+#
+# 2.4.17  PXB added Data-At-Rest Encryption support found in PS/PXC 5.7.28
+#
+# 2.4.20  Transition-key fixes
+#
 
-XB_REQUIRED_VERSION="2.4.12"
+XB_REQUIRED_VERSION="2.4.29"
 
 XB_VERSION=`$INNOBACKUPEX_BIN --version 2>&1 | grep -oe '[0-9]\.[0-9][\.0-9]*' | head -n1`
 if [[ -z $XB_VERSION ]]; then
@@ -1499,7 +1746,7 @@ if [[ "$pxc_encrypt_cluster_traffic" == "on" ]]; then
     wsrep_log_debug "with encrypt=4  ssl_ca=$ssl_ca  ssl_cert=$ssl_cert  ssl_key=$ssl_key"
 fi
 
-if ${INNOBACKUPEX_BIN} /tmp --help 2>/dev/null | grep -q -- '--version-check'; then
+if ${INNOBACKUPEX_BIN} --help 2>/dev/null | grep -q -- '--version-check'; then
     disver="--no-version-check"
 fi
 
@@ -1561,6 +1808,7 @@ fi
 # Setup stream for transfering and streaming.
 get_stream
 get_transfer
+get_keys
 
 if [ "$WSREP_SST_OPT_ROLE" = "donor" ]
 then
@@ -1598,11 +1846,24 @@ then
     # append transition_key only if keyring is being used.
     if [[ $keyring_plugin -eq 1 ]]; then
         echo "transition-key=$transition_key" >> "$sst_info_file_path"
-        encrypt_backup_options="--transition-key=\$transition_key"
+        encrypt_backup_options="--transition-key=$transition_key"
     fi
 
-    #
-    # SST is not needed. IST would suffice. By-pass SST.
+    # Save the transfer command (will be restored later)
+    ttcmd="$tcmd"
+
+    # Add compression to the head of the stream (if specified)
+    if [[ -n "$scomp" ]]; then
+        tcmd=" $scomp | $tcmd "
+    fi
+    # Add encryption to the head of the stream (if specified)
+    if [[ $encrypt -eq 1 && -n "$ecmd_other" ]]; then
+        tcmd=" \$ecmd_other | $tcmd "
+    fi
+    if [[ $encrypt -eq 1 ]]; then
+        xbstream_eopts=$xbstream_eopts_other
+    fi
+
     if [ $WSREP_SST_OPT_BYPASS -eq 0 ]
     then
         usrst=0
@@ -1629,22 +1890,7 @@ then
            INNOEXTRA+=" --password="
         fi
 
-        get_keys
         check_extra
-
-        ttcmd="$tcmd"
-
-        # Add compression to the head of the stream (if specified)
-        if [[ -n "$scomp" ]]; then
-            tcmd=" $scomp | $tcmd "
-        fi
-        # Add encryption to the head of the stream (if specified)
-        if [[ $encrypt -eq 1 && -n "$ecmd_other" ]]; then
-            tcmd=" \$ecmd_other | $tcmd "
-        fi
-        if [[ $encrypt -eq 1 ]]; then
-            xbstreameopts=$xbstreameopts_other
-        fi
 
         # Before the real SST,send the sst-info
         wsrep_log_debug "Streaming SST meta-info file before SST"
@@ -1677,11 +1923,18 @@ then
             tcmd=" \$ecmd | $tcmd "
         fi
         if [[ $encrypt -eq 1 ]]; then
-            xbstreameopts=$xbstreameopts_sst
+            xbstream_eopts=$xbstream_eopts_sst
         fi
 
         set +e
-        timeit "${stagemsg}-SST" "$INNOBACKUP | $tcmd; RC=( "\${PIPESTATUS[@]}" )"
+        # With wsrep_sst_donor_skip we never send the backup
+        if [ "$WSREP_SST_OPT_DEBUG" = "wsrep_sst_donor_skip" ]
+        then
+          RC=0
+        else
+          timeit "${stagemsg}-SST" "$INNOBACKUP | $tcmd; RC=( "\${PIPESTATUS[@]}" )"
+        fi
+
         set -e
 
         if [ ${RC[0]} -ne 0 ]; then
@@ -1705,18 +1958,6 @@ then
         wsrep_log_info "Bypassing SST. Can work it through IST"
         echo "continue" # now server can resume updating data
         echo "1" > "${donor_tmpdir}/${IST_FILE}"
-        get_keys
-        # Add compression to the head of the stream (if specified)
-        if [[ -n "$scomp" ]]; then
-            tcmd=" $scomp | $tcmd "
-        fi
-        # Add encryption to the head of the stream (if specified)
-        if [[ $encrypt -eq 1 && -n "$ecmd_other" ]]; then
-            tcmd=" \$ecmd_other | $tcmd "
-        fi
-        if [[ $encrypt -eq 1 ]]; then
-            xbstreameopts=$xbstreameopts_other
-        fi
 
         strmcmd+=" \${IST_FILE}"
 
@@ -1763,7 +2004,6 @@ then
         tcmd+=" | $pcmd"
     fi
 
-    get_keys
     if [[ $encrypt -eq 1 && -n "$ecmd_other" ]]; then
         strmcmd=" \$ecmd_other | $strmcmd"
     fi
@@ -1771,7 +2011,7 @@ then
         strmcmd=" $sdecomp | $strmcmd"
     fi
     if [[ $encrypt -eq 1 ]]; then
-        xbstreameopts=$xbstreameopts_other
+        xbstream_eopts=$xbstream_eopts_other
     fi
 
     initialize_tmpdir
@@ -1795,9 +2035,18 @@ then
         DONOR_MYSQL_VERSION=$(parse_sst_info "$sst_file_info_path" sst mysql-version "")
 
         transition_key=$(parse_sst_info "$sst_file_info_path" sst transition-key "")
+
         if [[ -n $transition_key ]]; then
-            encrypt_prepare_options="--transition-key=\$transition_key"
-            encrypt_move_options="--transition-key=\$transition_key --generate-new-master-key"
+
+            # Use the broken key if the donor version is < 5.7.29 and is not 5.7.28-31-57.2
+            # In other words, 5.7.28-31-57.2 and above will use the key that was sent
+            if ! check_for_version "$DONOR_MYSQL_VERSION" "5.7.29" &&
+               [[ $DONOR_MYSQL_VERSION != "5.7.28-31-57.2" ]]; then
+                transition_key="\$transition_key"
+            fi
+
+            encrypt_prepare_options="--transition-key=$transition_key"
+            encrypt_move_options="--transition-key=$transition_key --generate-new-master-key"
         fi
     elif [[ -r "${STATDIR}/${XB_GTID_INFO_FILE}" ]]; then
         #
@@ -1841,7 +2090,7 @@ then
                 wsrep_log_warning "This node's PXC version is $local_version_str. The donor's PXC version is $donor_version_str."
                 wsrep_log_warning "Run mysql_upgrade in non-cluster (standalone mode) to upgrade."
                 wsrep_log_warning "Check the upgrade process here:"
-                wsrep_log_warning "    https://www.percona.com/doc/percona-xtradb-cluster/LATEST/howtos/upgrade_guide.html"
+                wsrep_log_warning "    https://www.percona.com/doc/percona-xtradb-cluster/5.7/howtos/upgrade_guide.html"
             fi
         fi
 
@@ -1874,7 +2123,10 @@ then
                      fi
 
                      XB_DONOR_KEYRING_FILE_PATH="${KEYRING_FILE_DIR}/${XB_DONOR_KEYRING_FILE}"
-                     recv_data_from_donor_to_joiner "${KEYRING_FILE_DIR}" "${stagemsg}-keyring" 0 2
+                     recv_data_from_donor_to_joiner "${KEYRING_FILE_DIR}" "${stagemsg}-keyring" 0 2 &
+                     jpid=$!
+                     monitor_sst_progress "${KEYRING_FILE_DIR}" $jpid ${WSREP_SST_IDLE_TIMEOUT} &
+                     wait $jpid
                      keyringapplyopt=" --keyring-file-data=$XB_DONOR_KEYRING_FILE_PATH "
                      wsrep_log_info "donor keyring received at: '${XB_DONOR_KEYRING_FILE_PATH}'"
                  else
@@ -1927,7 +2179,7 @@ then
             strmcmd=" $sdecomp | $strmcmd"
         fi
         if [[ $encrypt -eq 1 ]]; then
-            xbstreameopts=$xbstreameopts_sst
+            xbstream_eopts=$xbstream_eopts_sst
         fi
 
         # For compatibility, if the tmpdir is not specified, then use
@@ -1952,6 +2204,12 @@ then
         # with ever increasing number of files and achieve nothing.
         find $ib_home_dir $ib_log_dir $ib_undo_dir $DATA -mindepth 1  -regex $cpat  -prune  -o -exec rm -rfv {} 1>/dev/null \+
 
+        if [[ -r "$keyring_file_data" ]] || [[ -r "${keyring_file_data}.backup" ]];
+        then
+          wsrep_log_info "Cleaning the existing keyring file"
+          rm -f "$keyring_file_data" "${keyring_file_data}.backup"
+        fi
+
         # Clean the binlog dir (if it's explicitly specified)
         # By default it'll be in the datadir
         tempdir=$(parse_cnf mysqld log-bin "")
@@ -1971,6 +2229,7 @@ then
 
         XB_GTID_INFO_FILE_PATH="${DATA}/${XB_GTID_INFO_FILE}"
         wsrep_log_info "............Waiting for SST streaming to complete!"
+        monitor_sst_progress "${JOINER_SST_DIR}" $jpid ${WSREP_SST_IDLE_TIMEOUT} &
         wait $jpid
 
         get_proc

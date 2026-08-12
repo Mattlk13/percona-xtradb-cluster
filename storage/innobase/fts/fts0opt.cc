@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 2007, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2007, 2024, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -64,7 +72,7 @@ static os_event_t fts_opt_shutdown_event = NULL;
 static const ulint FTS_WORD_NODES_INIT_SIZE = 64;
 
 /** Last time we did check whether system need a sync */
-static ib_time_t	last_check_sync_time;
+static ib_time_monotonic_t	last_check_sync_time;
 
 /** State of a table within the optimization sub system. */
 enum fts_state_t {
@@ -195,12 +203,12 @@ struct fts_slot_t {
 	ulint		deleted;	/*!< Number of doc ids deleted since the
 					last time this table was optimized */
 
-	ib_time_t	last_run;	/*!< Time last run completed */
+	ib_time_monotonic_t	last_run;  /*!< Time last run completed */
 
-	ib_time_t	completed;	/*!< Optimize finish time */
+	ib_time_monotonic_t	completed; /*!< Optimize finish time */
 
-	ib_time_t	interval_time;	/*!< Minimum time to wait before
-					optimizing the table again. */
+	ib_time_t	interval_time;	   /*!< Minimum time to wait before
+					   optimizing the table again. */
 };
 
 /** A table remove message for the FTS optimize thread. */
@@ -482,7 +490,8 @@ fts_index_fetch_nodes(
 	fts_table_t*	fts_table,	/*!< in: table of the FTS INDEX */
 	const fts_string_t*
 			word,		/*!< in: the word to fetch */
-	fts_fetch_t*	fetch)		/*!< in: fetch callback.*/
+	fts_fetch_t*	fetch,		/*!< in: fetch callback.*/
+	bool		exact_match)	/*!< in: exact match.*/
 {
 	pars_info_t*	info;
 	dberr_t		error;
@@ -517,23 +526,26 @@ fts_index_fetch_nodes(
 		*graph = fts_parse_sql(
 			fts_table,
 			info,
-			"DECLARE FUNCTION my_func;\n"
-			"DECLARE CURSOR c IS"
-			" SELECT word, doc_count, first_doc_id, last_doc_id,"
-			" ilist\n"
-			" FROM $table_name\n"
-			" WHERE word LIKE :word\n"
-			" ORDER BY first_doc_id;\n"
-			"BEGIN\n"
-			"\n"
-			"OPEN c;\n"
-			"WHILE 1 = 1 LOOP\n"
-			"  FETCH c INTO my_func();\n"
-			"  IF c % NOTFOUND THEN\n"
-			"    EXIT;\n"
-			"  END IF;\n"
-			"END LOOP;\n"
-			"CLOSE c;");
+			mem_heap_printf(
+				info->heap,
+				"DECLARE FUNCTION my_func;\n"
+				"DECLARE CURSOR c IS"
+				" SELECT word, doc_count, first_doc_id,"
+				" last_doc_id, ilist\n"
+				" FROM $table_name\n"
+				" WHERE word %s :word\n"
+				" ORDER BY first_doc_id;\n"
+				"BEGIN\n"
+				"\n"
+				"OPEN c;\n"
+				"WHILE 1 = 1 LOOP\n"
+				"  FETCH c INTO my_func();\n"
+				"  IF c %% NOTFOUND THEN\n"
+				"    EXIT;\n"
+				"  END IF;\n"
+				"END LOOP;\n"
+				"CLOSE c;",
+				(exact_match ? "=" : "LIKE")));
 	}
 
 	for (;;) {
@@ -564,26 +576,20 @@ fts_index_fetch_nodes(
 }
 
 /**********************************************************************//**
-Read a word */
+Extract a given number of bytes into a buffer */
 static
-byte*
-fts_zip_read_word(
+bool
+fts_zip_extract_bytes(
 /*==============*/
 	fts_zip_t*	zip,		/*!< in: Zip state + data */
-	fts_string_t*	word)		/*!< out: uncompressed word */
+	byte *buf,				/*!< out: buffer to be filled */
+	unsigned int size) 		/*!< in: size of buffer */
 {
-	short		len = 0;
+	bool complete = false;
+	zip->zp->next_out = buf;
+	zip->zp->avail_out = size;
 	void*		null = NULL;
-	byte*		ptr = word->f_str;
 	int		flush = Z_NO_FLUSH;
-
-	/* Either there was an error or we are at the Z_STREAM_END. */
-	if (zip->status != Z_OK) {
-		return(NULL);
-	}
-
-	zip->zp->next_out = reinterpret_cast<byte*>(&len);
-	zip->zp->avail_out = sizeof(len);
 
 	while (zip->status == Z_OK && zip->zp->avail_out > 0) {
 
@@ -623,22 +629,26 @@ fts_zip_read_word(
 
 		switch (zip->status = inflate(zip->zp, flush)) {
 		case Z_OK:
-			if (zip->zp->avail_out == 0 && len > 0) {
-
-				ut_a(len <= FTS_MAX_WORD_LEN);
-				ptr[len] = 0;
-
-				zip->zp->next_out = ptr;
-				zip->zp->avail_out = len;
-
-				word->f_len = len;
-				len = 0;
+			if (zip->zp->avail_out == 0) {
+				complete = true;
 			}
 			break;
 
-		case Z_BUF_ERROR:	/* No progress possible. */
 		case Z_STREAM_END:
+			if (zip->zp->avail_out == 0) {
+				complete = true;
+			}
+
+			/* Fallthrough */
+		case Z_BUF_ERROR:	/* No progress possible. */
 			inflateEnd(zip->zp);
+			/* All blocks must be freed at end of inflate. */
+			for (ulint i = 0; i < ib_vector_size(zip->blocks); ++i) {
+				if (ib_vector_getp(zip->blocks, i)) {
+					ut_free(ib_vector_getp(zip->blocks, i));
+					ib_vector_set(zip->blocks, i, &null);
+				}
+			}
 			break;
 
 		case Z_STREAM_ERROR:
@@ -647,21 +657,42 @@ fts_zip_read_word(
 		}
 	}
 
-	/* All blocks must be freed at end of inflate. */
+	return complete;
+}
+
+/**********************************************************************//**
+Read a word */
+static
+bool
+fts_zip_read_word(
+/*==============*/
+	fts_zip_t*	zip,			/*!< in: Zip state + data */
+	fts_string_t*	word)		/*!< out: uncompressed word */
+{
+	/* Either there was an error or we are at the Z_STREAM_END. */
 	if (zip->status != Z_OK) {
-		for (ulint i = 0; i < ib_vector_size(zip->blocks); ++i) {
-			if (ib_vector_getp(zip->blocks, i)) {
-				ut_free(ib_vector_getp(zip->blocks, i));
-				ib_vector_set(zip->blocks, i, &null);
-			}
-		}
+		return false;
 	}
 
-	if (ptr != NULL) {
-		ut_ad(word->f_len == strlen((char*) ptr));
+	ushort len = 0;
+
+	const bool have_len =
+		fts_zip_extract_bytes(zip, reinterpret_cast<byte *>(&len), sizeof(len));
+
+	if (!have_len) {
+		return false;
 	}
 
-	return(zip->status == Z_OK || zip->status == Z_STREAM_END ? ptr : NULL);
+	ut_a(len <= FTS_MAX_WORD_LEN);
+
+	word->f_len = len;
+	const bool have_word = fts_zip_extract_bytes(zip, word->f_str, len);
+	ut_ad(have_word);
+
+	word->f_str[len] = 0;
+	ut_ad(word->f_len == strlen((char *)word->f_str));
+
+	return have_word;
 }
 
 /**********************************************************************//**
@@ -679,7 +710,7 @@ fts_fetch_index_words(
 	fts_zip_t*	zip = static_cast<fts_zip_t*>(user_arg);
 	que_node_t*	exp = sel_node->select_list;
 	dfield_t*	dfield = que_node_get_val(exp);
-	short		len =  static_cast<short>(dfield_get_len(dfield));
+	ushort		len =  static_cast<ushort>(dfield_get_len(dfield));
 	void*		data = dfield_get_data(dfield);
 
 	/* Skip the duplicate words. */
@@ -1019,7 +1050,7 @@ fts_table_fetch_doc_ids(
 	if (error == DB_SUCCESS) {
 		fts_sql_commit(trx);
 
-		ib_vector_sort(doc_ids->doc_ids, fts_update_doc_id_cmp);
+		ib_vector_sort(doc_ids->doc_ids, fts_doc_id_field_cmp<fts_update_t>);
 	} else {
 		fts_sql_rollback(trx);
 	}
@@ -1144,7 +1175,7 @@ fts_optimize_encode_node(
 	/* Calculate the space required to store the ilist. */
 	ut_ad(doc_id > node->last_doc_id);
 	doc_id_delta = doc_id - node->last_doc_id;
-	enc_len = fts_get_encoded_len(static_cast<ulint>(doc_id_delta));
+	enc_len = fts_get_encoded_len(doc_id_delta);
 
 	/* Calculate the size of the encoded pos array. */
 	while (*src) {
@@ -1188,9 +1219,8 @@ fts_optimize_encode_node(
 	src = enc->src_ilist_ptr;
 	dst = node->ilist + node->ilist_size;
 
-	/* Encode the doc id. Cast to ulint, the delta should be small and
-	therefore no loss of precision. */
-	dst += fts_encode_int((ulint) doc_id_delta, dst);
+	/* Encode the doc id. */
+	dst += fts_encode_int(doc_id_delta, dst);
 
 	/* Copy the encoded pos array. */
 	memcpy(dst, src, pos_enc_len);
@@ -1234,10 +1264,9 @@ fts_optimize_node(
 	while (copied < src_node->ilist_size
 	       && dst_node->ilist_size < FTS_ILIST_MAX_SIZE) {
 
-		doc_id_t	delta;
 		doc_id_t	del_doc_id = FTS_NULL_DOC_ID;
 
-		delta = fts_decode_vlc(&enc->src_ilist_ptr);
+		doc_id_t delta = fts_decode_vlc(&enc->src_ilist_ptr);
 
 test_again:
 		/* Check whether the doc id is in the delete list, if
@@ -1544,9 +1573,10 @@ static MY_ATTRIBUTE((nonnull, warn_unused_result))
 dberr_t
 fts_optimize_compact(
 /*=================*/
-	fts_optimize_t*	optim,		/*!< in: optimize state data */
-	dict_index_t*	index,		/*!< in: current FTS being optimized */
-	ib_time_t	start_time)	/*!< in: optimize start time */
+	fts_optimize_t*	optim,		     /*!< in: optimize state data */
+	dict_index_t*	index,		     /*!< in: current FTS being
+					      optimized */
+	ib_time_monotonic_t	start_time)  /*!< in: optimize start time */
 {
 	ulint		i;
 	dberr_t		error = DB_SUCCESS;
@@ -1580,7 +1610,8 @@ fts_optimize_compact(
 		fts_word_free(word);
 
 		if (fts_optimize_time_limit > 0
-		    && (ut_time() - start_time) > fts_optimize_time_limit) {
+		    && (ut_time_monotonic() - start_time) >
+		        fts_optimize_time_limit) {
 
 			optim->done = TRUE;
 		}
@@ -1778,7 +1809,7 @@ fts_optimize_words(
 	fts_string_t*	word)	/*!< in: the starting word to optimize */
 {
 	fts_fetch_t	fetch;
-	ib_time_t	start_time;
+	ib_time_monotonic_t	start_time;
 	que_t*		graph = NULL;
 	CHARSET_INFO*	charset = optim->fts_index_table.charset;
 
@@ -1788,7 +1819,7 @@ fts_optimize_words(
 	fts_optimize_time_limit = fts_optimize_get_time_limit(
 		optim->trx, &optim->fts_common_table);
 
-	start_time = ut_time();
+	start_time = ut_time_monotonic();
 
 	/* Setup the callback to use for fetching the word ilist etc. */
 	fetch.read_arg = optim->words;
@@ -1809,7 +1840,7 @@ fts_optimize_words(
 		fetch.total_memory = 0;
 		error = fts_index_fetch_nodes(
 			trx, &graph, &optim->fts_index_table, word,
-			&fetch);
+			&fetch, true);
 		ut_ad(fetch.total_memory < fts_result_cache_limit);
 
 		if (error == DB_SUCCESS) {
@@ -2402,7 +2433,7 @@ fts_optimize_table_bk(
 
 	/* Avoid optimizing tables that were optimized recently. */
 	if (slot->last_run > 0
-	    && (ut_time() - slot->last_run) < slot->interval_time) {
+	    && (ut_time_monotonic() - slot->last_run) < slot->interval_time) {
 
 		return(DB_SUCCESS);
 
@@ -2414,14 +2445,14 @@ fts_optimize_table_bk(
 		if (error == DB_SUCCESS) {
 			slot->state = FTS_STATE_DONE;
 			slot->last_run = 0;
-			slot->completed = ut_time();
+			slot->completed = ut_time_monotonic();
 		}
 	} else {
 		error = DB_SUCCESS;
 	}
 
 	/* Note time this run completed. */
-	slot->last_run = ut_time();
+	slot->last_run = ut_time_monotonic();
 
 	return(error);
 }
@@ -2634,6 +2665,9 @@ fts_optimize_request_sync_table(
 	msg->ptr = table_id;
 
 	ib_wqueue_add(fts_optimize_wq, msg, msg->heap);
+	DBUG_EXECUTE_IF("fts_optimize_wq_count_check",
+	    if (ib_wqueue_get_count(fts_optimize_wq) > 1000) {
+	    DBUG_SUICIDE(); });
 }
 
 /**********************************************************************//**
@@ -2733,11 +2767,11 @@ fts_optimize_how_many(
 						vector*/
 {
 	ulint		i;
-	ib_time_t	delta;
+	ib_time_monotonic_t	delta;
 	ulint		n_tables = 0;
-	ib_time_t	current_time;
+	ib_time_monotonic_t	current_time;
 
-	current_time = ut_time();
+	current_time = ut_time_monotonic();
 
 	for (i = 0; i < ib_vector_size(tables); ++i) {
 		const fts_slot_t*	slot;
@@ -2791,13 +2825,13 @@ fts_is_sync_needed(
 						vector*/
 {
 	ulint	total_memory = 0;
-	double	time_diff = difftime(ut_time(), last_check_sync_time);
+	uint64_t time_diff = ut_time_monotonic() - last_check_sync_time;
 
 	if (fts_need_sync || time_diff < 5) {
 		return(false);
 	}
 
-	last_check_sync_time = ut_time();
+	last_check_sync_time = ut_time_monotonic();
 
 	for (ulint i = 0; i < ib_vector_size(tables); ++i) {
 		const fts_slot_t*	slot;
@@ -3039,7 +3073,7 @@ fts_optimize_init(void)
 	table_vector.clear();
 
 	fts_opt_shutdown_event = os_event_create(0);
-	last_check_sync_time = ut_time();
+	last_check_sync_time = ut_time_monotonic();
 
 	os_thread_create(fts_optimize_thread, fts_optimize_wq, NULL);
 }

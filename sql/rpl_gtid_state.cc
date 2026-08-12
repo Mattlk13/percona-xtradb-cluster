@@ -1,14 +1,20 @@
-/* Copyright (c) 2011, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2011, 2023, Oracle and/or its affiliates.
 
-   This program is free software; you can redistribute it and/or
-   modify it under the terms of the GNU General Public License as
-   published by the Free Software Foundation; version 2 of the
-   License.
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
 
-   This program is distributed in the hope that it will be useful, but
-   WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-   General Public License for more details.
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -21,6 +27,12 @@
 #include "sql_class.h"             // THD
 #include "debug_sync.h"            // DEBUG_SYNC
 #include "binlog.h"
+
+#ifdef WITH_WSREP
+#include "rpl_group_replication.h" // is_group_replication_plugin_loaded()
+#endif /* WITH_WSREP */
+
+#include <vector>
 
 PSI_memory_key key_memory_Gtid_state_group_commit_sidno;
 
@@ -55,9 +67,9 @@ enum_return_status Gtid_state::acquire_ownership(THD *thd, const Gtid &gtid)
   // caller must take both global_sid_lock and lock on the SIDNO.
   global_sid_lock->assert_some_lock();
   gtid_state->assert_sidno_lock_owner(gtid.sidno);
-  DBUG_ASSERT(!executed_gtids.contains_gtid(gtid));
+  assert(!executed_gtids.contains_gtid(gtid));
   DBUG_PRINT("info", ("gtid=%d:%lld", gtid.sidno, gtid.gno));
-  DBUG_ASSERT(thd->owned_gtid.sidno == 0);
+  assert(thd->owned_gtid.sidno == 0);
   if (owned_gtids.add_gtid_owner(gtid, thd->thread_id()) != RETURN_STATUS_OK)
     goto err;
   if (thd->get_gtid_next_list() != NULL)
@@ -67,7 +79,7 @@ enum_return_status Gtid_state::acquire_ownership(THD *thd, const Gtid &gtid)
     thd->owned_gtid.sidno= THD::OWNED_SIDNO_GTID_SET;
     thd->owned_sid.clear();
 #else
-    DBUG_ASSERT(0);
+    assert(0);
 #endif
   }
   else
@@ -89,7 +101,7 @@ err:
       g= git.get();
     }
 #else
-    DBUG_ASSERT(0);
+    assert(0);
 #endif
   }
   thd->clear_owned_gtids();
@@ -116,7 +128,7 @@ void Gtid_state::unlock_owned_sidnos(const THD *thd)
 #ifdef HAVE_GTID_NEXT_LIST
     unlock_sidnos(&thd->owned_gtid_set);
 #else
-    DBUG_ASSERT(0);
+    assert(0);
 #endif
   }
   else if (thd->owned_gtid.sidno > 0)
@@ -133,7 +145,7 @@ void Gtid_state::broadcast_owned_sidnos(const THD *thd)
 #ifdef HAVE_GTID_NEXT_LIST
     broadcast_sidnos(&thd->owned_gtid_set);
 #else
-    DBUG_ASSERT(0);
+    assert(0);
 #endif
   }
   else if (thd->owned_gtid.sidno > 0)
@@ -142,6 +154,16 @@ void Gtid_state::broadcast_owned_sidnos(const THD *thd)
   }
 }
 
+void Gtid_state::get_snapshot_gtid_executed(
+    std::string &snapshot_gtid_executed)
+{
+  global_sid_lock->wrlock();
+  size_t size= executed_gtids.get_string_length() + 1;
+  std::vector<char> buf(size);
+  executed_gtids.to_string(buf.data());
+  snapshot_gtid_executed= buf.data();
+  global_sid_lock->unlock();
+}
 
 void Gtid_state::update_commit_group(THD *first_thd)
 {
@@ -270,7 +292,7 @@ void Gtid_state::end_gtid_violating_transaction(THD *thd)
       end_automatic_gtid_violating_transaction();
     else
     {
-      DBUG_ASSERT(thd->variables.gtid_next.type == ANONYMOUS_GROUP);
+      assert(thd->variables.gtid_next.type == ANONYMOUS_GROUP);
       end_anonymous_gtid_violating_transaction();
     }
     thd->has_gtid_consistency_violation= false;
@@ -289,8 +311,7 @@ bool Gtid_state::wait_for_sidno(THD *thd, rpl_sidno sidno,
   sid_locks.enter_cond(thd, sidno,
                        &stage_waiting_for_gtid_to_be_committed,
                        &old_stage);
-  bool ret= (thd->killed != THD::NOT_KILLED ||
-             sid_locks.wait(thd, sidno, abstime));
+  bool ret= sid_locks.wait(thd, sidno, abstime);
   // Can't call sid_locks.unlock() as that requires global_sid_lock.
   mysql_mutex_unlock(thd->current_mutex);
   thd->EXIT_COND(&old_stage);
@@ -305,8 +326,8 @@ bool Gtid_state::wait_for_gtid(THD *thd, const Gtid &gtid,
   DBUG_PRINT("info", ("SIDNO=%d GNO=%lld thread_id=%u",
                       gtid.sidno, gtid.gno,
                       thd->thread_id()));
-  DBUG_ASSERT(!owned_gtids.is_owned_by(gtid, thd->thread_id()));
-  DBUG_ASSERT(!owned_gtids.is_owned_by(gtid, 0));
+  assert(!owned_gtids.is_owned_by(gtid, thd->thread_id()));
+  assert(!owned_gtids.is_owned_by(gtid, 0));
 
   bool ret= wait_for_sidno(thd, gtid.sidno, abstime);
   DBUG_RETURN(ret);
@@ -324,7 +345,7 @@ bool Gtid_state::wait_for_gtid_set(THD *thd, Gtid_set* wait_for,
 
   global_sid_lock->assert_some_rdlock();
 
-  DBUG_ASSERT(wait_for->get_sid_map() == global_sid_map);
+  assert(wait_for->get_sid_map() == global_sid_map);
 
   if (timeout > 0) {
     set_timespec_nsec(&abstime,
@@ -466,7 +487,7 @@ rpl_gno Gtid_state::get_automatic_gno(rpl_sidno sidno) const
   while (true)
   {
     const Gtid_set::Interval *iv= ivit.get();
-    rpl_gno next_interval_start= iv != NULL ? iv->start : MAX_GNO;
+    rpl_gno next_interval_start= iv != NULL ? iv->start : GNO_END;
     while (next_candidate.gno < next_interval_start &&
            DBUG_EVALUATE_IF("simulate_gno_exhausted", false, true))
     {
@@ -481,7 +502,7 @@ rpl_gno Gtid_state::get_automatic_gno(rpl_sidno sidno) const
       my_error(ER_GNO_EXHAUSTED, MYF(0));
       DBUG_RETURN(-1);
     }
-    if (next_candidate.gno <= iv->end)
+    if (next_candidate.gno < iv->end)
       next_candidate.gno= iv->end;
     ivit.next();
   }
@@ -509,10 +530,10 @@ enum_return_status Gtid_state::generate_automatic_gtid(THD *thd,
   DBUG_ENTER("Gtid_state::generate_automatic_gtid");
   enum_return_status ret= RETURN_STATUS_OK;
 
-  DBUG_ASSERT(thd->variables.gtid_next.type == AUTOMATIC_GROUP);
-  DBUG_ASSERT(specified_sidno >= 0);
-  DBUG_ASSERT(specified_gno >= 0);
-  DBUG_ASSERT(thd->owned_gtid.is_empty());
+  assert(thd->variables.gtid_next.type == AUTOMATIC_GROUP);
+  assert(specified_sidno >= 0);
+  assert(specified_gno >= 0);
+  assert(thd->owned_gtid.is_empty());
 
   bool locked_sidno_was_passed_null = (locked_sidno == NULL);
 
@@ -522,18 +543,36 @@ enum_return_status Gtid_state::generate_automatic_gtid(THD *thd,
     /* The caller must lock the sid_lock when locked_sidno is passed */
     sid_lock->assert_some_lock();
 
+#ifdef WITH_WSREP
+    bool skip_gtid = false;
+    /* If binlog is disabled permanently we don't get here.
+    If it is disabled only in a particular session, we need to
+    do PXC replication, however we will not binlog it.
+    So we need to skip GTID generation for this transaction.
+    Just pretend for a while that gtid_mode=OFF */
+    if (!(thd->variables.option_bits & OPTION_BIN_LOG) &&
+        !(thd->variables.option_bits & OPTION_BIN_LOG_INTERNAL_OFF))
+        {
+          skip_gtid = true;
+        }
+  // If GTID_MODE = ON_PERMISSIVE or ON, generate a new GTID
+  if (!skip_gtid && get_gtid_mode(GTID_MODE_LOCK_SID) >= GTID_MODE_ON_PERMISSIVE)
+#else
   // If GTID_MODE = ON_PERMISSIVE or ON, generate a new GTID
   if (get_gtid_mode(GTID_MODE_LOCK_SID) >= GTID_MODE_ON_PERMISSIVE)
+#endif
   {
     Gtid automatic_gtid= { specified_sidno, specified_gno };
 
 #ifdef WITH_WSREP
-    /* If the trx has been executed in wsrep then get wsrep_sidno
-    and not the normal server_sid no. */
-    if (WSREP(thd) && thd->wsrep_trx_meta.gtid.seqno != -1 &&
+    /* If the trx has been executed in wsrep then get wsrep_sidno and not the
+     * normal server_sidno. Retain the same sidno if group_replication is
+     * loaded on to the server */
+    if (!is_group_replication_plugin_loaded() && WSREP(thd) &&
+        thd->wsrep_trx_meta.gtid.seqno != -1 &&
         !thd->wsrep_skip_wsrep_GTID)
       automatic_gtid.sidno= wsrep_sidno;
-    else
+    else if (automatic_gtid.sidno == 0)
       automatic_gtid.sidno= get_server_sidno();
 #else
     if (automatic_gtid.sidno == 0)
@@ -586,7 +625,11 @@ enum_return_status Gtid_state::generate_automatic_gtid(THD *thd,
     // using an anonymous transaction.
     thd->owned_gtid.sidno= THD::OWNED_SIDNO_ANONYMOUS;
     thd->owned_gtid.gno= 0;
+#ifdef WITH_WSREP
+    acquire_anonymous_ownership(thd);
+#else
     acquire_anonymous_ownership();
+#endif
     thd->owned_gtid.dbug_print(NULL,
                                "set owned_gtid (anonymous) in generate_automatic_gtid");
   }
@@ -603,7 +646,7 @@ enum_return_status Gtid_state::generate_automatic_gtid(THD *thd,
 
 void Gtid_state::lock_sidnos(const Gtid_set *gs)
 {
-  DBUG_ASSERT(gs);
+  assert(gs);
   rpl_sidno max_sidno= gs->get_max_sidno();
   for (rpl_sidno sidno= 1; sidno <= max_sidno; sidno++)
     if (gs->contains_sidno(sidno))
@@ -613,7 +656,7 @@ void Gtid_state::lock_sidnos(const Gtid_set *gs)
 
 void Gtid_state::unlock_sidnos(const Gtid_set *gs)
 {
-  DBUG_ASSERT(gs);
+  assert(gs);
   rpl_sidno max_sidno= gs->get_max_sidno();
   for (rpl_sidno sidno= 1; sidno <= max_sidno; sidno++)
     if (gs->contains_sidno(sidno))
@@ -623,7 +666,7 @@ void Gtid_state::unlock_sidnos(const Gtid_set *gs)
 
 void Gtid_state::broadcast_sidnos(const Gtid_set *gs)
 {
-  DBUG_ASSERT(gs);
+  assert(gs);
   rpl_sidno max_sidno= gs->get_max_sidno();
   for (rpl_sidno sidno= 1; sidno <= max_sidno; sidno++)
     if (gs->contains_sidno(sidno))
@@ -649,13 +692,13 @@ enum_return_status Gtid_state::ensure_sidno()
     PROPAGATE_REPORTED_ERROR(sid_locks.ensure_index(sidno));
     PROPAGATE_REPORTED_ERROR(ensure_commit_group_sidnos(sidno));
     sidno= sid_map->get_max_sidno();
-    DBUG_ASSERT(executed_gtids.get_max_sidno() >= sidno);
-    DBUG_ASSERT(gtids_only_in_table.get_max_sidno() >= sidno);
-    DBUG_ASSERT(previous_gtids_logged.get_max_sidno() >= sidno);
-    DBUG_ASSERT(lost_gtids.get_max_sidno() >= sidno);
-    DBUG_ASSERT(owned_gtids.get_max_sidno() >= sidno);
-    DBUG_ASSERT(sid_locks.get_max_index() >= sidno);
-    DBUG_ASSERT(commit_group_sidnos.size() >= (unsigned int)sidno);
+    assert(executed_gtids.get_max_sidno() >= sidno);
+    assert(gtids_only_in_table.get_max_sidno() >= sidno);
+    assert(previous_gtids_logged.get_max_sidno() >= sidno);
+    assert(lost_gtids.get_max_sidno() >= sidno);
+    assert(owned_gtids.get_max_sidno() >= sidno);
+    assert(sid_locks.get_max_index() >= sidno);
+    assert(commit_group_sidnos.size() >= (unsigned int)sidno);
   }
   RETURN_OK;
 }
@@ -682,7 +725,7 @@ enum_return_status Gtid_state::add_lost_gtids(const Gtid_set *gtid_set)
                  MYF(0)));
     RETURN_REPORTED_ERROR;
   }
-  DBUG_ASSERT(lost_gtids.is_empty());
+  assert(lost_gtids.is_empty());
 
   if (save(gtid_set))
     RETURN_REPORTED_ERROR;
@@ -718,8 +761,8 @@ int Gtid_state::init()
 int Gtid_state::save(THD *thd)
 {
   DBUG_ENTER("Gtid_state::save(THD *thd)");
-  DBUG_ASSERT(gtid_table_persistor != NULL);
-  DBUG_ASSERT(thd->owned_gtid.sidno > 0);
+  assert(gtid_table_persistor != NULL);
+  assert(thd->owned_gtid.sidno > 0);
   int error= 0;
 
   int ret= gtid_table_persistor->save(thd, &thd->owned_gtid);
@@ -743,6 +786,7 @@ int Gtid_state::save(THD *thd)
 int Gtid_state::save(const Gtid_set *gtid_set)
 {
   DBUG_ENTER("Gtid_state::save(Gtid_set *gtid_set)");
+  DBUG_EXECUTE_IF("crash_before_gtid_persist", DBUG_SUICIDE(););
   int ret= gtid_table_persistor->save(gtid_set);
   DBUG_RETURN(ret);
 }
@@ -845,7 +889,7 @@ bool Gtid_state::update_gtids_impl_do_nothing(THD *thd)
 
 bool Gtid_state::update_gtids_impl_begin(THD *thd)
 {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   if (current_thd != thd)
     mysql_mutex_lock(&thd->LOCK_thd_query);
   DBUG_PRINT("info", ("query='%s' thd->is_commit_in_middle_of_statement=%d",
@@ -884,13 +928,13 @@ void Gtid_state::update_gtids_impl_own_gtid_set(THD *thd, bool is_commit)
                              "in update_gtids_impl");
   thd->clear_owned_gtids();
 #else
-  DBUG_ASSERT(0);
+  assert(0);
 #endif
 }
 
 void Gtid_state::update_gtids_impl_lock_sidno(rpl_sidno sidno)
 {
-  DBUG_ASSERT(sidno > 0);
+  assert(sidno > 0);
   DBUG_PRINT("info",("Locking sidno %d", sidno));
   lock_sidno(sidno);
 }
@@ -912,7 +956,7 @@ void Gtid_state::update_gtids_impl_lock_sidnos(THD *first_thd)
         if (owned_gtid_set.contains_sidno(i))
           commit_group_sidnos[i]= true;
 #else
-      DBUG_ASSERT(0);
+    assert(0);
 #endif
   }
 
@@ -929,12 +973,12 @@ void Gtid_state::update_gtids_impl_own_gtid(THD *thd, bool is_commit)
     In Group Replication the GTID may additionally be owned by another
     thread, and we won't remove that ownership (it will be rolled back later)
   */
-  DBUG_ASSERT(owned_gtids.is_owned_by(thd->owned_gtid, thd->thread_id()));
+  assert(owned_gtids.is_owned_by(thd->owned_gtid, thd->thread_id()));
   owned_gtids.remove_gtid(thd->owned_gtid, thd->thread_id());
 
   if (is_commit)
   {
-    DBUG_ASSERT(!executed_gtids.contains_gtid(thd->owned_gtid));
+    assert(!executed_gtids.contains_gtid(thd->owned_gtid));
     DBUG_EXECUTE_IF(
       "rpl_gtid_update_on_commit_simulate_out_of_memory",
       DBUG_SET("+d,rpl_gtid_get_free_interval_simulate_out_of_memory"););
@@ -969,7 +1013,7 @@ void Gtid_state::update_gtids_impl_own_gtid(THD *thd, bool is_commit)
   thd->clear_owned_gtids();
   if (thd->variables.gtid_next.type == GTID_GROUP)
   {
-    DBUG_ASSERT(!thd->is_commit_in_middle_of_statement);
+    assert(!thd->is_commit_in_middle_of_statement);
     thd->variables.gtid_next.set_undefined();
   }
   else
@@ -979,8 +1023,8 @@ void Gtid_state::update_gtids_impl_own_gtid(THD *thd, bool is_commit)
       gtid_pre_statement_checks skips the test for undefined,
       e.g. ROLLBACK.
     */
-    DBUG_ASSERT(thd->variables.gtid_next.type == AUTOMATIC_GROUP ||
-                thd->variables.gtid_next.type == UNDEFINED_GROUP);
+    assert(thd->variables.gtid_next.type == AUTOMATIC_GROUP ||
+           thd->variables.gtid_next.type == UNDEFINED_GROUP);
   }
 }
 
@@ -1004,8 +1048,8 @@ void Gtid_state::update_gtids_impl_broadcast_and_unlock_sidnos()
 void Gtid_state::update_gtids_impl_own_anonymous(THD* thd,
                                                  bool *more_trx)
 {
-  DBUG_ASSERT(thd->variables.gtid_next.type == ANONYMOUS_GROUP ||
-              thd->variables.gtid_next.type == AUTOMATIC_GROUP);
+  assert(thd->variables.gtid_next.type == ANONYMOUS_GROUP ||
+         thd->variables.gtid_next.type == AUTOMATIC_GROUP);
   /*
     If there is more in the transaction cache, set more_trx to indicate this.
 
@@ -1013,8 +1057,6 @@ void Gtid_state::update_gtids_impl_own_anonymous(THD* thd,
   */
   if (opt_bin_log)
   {
-    // Needed before is_binlog_cache_empty.
-    thd->binlog_setup_trx_data();
     if (!thd->is_binlog_cache_empty(true))
     {
       *more_trx= true;
@@ -1026,16 +1068,20 @@ void Gtid_state::update_gtids_impl_own_anonymous(THD* thd,
   if (!(*more_trx &&
         thd->variables.gtid_next.type == ANONYMOUS_GROUP))
   {
+#ifdef WITH_WSREP
+    release_anonymous_ownership(thd);
+#else
     release_anonymous_ownership();
+#endif
     thd->clear_owned_gtids();
   }
 }
 
 void Gtid_state::update_gtids_impl_own_nothing(THD *thd)
 {
-  DBUG_ASSERT(thd->commit_error != THD::CE_COMMIT_ERROR ||
-              thd->has_gtid_consistency_violation);
-  DBUG_ASSERT(thd->variables.gtid_next.type == AUTOMATIC_GROUP);
+  assert(thd->commit_error != THD::CE_COMMIT_ERROR ||
+         thd->has_gtid_consistency_violation);
+  assert(thd->variables.gtid_next.type == AUTOMATIC_GROUP);
 }
 
 void Gtid_state::update_gtids_impl_end(THD *thd, bool more_trx)
@@ -1063,3 +1109,50 @@ error:
   RETURN_REPORTED_ERROR;
 
 }
+
+#ifdef WITH_WSREP
+void Gtid_state::acquire_anonymous_ownership(THD *thd MY_ATTRIBUTE((unused)))
+{
+  DBUG_ENTER("Gtid_state::acquire_anonymous_ownership");
+  sid_lock->assert_some_lock();
+  /* We are allowed to get here only in two cases:
+  1. If this is WSREP-enabled thread
+      and binlog is disabled
+      and binlog is not disabled internally
+      This means that this is the session with sql_log_bin=OFF.
+  2. if gtid_mode != ON (the original condition) */
+  assert( (WSREP(thd) && !(thd->variables.option_bits & OPTION_BIN_LOG) &&
+          !(thd->variables.option_bits & OPTION_BIN_LOG_INTERNAL_OFF))
+          || (get_gtid_mode(GTID_MODE_LOCK_SID) != GTID_MODE_ON));
+#ifndef NDEBUG
+  int32 old_value=
+#endif
+    anonymous_gtid_count.atomic_add(1);
+  DBUG_PRINT("info", ("anonymous_gtid_count increased to %d", old_value + 1));
+  assert(old_value >= 0);
+  DBUG_VOID_RETURN;
+}
+
+/// Release anonymous ownership.
+void Gtid_state::release_anonymous_ownership(THD *thd MY_ATTRIBUTE((unused)))
+{
+  DBUG_ENTER("Gtid_state::release_anonymous_ownership");
+  sid_lock->assert_some_lock();
+  /* We are allowed to get here only in two cases:
+  1. If this is WSREP-enabled thread
+      and binlog is disabled
+      and binlog is not disabled internally
+      This means that this is the session with sql_log_bin=OFF.
+  2. if gtid_mode != ON (the original condition) */
+  assert( (WSREP(thd) && !(thd->variables.option_bits & OPTION_BIN_LOG) &&
+          !(thd->variables.option_bits & OPTION_BIN_LOG_INTERNAL_OFF))
+          || (get_gtid_mode(GTID_MODE_LOCK_SID) != GTID_MODE_ON));
+#ifndef NDEBUG
+  int32 old_value=
+#endif
+    anonymous_gtid_count.atomic_add(-1);
+  DBUG_PRINT("info", ("anonymous_gtid_count decreased to %d", old_value - 1));
+  assert(old_value >= 1);
+  DBUG_VOID_RETURN;
+}
+#endif  /* WITH_WSREP */

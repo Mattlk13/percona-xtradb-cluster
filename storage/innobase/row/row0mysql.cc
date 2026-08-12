@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 2000, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2000, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -425,6 +433,7 @@ column_zip_free(
 }
 
 /** Configure the zlib allocator to use the given memory heap. */
+static
 void
 column_zip_set_alloc(
 	void*		stream,	/*!< in/out: zlib stream */
@@ -580,7 +589,7 @@ row_decompress_column(
 	ulint		dict_data_len,
 				/*!< in: optional dictionary data length */
 	row_prebuilt_t*	prebuilt)
-				/*!< in: use prebuilt->compress_heap only
+				/*!< in: use prebuilt->blob_heap only
 				here*/
 {
 	ulint buf_len = 0;
@@ -644,14 +653,102 @@ row_decompress_column(
 	data += lenlen;
 
 	/* data is compressed, decompress it*/
-	if (!prebuilt->compress_heap) {
-		prebuilt->compress_heap =
+
+	/*
+	Keep uncompressed data on blob_heap.
+	compress_heap is used only for compressed data.
+	Q: Why do we need separate heaps for compression and decompression?
+	A: There are below scenarios when we use one or both heaps and we need to
+	manage them separately.
+
+	Case 1:
+	Consider the following table:
+	CREATE TABLE t1 (a INT, b BLOB COLUMN_FORMAT COMPRESSED);
+	If we update the row in the following way:
+	UPDATE t1 SET a=1 WHERE a = 0;
+	the flow is:
+
+	For every row do:
+		1. Read row
+			1.1. Read row with compressed BLOB from the storage into blob_heap
+				 (allocates mem from blob_heap)
+			1.2. Decompress BLOB. Put decompressed version on heap_x and link
+				 record with BLOB pointer (allocates memory from heap_x)
+			1.3. Construct the new row. As BLOB didn't change, reuse the pointer
+				 to it.
+		2. Write row
+			2.1. Compress BLOB. Put compressed version on compress_heap
+				 (allocates memory from compress_heap)
+			2.2. Store row with compressed BLOB to the storage.
+		3. Write row event to binlog
+			3.1. Use decompressed blob pointer (from heap_x)
+
+	Note that in the above flow we have 1 table involved, so one 'prebuilt'
+	object.
+
+	So we need to keep decompressed BLOB buffer valid until we write the row
+	into the binlog.
+	Every loop allocates memory from heaps, so we need to free it when not
+	needed anymore to avoid OOM.
+	That's why blob_heap is cleared before row read and compress_heap is cleared
+	after row write (it could be cleared before row write as well as it was in
+	the original implementation).
+	We can not use compress_heap to keep decompressed version of the BLOB,
+	because it has to retain up to binlogging. The last moment we are able to
+	deallocate it is at the end of row write, but it is too early.
+	That's why we do it before next row read (and additionally after the query).
+
+	Note:
+	This method decompresses not only BLOB columns, but also text and varchar.
+	In case of such columns (and no blob in row), there is no blob_heap
+	allocated, that's why we allocate it below. Logically, we could use
+	dedicated decompress_heap (heap_x from above) to keep decompressed version
+	of column, but that would lead to bigger changes (also in partitioned
+	tables). Both blob_heap and decompress_heap (heap_x) would serve the same
+	purpose: keep decompressed version of column, so we can use blob_heap for
+	this purpose.
+
+	Case 2:
+	Consider the following table:
+	CREATE TABLE t1 (b1 BLOB, b2 BLOB COLUMN_FORMAT COMPRESSED);
+	If we alter this table in the following way:
+	ALTER TABLE t1 MODIFY b1 BLOB COLUMN_FORMAT COMPRESSED;
+	the flow is:
+
+	1. Create temp table with compressed BLOB b1 column (target table)
+	2. For every row do:
+	3. Read row from original table
+		3.1  Read row with BLOBs from the storage into blob_heap
+		3.2. Decompress BLOB b2. Put decompressed version on heap_x and link
+			 record with BLOB b2 pointer
+	2. Write row to target table
+		2.1. Compress BLOBs. Put compressed version on compress_heap
+		2.2. Store row with compressed BLOBs to the storage.
+
+	Note that in the above flow we have 2 different tables, so 2 different
+	'prebuilt' objects.
+
+    Again, when we are looping over rows, we are allocating memory from heaps,
+	but we need to keep decompressed version of the row until it is stored back,
+	so we could free decompressed version after writing row. But it has to be
+	kept longer because of Case 1. This is why we free it before next row read
+	(or after the query).
+
+	Considering two above cases we get to the following conclusions:
+	1. We need to keep decompressed version of row until it is binlogged
+	   => we can free it before next row read and after the query is completed
+	2. We need to free compressed version of row to avoid OOM
+	   => we can free it before or after row write and after the query is
+	   completed
+    */
+	if (!prebuilt->blob_heap) {
+		prebuilt->blob_heap =
 			mem_heap_create(ut_max(UNIV_PAGE_SIZE, uncomp_len));
 	}
 
 	buf_len = uncomp_len;
 	buf = static_cast<byte*>(mem_heap_zalloc(
-				 prebuilt->compress_heap, buf_len));
+				 prebuilt->blob_heap, buf_len));
 
 	/* init d_stream */
 	d_stream.next_in = const_cast<Bytef*>(data);
@@ -659,7 +756,7 @@ row_decompress_column(
 	d_stream.next_out = buf;
 	d_stream.avail_out = buf_len;
 
-	column_zip_set_alloc(&d_stream, prebuilt->compress_heap);
+	column_zip_set_alloc(&d_stream, prebuilt->blob_heap);
 
 	window_bits = wrap ? MAX_WBITS : -MAX_WBITS;
 	err = inflateInit2(&d_stream, window_bits);
@@ -667,7 +764,8 @@ row_decompress_column(
 
 	err = inflate(&d_stream, Z_FINISH);
 	if (err == Z_NEED_DICT) {
-		ut_a(dict_data != 0 && dict_data_len != 0);
+		ut_a(dict_data != NULL);
+		ut_a(dict_data_len != 0);
 		err = inflateSetDictionary(&d_stream, dict_data,
 			dict_data_len);
 		ut_a(err == Z_OK);
@@ -736,7 +834,7 @@ row_mysql_store_blob_ref(
 				/*!< in: optional compression dictionary data
 				length */
 	row_prebuilt_t*	prebuilt)
-				/*<! in: use prebuilt->compress_heap only
+				/*<! in: use prebuilt->blob_heap only
 				here */
 {
 	/* MySQL might assume the field is set to zero except the length and
@@ -2289,9 +2387,6 @@ row_insert_for_mysql_using_ins_graph(
 		return(DB_TABLE_CORRUPT);
 	}
 
-	if (UNIV_LIKELY_NULL(prebuilt->compress_heap))
-		mem_heap_empty(prebuilt->compress_heap);
-
 	trx->op_info = "inserting";
 
 	row_mysql_delay_if_needed();
@@ -2435,6 +2530,19 @@ row_insert_for_mysql(
 	const byte*		mysql_rec,
 	row_prebuilt_t*		prebuilt)
 {
+	struct CompressHeapCleaner {
+		CompressHeapCleaner(row_prebuilt_t* prebuilt)
+		: prebuilt_(prebuilt) { }
+
+		~CompressHeapCleaner() {
+			if (prebuilt_ && UNIV_LIKELY_NULL(prebuilt_->compress_heap)) {
+				mem_heap_empty(prebuilt_->compress_heap);
+			}
+		}
+
+		row_prebuilt_t *prebuilt_;
+	} compressCheapCleaner(prebuilt);
+
 	/* For intrinsic tables there a lot of restrictions that can be
 	relaxed including locking of table, transaction handling, etc.
 	Use direct cursor interface for inserting to intrinsic tables. */
@@ -2710,11 +2818,19 @@ row_update_inplace_for_intrinsic(const upd_node_t* node)
 		index, offsets, node->update);
 
 	if (size_changes) {
+		btr_pcur_close(&pcur);
+		mtr_commit(&mtr);
 		return(DB_FAIL);
 	}
 
 	row_upd_rec_in_place(rec, index, offsets, node->update, NULL);
 
+	/* Set the changed pages as modified, so that if the page is
+	evicted from the buffer pool it is flushed and we don't lose
+	the changes */
+
+	mtr.set_modified();
+	btr_pcur_close(&pcur);
 	mtr_commit(&mtr);
 
 	return(DB_SUCCESS);
@@ -2904,8 +3020,7 @@ row_update_for_mysql_using_cursor(
 			if (!dict_index_is_auto_gen_clust(index)) {
 				err = row_ins_clust_index_entry(
 					index, entry, thr,
-					node->upd_ext
-					? node->upd_ext->n_ext : 0,
+					entry->get_n_ext(),
 					true);
 			}
 		} else {
@@ -2931,7 +3046,7 @@ row_update_for_mysql_using_cursor(
 
 			err = row_ins_clust_index_entry(
 				index, entry, thr,
-				node->upd_ext ? node->upd_ext->n_ext : 0,
+				entry->get_n_ext(),
 				false);
 			/* Commit the open mtr as we are processing UPDATE. */
 			if (index->last_ins_cur) {
@@ -3634,9 +3749,9 @@ row_create_table_for_mysql(
 		ib::error() << "Trying to create a MySQL system table "
 			<< table->name << " of type InnoDB. MySQL system"
 			" tables must be of the MyISAM type!";
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 err_exit:
-#endif /* !DBUG_OFF */
+#endif /* !NDEBUG */
 		dict_mem_table_free(table);
 
 		if (commit) {
@@ -4507,33 +4622,6 @@ row_discard_tablespace(
 
 	if (err != DB_SUCCESS) {
 		return(err);
-	}
-
-	/* For encrypted table, before we discard the tablespace,
-	we need save the encryption information into table, otherwise,
-	this information will be lost in fil_discard_tablespace along
-	with fil_space_free(). */
-	if (dict_table_is_encrypted(table)) {
-		ut_ad(table->encryption_key == NULL
-		      && table->encryption_iv == NULL);
-
-		table->encryption_key =
-			static_cast<byte*>(mem_heap_alloc(table->heap,
-							  ENCRYPTION_KEY_LEN));
-
-		table->encryption_iv =
-			static_cast<byte*>(mem_heap_alloc(table->heap,
-							  ENCRYPTION_KEY_LEN));
-
-		fil_space_t*	space = fil_space_get(table->space);
-		ut_ad(FSP_FLAGS_GET_ENCRYPTION(space->flags));
-
-		memcpy(table->encryption_key,
-		       space->encryption_key,
-		       ENCRYPTION_KEY_LEN);
-		memcpy(table->encryption_iv,
-		       space->encryption_iv,
-		       ENCRYPTION_KEY_LEN);
 	}
 
 	/* Discard the physical file that is used for the tablespace. */

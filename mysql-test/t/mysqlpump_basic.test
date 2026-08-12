@@ -1,7 +1,5 @@
 
 -- source include/not_embedded.inc
-# Disabled until https://bugs.mysql.com/bug.php?id=78224 is fixed.
--- source include/not_valgrind.inc
 
 --echo #
 --echo # WL#7755  mysqlpump: Extend mysqldump functionalities
@@ -658,7 +656,7 @@ SHOW CREATE TABLE test.t1;
 
 --let $program= $MYSQL_PUMP --include-databases=test --include-tables=t1
 
---exec $PROGRAM >> $MYSQL_TMP_DIR/mysqlpump.sql
+--exec $PROGRAM > $MYSQL_TMP_DIR/mysqlpump.sql
 
 DROP TABLE `test`.`t1`;
 
@@ -668,6 +666,8 @@ SHOW CREATE TABLE test.t1;
 
 DROP TABLE `test`.`t1`;
 DROP TABLESPACE `mytbsp`;
+
+--remove_file $MYSQL_TMP_DIR/mysqlpump.sql
 
 -- echo #
 -- echo # Bug#29023216: MYSQLPUMP SHOULD WRITE USERS AND GRANTS BEFORE VIEWS AND STORED PROGRAMS

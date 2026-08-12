@@ -1,13 +1,20 @@
-# Copyright (c) 2010, 2017, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2010, 2023, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; version 2 of the License.
+# it under the terms of the GNU General Public License, version 2.0,
+# as published by the Free Software Foundation.
+#
+# This program is also distributed with certain software (including
+# but not limited to OpenSSL) that is licensed under separate terms,
+# as designated in a particular file or component or in included license
+# documentation.  The authors of MySQL hereby grant you an additional
+# permission to link the program and your derivative works with the
+# separately licensed software that they have included with MySQL.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU General Public License, version 2.0, for more details.
 #
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
@@ -15,7 +22,6 @@
 
 # Common warning flags for GCC, G++, Clang and Clang++
 SET(MY_WARNING_FLAGS "-Wall -Wextra -Wformat-security -Wvla")
-#SET(MY_WARNING_FLAGS "-Wall -Wextra -Wformat-security -Wvla -Wno-error=deprecated-declarations -Wno-error=nonnull-compare -Wno-error=shift-negative-value -Wno-error=misleading-indentation -Wno-error=literal-suffix -Wno-error=virtual-move-assign ")
 
 # Common warning flags for GCC and Clang
 SET(MY_C_WARNING_FLAGS
@@ -31,17 +37,25 @@ IF(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
       "${MY_CXX_WARNING_FLAGS} -Wno-null-conversion -Wno-unused-private-field -Wno-error=c++11-compat")
 ENDIF()
 
+# Suppress warnings for clang-15 or newer
+IF(CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT CMAKE_C_COMPILER_VERSION VERSION_LESS 15.0)
+  STRING_APPEND(MY_C_WARNING_FLAGS " -Wno-deprecated-non-prototype")
+ENDIF()
+IF(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 15.0)
+  STRING_APPEND(MY_CXX_WARNING_FLAGS " -Wno-unused-parameter -Wno-unused-but-set-variable")
+ENDIF()
+
 # Turn on Werror (warning => error) when using maintainer mode.
 IF(MYSQL_MAINTAINER_MODE)
-  SET(MY_C_WARNING_FLAGS "${MY_C_WARNING_FLAGS} -Werror")
-  SET(MY_CXX_WARNING_FLAGS "${MY_CXX_WARNING_FLAGS} -Werror")
+  STRING_APPEND(MY_C_WARNING_FLAGS   " -Werror")
+  STRING_APPEND(MY_CXX_WARNING_FLAGS " -Werror")
 ENDIF()
 
 # Set warning flags for GCC/Clang
 IF(CMAKE_COMPILER_IS_GNUCC OR CMAKE_C_COMPILER_ID MATCHES "Clang")
-  SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${MY_C_WARNING_FLAGS}")
+  STRING_APPEND(CMAKE_C_FLAGS " ${MY_C_WARNING_FLAGS}")
 ENDIF()
 # Set warning flags for G++/Clang++
 IF(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${MY_CXX_WARNING_FLAGS}")
+  STRING_APPEND(CMAKE_CXX_FLAGS " ${MY_CXX_WARNING_FLAGS}")
 ENDIF()

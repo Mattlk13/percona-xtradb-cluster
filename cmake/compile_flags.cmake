@@ -1,14 +1,21 @@
-# Copyright (c) 2014, 2015, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2014, 2023, Oracle and/or its affiliates.
 # 
 # This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; version 2 of the License.
-# 
+# it under the terms of the GNU General Public License, version 2.0,
+# as published by the Free Software Foundation.
+#
+# This program is also distributed with certain software (including
+# but not limited to OpenSSL) that is licensed under separate terms,
+# as designated in a particular file or component or in included license
+# documentation.  The authors of MySQL hereby grant you an additional
+# permission to link the program and your derivative works with the
+# separately licensed software that they have included with MySQL.
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-# 
+# GNU General Public License, version 2.0, for more details.
+#
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
@@ -42,3 +49,41 @@ MACRO(ADD_COMPILE_FLAGS)
     ENDFOREACH()
   ENDFOREACH()
 ENDMACRO()
+
+# Set CMAKE_C_FLAGS and CMAKE_CXX_FLAGS to 'rpm --eval %optflags'
+FUNCTION(ADD_LINUX_RPM_FLAGS)
+  EXECUTE_PROCESS(COMMAND ${MY_RPM} --eval %optflags
+          OUTPUT_VARIABLE RPM_EVAL_OPTFLAGS
+          OUTPUT_STRIP_TRAILING_WHITESPACE
+          RESULT_VARIABLE RPM_EVAL_RESULT
+          )
+  IF(RPM_EVAL_RESULT EQUAL 0)
+    SET(CMAKE_C_FLAGS   "${RPM_EVAL_OPTFLAGS}" PARENT_SCOPE)
+    SET(CMAKE_CXX_FLAGS "${RPM_EVAL_OPTFLAGS}" PARENT_SCOPE)
+  ELSE()
+    MESSAGE(FATAL_ERROR "WITH_PACKAGE_FLAGS=on but rpm --eval %optflags failed")
+  ENDIF()
+ENDFUNCTION()
+
+# Set CMAKE_C_FLAGS and CMAKE_CXX_FLAGS to
+#   dpkg-buildflags --get <lang>FLAGS CPPFLAGS
+# Set CMAKE_EXE_LINKER_FLAGS CMAKE_MODULE_LINKER_FLAGS and
+# CMAKE_SHARED_LINKER_FLAGS to
+#   dpkg-buildflags --get LDFLAGS
+FUNCTION(ADD_LINUX_DEB_FLAGS)
+  FOREACH(flag CPPFLAGS CFLAGS CXXFLAGS LDFLAGS)
+    EXECUTE_PROCESS(COMMAND ${MY_DPKG_BUILDFLAGS} --get ${flag}
+            OUTPUT_VARIABLE GET_${flag}
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE GET_RESULT
+            )
+    IF(NOT GET_RESULT EQUAL 0)
+      MESSAGE(FATAL_ERROR "WITH_PACKAGE_FLAGS=on but dpkg-buildflags --get failed")
+    ENDIF()
+    SET(CMAKE_C_FLAGS   "${GET_CFLAGS}   ${GET_CPPFLAGS}" PARENT_SCOPE)
+    SET(CMAKE_CXX_FLAGS "${GET_CXXFLAGS} ${GET_CPPFLAGS}" PARENT_SCOPE)
+    SET(CMAKE_EXE_LINKER_FLAGS    "${GET_LDFLAGS}" PARENT_SCOPE)
+    SET(CMAKE_MODULE_LINKER_FLAGS "${GET_LDFLAGS}" PARENT_SCOPE)
+    SET(CMAKE_SHARED_LINKER_FLAGS "${GET_LDFLAGS}" PARENT_SCOPE)
+  ENDFOREACH()
+ENDFUNCTION()

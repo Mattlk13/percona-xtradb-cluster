@@ -47,7 +47,7 @@ SELECT "Rewrite me conn 2";
 SELECT xxx(pattern) FROM query_rewrite.rewrite_rules;
 
 --source suite/query_rewrite_plugins/include/uninstall_rewriter.inc
-
+--source include/disconnect_connections.inc
 
 --echo #
 --echo # Now make sure that everything works as long we do as we're supposed
@@ -66,7 +66,7 @@ SELECT 'Rewrite me';
 SHOW STATUS LIKE 'Rewriter_%';
 
 --source suite/query_rewrite_plugins/include/uninstall_rewriter.inc
-
+--source include/disconnect_connections.inc
 
 --echo #
 --echo # Now check that we don't fail even if @@autocommit is 0. In this case
@@ -102,7 +102,7 @@ SELECT 'Rewrite me';
 SHOW STATUS LIKE 'Rewriter_%';
 
 --source suite/query_rewrite_plugins/include/uninstall_rewriter.inc
-
+--source include/disconnect_connections.inc
 
 --echo #
 --echo # Now let's make sure that everything works fine if we run with
@@ -131,5 +131,24 @@ SELECT load_rewrite_rules();
 SELECT 'Rewrite me';
 
 SET autocommit = DEFAULT;
+
+--source suite/query_rewrite_plugins/include/uninstall_rewriter.inc
+--source include/disconnect_connections.inc
+--echo #
+--echo # Bug#36784795 Query rewrite plugin not working when server runs with
+--echo #              autocommit=OFF
+--echo #
+--source suite/query_rewrite_plugins/include/install_rewriter_with_optional_columns.inc
+
+SET GLOBAL autocommit = 0;
+SET SESSION autocommit = ON;
+#Session autocommit is not needed to set to OFF for this test.
+DELETE FROM query_rewrite.rewrite_rules;
+INSERT INTO query_rewrite.rewrite_rules (pattern, replacement) VALUES('SELECT ?', 'SELECT ? + 1');
+SELECT * FROM query_rewrite.rewrite_rules;
+CALL query_rewrite.flush_rewrite_rules();
+SELECT * FROM query_rewrite.rewrite_rules;
+SET GLOBAL autocommit = DEFAULT;
+SET SESSION autocommit = DEFAULT;
 
 --source suite/query_rewrite_plugins/include/uninstall_rewriter.inc

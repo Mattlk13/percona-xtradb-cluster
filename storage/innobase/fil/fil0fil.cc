@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 1995, 2019, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -719,7 +727,10 @@ retry:
 
 		/* Read the first page of the tablespace */
 
-		buf2 = static_cast<byte*>(ut_malloc_nokey(2 * UNIV_PAGE_SIZE));
+		const ulint buf2_size = recv_recovery_is_on()
+			? (2 * UNIV_PAGE_SIZE) : UNIV_PAGE_SIZE;
+		buf2 = static_cast<byte*>(
+			ut_malloc_nokey(buf2_size + UNIV_PAGE_SIZE));
 
 		/* Align the memory for file i/o if we might have O_DIRECT
 		set */
@@ -729,8 +740,7 @@ retry:
 		IORequest	request(IORequest::READ);
 
 		success = os_file_read(
-			request,
-			node->handle, page, 0, UNIV_PAGE_SIZE);
+			request, node->handle, page, 0, buf2_size);
 
 		srv_stats.page0_read.add(1);
 		space_id = fsp_header_get_space_id(page);
@@ -787,6 +797,7 @@ retry:
 				<< ib::hex(space->flags) << ")!";
 		}
 
+
 		/* Validate the flags but do not compare the data directory
 		flag, in case this tablespace was relocated. */
 		unsigned relevant_space_flags
@@ -841,6 +852,20 @@ retry:
 			space->size_in_header = size;
 			space->free_limit = free_limit;
 			space->free_len = free_len;
+
+			/* Set estimated value for space->compression_type
+			during recovery process. */
+			if (recv_recovery_is_on()
+			    && (Compression::is_compressed_page(
+					page + page_size.physical())
+			        || Compression::is_compressed_encrypted_page(
+					page + page_size.physical()))) {
+				ut_ad(buf2_size >= (2 * UNIV_PAGE_SIZE));
+				Compression::meta_t header;
+				Compression::deserialize_header(
+					page + page_size.physical(), &header);
+				space->compression_type = header.m_algorithm;
+			}
 		}
 
 		ut_free(buf2);
@@ -869,7 +894,7 @@ retry:
 
 
 		if (node->size == 0) {
-			ulint	extent_size;
+			uint64_t	extent_size;
 
 			extent_size = page_size.physical() * FSP_EXTENT_SIZE;
 
@@ -1672,18 +1697,23 @@ fil_space_get_flags(
 	return(flags);
 }
 
-/** Check if table is mark for truncate.
+/** Check if tablespace exists and is marked for truncation.
 @param[in]	id	space id
+@return true if tablespace is missing.
 @return true if tablespace is marked for truncate. */
 bool
 fil_space_is_being_truncated(
 	ulint id)
 {
-	bool	mark_for_truncate;
+	bool flag = true;
+	fil_space_t* space;
 	mutex_enter(&fil_system->mutex);
-	mark_for_truncate = fil_space_get_by_id(id)->is_being_truncated;
+	space = fil_space_get_space(id);
+	if (space != NULL) {
+		flag = space->is_being_truncated;
+        }
 	mutex_exit(&fil_system->mutex);
-	return(mark_for_truncate);
+	return(flag);
 }
 
 /** Open each fil_node_t of a named fil_space_t if not already open.
@@ -2437,6 +2467,10 @@ fil_name_write(
 	const fil_node_t*	file,
 	mtr_t*			mtr)
 {
+	/* Temporary tablespaces ibtmp1 or the file_per_table
+	compressed temporary tablespaces should never be redo logged */
+	ut_ad(FSP_FLAGS_GET_TEMPORARY(space->flags) == 0);
+
 	fil_name_write(space->id, first_page_no, file->name, mtr);
 }
 
@@ -2472,7 +2506,9 @@ fil_recreate_table(
 	/* Step-1: Scan for active indexes from REDO logs and drop
 	all the indexes using low level function that take root_page_no
 	and space-id. */
+	mutex_enter(&dict_sys->mutex);
 	truncate.drop_indexes(space_id);
+	mutex_exit(&dict_sys->mutex);
 
 	/* Step-2: Scan for active indexes and re-create them. */
 	err = truncate.create_indexes(
@@ -3268,12 +3304,8 @@ fil_reinit_space_header_for_table(
 	row_mysql_unlock_data_dictionary(trx);
 	DEBUG_SYNC_C("trunc_table_index_dropped_release_dict_lock");
 
-	/* Lock the search latch in shared mode to prevent user
-	from disabling AHI during the scan */
-	btr_search_s_lock_all();
 	DEBUG_SYNC_C("simulate_buffer_pool_scan");
 	buf_LRU_flush_or_remove_pages(id, BUF_REMOVE_ALL_NO_WRITE, 0);
-	btr_search_s_unlock_all();
 
 	row_mysql_lock_data_dictionary(trx);
 
@@ -5342,7 +5374,7 @@ retry:
 	}
 
 	page_size_t	pageSize(space->flags);
-	const ulint	page_size = pageSize.physical();
+	const os_offset_t	page_size = pageSize.physical();
 	fil_node_t*	node = UT_LIST_GET_LAST(space->chain);
 
 	if (!node->being_extended) {
@@ -5868,6 +5900,34 @@ fil_io_set_keyring_encryption(IORequest& req_type,
 	mutex_exit(&space->crypt_data->mutex);
 }
 
+static void
+fil_io_set_mk_encryption(IORequest& req_type, fil_space_t* space)
+{
+	unsigned char* key = space->encryption_redo_key != NULL
+		? reinterpret_cast<unsigned char*>(space->encryption_redo_key->key)
+		: space->encryption_key;
+	uint version = space->encryption_redo_key != NULL
+		? space->encryption_redo_key->version
+		: space->encryption_key_version;
+	req_type.encryption_key(key,
+				32,
+				false,
+				space->encryption_iv,
+				version, 0, NULL, NULL);
+
+	req_type.encryption_rotation(Encryption::NO_ROTATION);
+}
+
+static
+bool
+fil_keyring_skip_encryption(const page_id_t& page_id) {
+
+	/* Don't encrypt TRX_SYS_SPACE.TRX_SYS_PAGE_NO as it contains address
+	to dblwr buffer */
+	return((page_id.space() == TRX_SYS_SPACE
+		&& page_id.page_no() == TRX_SYS_PAGE_NO) ? true : false);
+}
+
 /** Set encryption information for IORequest.
 @param[in,out]	req_type	IO request
 @param[in]	page_id		page id
@@ -5926,30 +5986,59 @@ fil_io_set_encryption(
 		return;
 	}
 
-	/* Don't encrypt the page 0 of all tablespaces,
-	   don't encrypt TRX_SYS_SPACE.TRX_SYS_PAGE_NO as it contains address to dblwr buffer */
-	if ((req_type.is_log()
-	     || (page_id.page_no() > 0
-		 && (TRX_SYS_SPACE != page_id.space()
-		     || TRX_SYS_PAGE_NO != page_id.page_no())))
-	    && space->encryption_type != Encryption::NONE) {
-		if (space->encryption_type == Encryption::KEYRING)  {
-			ut_ad(space->crypt_data != NULL);
-
-			fil_io_set_keyring_encryption(req_type, space, page_id);
-		} else {
-			ut_ad(space->encryption_type == Encryption::AES);
-			req_type.encryption_key(space->encryption_key,
-						32,
-						false,
-						space->encryption_iv,
-						0, 0, NULL, NULL); // not relevant for Master Key encryption
-
-			req_type.encryption_rotation(Encryption::NO_ROTATION);
-		}
-		req_type.encryption_algorithm(space->encryption_type);
-	} else {
+	if (space->encryption_type == Encryption::NONE) {
 		req_type.clear_encrypted();
+		return;
+	}
+
+        if (req_type.is_log())  {
+		/* redo log encryption */
+		ut_ad(page_id.space() == SRV_LOG_SPACE_FIRST_ID);
+
+		switch (space->encryption_type) {
+		case Encryption::AES:
+		case Encryption::KEYRING:
+			// Both MK and Keyrig key use same style for redo log
+			fil_io_set_mk_encryption(req_type, space);
+		        req_type.encryption_algorithm(space->encryption_type);
+			return;
+		case Encryption::NONE:
+			// Already handled above
+		default:
+			ut_a(0);
+		}
+
+	} else {
+		/* tablespace encryption */
+
+		/* Don't encrypt the page 0 of all tablespaces */
+		if (page_id.page_no() == 0) {
+		    req_type.clear_encrypted();
+		    return;
+		}
+
+		switch (space->encryption_type) {
+		case Encryption::KEYRING:
+			if (fil_keyring_skip_encryption(page_id)) {
+				req_type.clear_encrypted();
+				return;
+			} else {
+				fil_io_set_keyring_encryption(
+					req_type, space, page_id);
+				req_type.encryption_algorithm(
+						space->encryption_type);
+				return;
+			}
+
+		case Encryption::AES:
+			fil_io_set_mk_encryption(req_type, space);
+		        req_type.encryption_algorithm(space->encryption_type);
+			return;
+		case Encryption::NONE:
+			// Already handled above
+		default:
+			ut_a(0);
+		}
 	}
 }
 
@@ -6872,6 +6961,7 @@ struct fil_iterator_t {
 	uint		encryption_key_version;
 	uint		encryption_key_id;
 	fil_space_crypt_t *crypt_data;		/*!< Crypt data (if encrypted) */
+	size_t		block_size;		/*!< FS Block Size */
 };
 
 /********************************************************************//**
@@ -6911,6 +7001,7 @@ fil_iterate(
 	for (offset = iter.start; offset < iter.end; offset += n_bytes) {
 
 		IORequest	read_request(read_type);
+		read_request.block_size(iter.block_size);
 
 		byte*	io_buffer = iter.io_buffer;
 
@@ -7010,6 +7101,7 @@ fil_iterate(
 		}
 
 		IORequest	write_request(write_type);
+		write_request.block_size(iter.block_size);
 
 		/* For encrypted table, set encryption information. */
 		if (iter.encryption_key != NULL && offset != 0 && iter.crypt_data == NULL) {
@@ -7139,6 +7231,17 @@ fil_tablespace_iterate(
 		err = DB_SUCCESS;
 	}
 
+	/* Set File System Block Size */
+	size_t block_size;
+	{
+		os_file_stat_t stat_info;
+
+		ut_d(dberr_t err =) os_file_get_status(filepath, &stat_info, false, false);
+		ut_ad(err == DB_SUCCESS);
+
+		block_size = stat_info.block_size;
+	}
+
 	callback.set_file(filepath, file);
 
 	os_offset_t	file_size = os_file_get_size(file);
@@ -7181,6 +7284,7 @@ fil_tablespace_iterate(
 		iter.file_size = file_size;
 		iter.n_io_buffers = n_io_buffers;
 		iter.page_size = callback.get_page_size().physical();
+		iter.block_size = block_size;
 
 		ulint	space_flags = callback.get_space_flags();
 		iter.crypt_data = fil_space_read_crypt_data(
@@ -7203,14 +7307,22 @@ fil_tablespace_iterate(
 
 		/* Check encryption is matched or not. */
 		if (err == DB_SUCCESS && FSP_FLAGS_GET_ENCRYPTION(space_flags)) {
-			ut_ad(iter.encryption_key != NULL);
-
 			if (!dict_table_is_encrypted(table)) {
 				ib::error() << "Table is not in an encrypted"
-					" tablespace, but the data file which"
-					" trying to import is an encrypted"
+					" tablespace, but the data file"
+                                        " intended for import is an encrypted"
 					" tablespace";
 				err = DB_IO_NO_ENCRYPT_TABLESPACE;
+			} else {
+				/* encryption_key must have been populated
+                                while reading CFP file. */
+				ut_ad(table->encryption_key != NULL &&
+				table->encryption_iv != NULL);
+
+				if (table->encryption_key == NULL ||
+					table->encryption_iv == NULL) {
+					err = DB_ERROR;
+				}
 			}
 		}
 
@@ -7776,6 +7888,7 @@ truncate_t::truncate(
 			ib::error() << "Failed to open tablespace file "
 				<< path << ".";
 
+			mutex_exit(&fil_system->mutex);
 			ut_free(path);
 
 			return(DB_ERROR);
@@ -7930,6 +8043,7 @@ fil_get_compression(
 @param[in] algorithm		Encryption algorithm
 @param[in] key			Encryption key
 @param[in] iv			Encryption iv
+@param[in] acquire_mutex	if true acquire fil_sys mutex, else false
 @return DB_SUCCESS or error code */
 dberr_t
 fil_set_encryption(
@@ -7937,15 +8051,18 @@ fil_set_encryption(
 	Encryption::Type	algorithm,
 	byte*			key,
 	byte*			iv,
-	bool aquire_mutex)
+	bool			acquire_mutex)
 {
-	if (aquire_mutex)
+	if (acquire_mutex) {
 		mutex_enter(&fil_system->mutex);
+	}
 
 	fil_space_t*	space = fil_space_get_by_id(space_id);
 
 	if (space == NULL) {
-		mutex_exit(&fil_system->mutex);
+		if (acquire_mutex) {
+			mutex_exit(&fil_system->mutex);
+		}
 		return(DB_NOT_FOUND);
 	}
 
@@ -7957,7 +8074,6 @@ fil_set_encryption(
 
 	if (key == NULL) {
 		Encryption::random_value(space->encryption_key);
-		space->encryption_key_version = REDO_LOG_ENCRYPT_NO_VERSION;
 	} else {
 		memcpy(space->encryption_key,
 		       key, ENCRYPTION_KEY_LEN);
@@ -7971,19 +8087,29 @@ fil_set_encryption(
 		       iv, ENCRYPTION_KEY_LEN);
 	}
 
-	if (aquire_mutex)
+	if (acquire_mutex) {
 		mutex_exit(&fil_system->mutex);
+	}
 
 	return(DB_SUCCESS);
 }
 
 /** Enable encryption of temporary tablespace
 @param[in,out]	space	tablespace object
+@param[in]	enable	true to enable encryption, false to disable
 @return DB_SUCCESS on success, DB_ERROR on failure */
 dberr_t
 fil_temp_update_encryption(
-	fil_space_t*	space)
+	fil_space_t*	space,
+	bool		enable)
 {
+	if (!enable || FSP_FLAGS_GET_ENCRYPTION(space->flags)) {
+		/* Do nothing when asked to disable encryption. Because
+		existing tables in the temporary tablespace may be
+		encrypted we need to keep existing keys */
+
+		return(DB_SUCCESS);
+	}
 	/* Make sure the keyring is loaded. */
 	if (!Encryption::check_keyring()) {
 		ib::error() << "Can't set temporary tablespace"
@@ -8020,7 +8146,11 @@ fil_encryption_rotate_low(const fil_space_t* space)
 		mtr_t mtr;
 		mtr_start(&mtr);
 
-		if (fsp_is_system_temporary(space->id)) {
+		/* Compressed temporary tables are file_per_table
+		tablespaces and cannot be determined by space_id check.
+		Check the temporary FSP flag for these tablespaces */
+		if (fsp_is_system_temporary(space->id)
+		    || FSP_FLAGS_GET_TEMPORARY(space->flags)) {
 			mtr_set_log_mode(&mtr, MTR_LOG_NO_REDO);
 		}
 

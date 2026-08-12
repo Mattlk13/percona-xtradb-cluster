@@ -1,13 +1,20 @@
-/* Copyright (c) 2001, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2001, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software Foundation,
@@ -156,6 +163,43 @@ static void mysql_ha_close_table(THD *thd, TABLE_LIST *tables)
   tables->mdl_request.ticket= NULL;
 }
 
+#ifdef WITH_WSREP
+static bool pxc_strict_mode_check(THD *thd)
+{
+  /* HANDLER OPEN is not supported by galera due as it not compatible
+  with multi-master semantics. It acquires explicit table lock. */
+  bool block= false;
+
+  switch (pxc_strict_mode)
+  {
+    case PXC_STRICT_MODE_DISABLED:
+    case PXC_STRICT_MODE_MASTER:
+      /* Do nothing */
+      break;
+    case PXC_STRICT_MODE_PERMISSIVE:
+    {
+      const char *msg= "Percona-XtraDB-Cluster doesn't recommend use of"
+                       " HANDLER <table> OPEN AS <alias>"
+                       " with pxc_strict_mode = PERMISSIVE";
+      WSREP_WARN("%s", msg);
+      push_warning_printf(thd, Sql_condition::SL_WARNING, ER_UNKNOWN_ERROR,
+                          "%s", msg);
+    }
+      break;
+    case PXC_STRICT_MODE_ENFORCING:
+    default:
+      const char *msg= "Percona-XtraDB-Cluster prohibits use of"
+                       " HANDLER <table> OPEN AS <alias>"
+                       " with pxc_strict_mode = ENFORCING";
+      block= true;
+      WSREP_ERROR("%s", msg);
+      my_message(ER_UNKNOWN_ERROR, msg, MYF(0));
+      break;
+  }
+
+  return block;
+}
+#endif
 
 /**
   Execute a HANDLER OPEN statement.
@@ -168,13 +212,20 @@ static void mysql_ha_close_table(THD *thd, TABLE_LIST *tables)
 
 bool Sql_cmd_handler_open::execute(THD *thd)
 {
-  TABLE_LIST    *hash_tables = NULL;
+  TABLE_LIST    *hash_tables= NULL;
   char          *db, *name, *alias;
   size_t        dblen, namelen, aliaslen;
   TABLE_LIST    *tables= thd->lex->select_lex->get_table_list();
   DBUG_ENTER("Sql_cmd_handler_open::execute");
   DBUG_PRINT("enter",("'%s'.'%s' as '%s'",
                       tables->db, tables->table_name, tables->alias));
+
+#ifdef WITH_WSREP
+  if (pxc_strict_mode_check(thd))
+  {
+    DBUG_RETURN(TRUE);
+  }
+#endif
 
   if (thd->locked_tables_mode)
   {
@@ -303,7 +354,7 @@ static bool mysql_ha_open_table(THD *thd, TABLE_LIST *hash_tables)
 
   DBUG_ENTER("mysql_ha_open_table");
 
-  DBUG_ASSERT(!thd->locked_tables_mode);
+  assert(!thd->locked_tables_mode);
 
   /*
     Save and reset the open_tables list so that open_tables() won't
@@ -321,7 +372,7 @@ static bool mysql_ha_open_table(THD *thd, TABLE_LIST *hash_tables)
     'hash_tables->table' must be NULL, unless there is pre-opened
     temporary table. open_tables() will set it if successful.
   */
-  DBUG_ASSERT(! hash_tables->table || is_temporary_table(hash_tables));
+  assert(! hash_tables->table || is_temporary_table(hash_tables));
 
   error= open_tables(thd, &hash_tables, &counter, 0);
 
@@ -347,7 +398,7 @@ static bool mysql_ha_open_table(THD *thd, TABLE_LIST *hash_tables)
       If called for re-open, no need to rollback either,
       it will be done at statement end.
     */
-    DBUG_ASSERT(thd->get_transaction()->is_empty(Transaction_ctx::STMT));
+    assert(thd->get_transaction()->is_empty(Transaction_ctx::STMT));
     close_thread_tables(thd);
     thd->mdl_context.rollback_to_savepoint(mdl_savepoint);
     thd->set_open_tables(backup_open_tables);
@@ -371,14 +422,23 @@ static bool mysql_ha_open_table(THD *thd, TABLE_LIST *hash_tables)
     was opened for HANDLER as it is used to link them together
     (see thd->temporary_tables).
   */
-  DBUG_ASSERT(hash_tables->table->next == NULL ||
-              hash_tables->table->s->tmp_table);
+  assert(hash_tables->table->next == NULL ||
+         hash_tables->table->s->tmp_table);
   /*
     If it's a temp table, don't reset table->query_id as the table is
     being used by this handler. For non-temp tables we use this flag
     in asserts.
   */
   hash_tables->table->open_by_handler= 1;
+
+  /*
+    Generated column expressions have been resolved using the MEM_ROOT of the
+    current HANDLER statement, which is cleared when the statement has finished.
+    Clean up the expressions so that subsequent HANDLER ... READ calls don't
+    access data allocated on a cleared MEM_ROOT. The generated column
+    expressions have to be re-resolved on each HANDLER ... READ call.
+  */
+  hash_tables->table->cleanup_gc_items();
 
   DBUG_PRINT("exit",("OK"));
   DBUG_RETURN(FALSE);
@@ -497,8 +557,8 @@ bool Sql_cmd_handler_read::execute(THD *thd)
   offset_limit_cnt= unit->offset_limit_cnt;
 
   select_lex->context.resolve_in_table_list_only(tables);
-  list.push_front(new Item_field(&select_lex->context,
-                                 NULL, NULL, "*"));
+  list.push_front(new Item_asterisk(&select_lex->context,
+                                    NULL, NULL));
   List_iterator<Item> it(list);
   it++;
 
@@ -570,7 +630,7 @@ retry:
         This is implicit and obscure, since HANDLER position is lost in the
         process, but it's the legacy server behaviour we should preserve.
       */
-      DBUG_ASSERT(error && !thd->is_error());
+      assert(error && !thd->is_error());
       mysql_ha_close_table(thd, hash_tables);
       goto retry;
     }
@@ -582,8 +642,8 @@ retry:
   /* save open_tables state */
   backup_open_tables= thd->open_tables;
   /* Always a one-element list, see mysql_ha_open(). */
-  DBUG_ASSERT(hash_tables->table->next == NULL ||
-              hash_tables->table->s->tmp_table);
+  assert(hash_tables->table->next == NULL ||
+         hash_tables->table->s->tmp_table);
   /*
     mysql_lock_tables() needs thd->open_tables to be set correctly to
     be able to handle aborts properly.
@@ -591,7 +651,7 @@ retry:
   thd->set_open_tables(hash_tables->table);
 
   /* Re-use Sql_handler_lock_error instance which was initialized earlier. */
-  DBUG_ASSERT(!sql_handler_lock_error.need_reopen());
+  assert(!sql_handler_lock_error.need_reopen());
   thd->push_internal_handler(&sql_handler_lock_error);
 
   lock= mysql_lock_tables(thd, &thd->open_tables, 1, 0);
@@ -602,20 +662,20 @@ retry:
     object with another one (reopen it). This is no longer the case
     with new MDL.
   */
-  DBUG_ASSERT(hash_tables->table == thd->open_tables);
+  assert(hash_tables->table == thd->open_tables);
   /* Restore previous context. */
   thd->set_open_tables(backup_open_tables);
 
   if (sql_handler_lock_error.need_reopen())
   {
-    DBUG_ASSERT(!lock && !thd->is_error());
+    assert(!lock && !thd->is_error());
     /*
       Always close statement transaction explicitly,
       so that the engine doesn't have to count locks.
       There should be no need to perform transaction
       rollback due to deadlock.
     */
-    DBUG_ASSERT(! thd->transaction_rollback_request);
+    assert(! thd->transaction_rollback_request);
     trans_rollback_stmt(thd);
     thd->mdl_context.rollback_to_savepoint(mdl_savepoint);
     mysql_ha_close_table(thd, hash_tables);
@@ -679,6 +739,14 @@ retry:
 
   table->file->init_table_handle_for_HANDLER();
 
+  /*
+    Resolve the generated column expressions. They have to be cleaned up before
+    returning, since the resolved expressions may point to memory allocated on
+    the MEM_ROOT of the current HANDLER ... READ statement, which will be
+    cleared when the statement has completed.
+  */
+  if (table->refix_gc_items(thd)) goto err;
+
   for (num_rows=0; num_rows < select_limit_cnt; )
   {
     switch (mode) {
@@ -688,7 +756,7 @@ retry:
         if (table->file->inited == handler::INDEX)
         {
           /* Check if we read from the same index. */
-          DBUG_ASSERT((uint) keyno == table->file->get_index());
+          assert((uint) keyno == table->file->get_index());
           error= table->file->ha_index_next(table->record[0]);
           break;
         }
@@ -721,9 +789,9 @@ retry:
       mode=RNEXT;
       break;
     case RPREV:
-      DBUG_ASSERT(m_key_name != 0);
+      assert(m_key_name != 0);
       /* Check if we read from the same index. */
-      DBUG_ASSERT((uint) keyno == table->file->get_index());
+      assert((uint) keyno == table->file->get_index());
       if (table->file->inited == handler::INDEX)
       {
         error= table->file->ha_index_prev(table->record[0]);
@@ -732,7 +800,7 @@ retry:
       // fallthrough
       // for more info, see comment before 'case RFIRST'.
     case RLAST:
-      DBUG_ASSERT(m_key_name != 0);
+      assert(m_key_name != 0);
       if (!(error= table->file->ha_index_or_rnd_end()) &&
           !(error= table->file->ha_index_init(keyno, 1)))
         error= table->file->ha_index_last(table->record[0]);
@@ -740,12 +808,12 @@ retry:
       break;
     case RNEXT_SAME:
       /* Continue scan on "(keypart1,keypart2,...)=(c1, c2, ...)  */
-      DBUG_ASSERT(table->file->inited == handler::INDEX);
+      assert(table->file->inited == handler::INDEX);
       error= table->file->ha_index_next_same(table->record[0], key, key_len);
       break;
     case RKEY:
     {
-      DBUG_ASSERT(m_key_name != 0);
+      assert(m_key_name != 0);
       KEY *keyinfo=table->key_info+keyno;
       KEY_PART_INFO *key_part=keyinfo->key_part;
       if (m_key_expr->elements > keyinfo->user_defined_key_parts)
@@ -845,6 +913,7 @@ ok:
   trans_commit_stmt(thd);
   mysql_unlock_tables(thd,lock);
   thd->mdl_context.rollback_to_savepoint(mdl_savepoint);
+  table->cleanup_gc_items();
   my_eof(thd);
   DBUG_PRINT("exit",("OK"));
   DBUG_RETURN(FALSE);
@@ -852,6 +921,7 @@ ok:
 err:
   trans_rollback_stmt(thd);
   mysql_unlock_tables(thd,lock);
+  table->cleanup_gc_items();
 err1:
   thd->mdl_context.rollback_to_savepoint(mdl_savepoint);
 err0:
@@ -918,7 +988,7 @@ void mysql_ha_rm_tables(THD *thd, TABLE_LIST *tables)
   TABLE_LIST *hash_tables, *next;
   DBUG_ENTER("mysql_ha_rm_tables");
 
-  DBUG_ASSERT(tables);
+  assert(tables);
 
   hash_tables= mysql_ha_find(thd, tables);
 

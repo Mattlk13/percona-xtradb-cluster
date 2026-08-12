@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 2011, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2011, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -47,6 +55,25 @@ Created 2011-05-26 Marko Makela
 
 #include <algorithm>
 #include <map>
+
+/** RAII interface to B-tree page cursor. Calls btr_pcur_close() on scope exit
+*/
+class Btr_pcur_guard {
+public:
+	/** Attach a pcur to the guard */
+	Btr_pcur_guard(btr_pcur_t *pcur) : m_pcur(pcur) {}
+
+	/** Call cursor close at the time of destruction. */
+	~Btr_pcur_guard() {
+		if (m_pcur != NULL) {
+			btr_pcur_close(m_pcur);
+		}
+	}
+
+private:
+	/** Btree page cursor object */
+	btr_pcur_t *m_pcur;
+};
 
 /** Table row modification operations during online table rebuild.
 Delete-marked records are not copied to the rebuilt table. */
@@ -518,7 +545,7 @@ row_log_online_op(
 
 	if (mrec_size >= avail_size) {
 		dberr_t			err;
-		IORequest		request(IORequest::WRITE);
+		IORequest		request(IORequest::ROW_LOG | IORequest::WRITE);
 		const os_offset_t	byte_offset
 			= (os_offset_t) log->tail.blocks
 			* srv_sort_buf_size;
@@ -654,7 +681,8 @@ row_log_table_close_func(
 
 	if (size >= avail) {
 		dberr_t			err;
-		IORequest		request(IORequest::WRITE);
+		IORequest		request(IORequest::ROW_LOG | IORequest::WRITE);
+
 		const os_offset_t	byte_offset
 			= (os_offset_t) log->tail.blocks
 			* srv_sort_buf_size;
@@ -2107,6 +2135,9 @@ row_log_table_apply_delete(
 	btr_pcur_open(index, old_pk, PAGE_CUR_LE,
 		      BTR_MODIFY_TREE | BTR_LATCH_FOR_DELETE,
 		      &pcur, &mtr);
+
+	Btr_pcur_guard pcur_guard(&pcur);
+
 #ifdef UNIV_DEBUG
 	switch (btr_pcur_get_btr_cur(&pcur)->flag) {
 	case BTR_CUR_DELETE_REF:
@@ -2260,6 +2291,9 @@ row_log_table_apply_update(
 	mtr.set_named_space(index->space);
 	btr_pcur_open(index, old_pk, PAGE_CUR_LE,
 		      BTR_MODIFY_TREE, &pcur, &mtr);
+
+	Btr_pcur_guard pcur_guard(&pcur);
+
 #ifdef UNIV_DEBUG
 	switch (btr_pcur_get_btr_cur(&pcur)->flag) {
 	case BTR_CUR_DELETE_REF:
@@ -2455,15 +2489,12 @@ func_exit_committed:
 	dtuple_t*	old_row;
 	row_ext_t*	old_ext;
 
-	if (dict_index_t* index_next = dict_table_get_next_index(index)) {
+	if (dict_table_get_next_index(index) != NULL) {
 		/* Construct the row corresponding to the old value of
 		the record. */
 		old_row = row_build(
                         ROW_COPY_DATA, index, btr_pcur_get_rec(&pcur),
                         cur_offsets, NULL, NULL, NULL, &old_ext, heap);
-		if (dict_index_has_virtual(index_next)) {
-			dtuple_copy_v_fields(old_row, update->old_vrow);
-		}
 		ut_ad(old_row);
 		DBUG_PRINT("ib_alter_table",
 			   ("update table " IB_ID_FMT
@@ -2496,6 +2527,7 @@ func_exit_committed:
 		dtuple_big_rec_free(big_rec);
 	}
 
+	bool vfields_copied = false;
 	while ((index = dict_table_get_next_index(index)) != NULL) {
 
 		n_index++;
@@ -2506,14 +2538,15 @@ func_exit_committed:
 		if (index->type & DICT_FTS) {
 			continue;
 		}
+		
+		if (!vfields_copied && dict_index_has_virtual(index)) {
+			dtuple_copy_v_fields(old_row, old_pk);
+			vfields_copied = true;
+		}
 
 		if (!row_upd_changes_ord_field_binary(
 			    index, update, thr, old_row, NULL)) {
 			continue;
-		}
-
-		if (dict_index_has_virtual(index)) {
-			dtuple_copy_v_fields(old_row, old_pk);
 		}
 
 		mtr_commit(&mtr);
@@ -2874,17 +2907,22 @@ row_log_table_apply_op(
 
 			/* if there is more than 2 bytes length info */
 			if (n_v_size > 2) {
+				if (next_mrec + 2 > mrec_end) {
+					return(NULL);
+				}
+				o_v_size = mach_read_from_2(next_mrec);
+				if (next_mrec + o_v_size > mrec_end) {
+					return(NULL);
+				}
+
 				trx_undo_read_v_cols(
 					log->table, const_cast<byte*>(
 					next_mrec), old_pk, false,
 					&(log->col_map[log->n_old_col]));
-				o_v_size = mach_read_from_2(next_mrec);
 			}
 
 			next_mrec += o_v_size;
-			if (next_mrec > mrec_end) {
-				return(NULL);
-			}
+			ut_ad(next_mrec <= mrec_end);
 		}
 
 		ut_ad(next_mrec <= mrec_end);
@@ -3106,7 +3144,7 @@ all_done:
 			goto func_exit;
 		}
 
-		IORequest	request(IORequest::NO_ENCRYPTION | IORequest::READ);
+		IORequest	request(IORequest::NO_ENCRYPTION | IORequest::READ | IORequest::ROW_LOG);
 
 		byte*		buf = index->online_log->head.block;
 
@@ -3986,7 +4024,7 @@ all_done:
 			goto func_exit;
 		}
 
-		IORequest	request(IORequest::NO_ENCRYPTION | IORequest::READ);
+		IORequest	request(IORequest::NO_ENCRYPTION | IORequest::READ | IORequest::ROW_LOG);
 
 		byte*		buf = index->online_log->head.block;
 

@@ -44,7 +44,7 @@ static Log_event* wsrep_read_log_event(
 
   if (!res)
   {
-    DBUG_ASSERT(error != 0);
+    assert(error != 0);
     sql_print_error("Error in Log_event::read_log_event(): "
                     "'%s', data_len: %d, event_type: %d",
                     error,data_len,head[EVENT_TYPE_OFFSET]);
@@ -86,6 +86,18 @@ static wsrep_cb_status_t wsrep_apply_events(THD*        thd,
 
   DBUG_ENTER("wsrep_apply_events");
 
+  DBUG_EXECUTE_IF("wsrep_applier_sleep_15",
+  {
+    static bool slept_once= false;
+    if (!slept_once)
+    {
+      slept_once= true;
+      WSREP_INFO("Applier sleeping 15 sec");
+      my_sleep(15000000);
+      WSREP_INFO("Applier slept 15 sec");
+    }
+  });
+
   if (thd->killed == THD::KILL_CONNECTION &&
       thd->wsrep_conflict_state != REPLAYING)
   {
@@ -96,7 +108,7 @@ static wsrep_cb_status_t wsrep_apply_events(THD*        thd,
   }
 
   mysql_mutex_lock(&thd->LOCK_wsrep_thd);
-  thd->wsrep_query_state= QUERY_EXEC;
+  wsrep_thd_set_query_state(thd, QUERY_EXEC);
   if (thd->wsrep_conflict_state!= REPLAYING)
     thd->wsrep_conflict_state= NO_CONFLICT;
   mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
@@ -105,6 +117,7 @@ static wsrep_cb_status_t wsrep_apply_events(THD*        thd,
     WSREP_DEBUG("Empty apply event found while processing write-set: %lld",
                 (long long) wsrep_thd_trx_seqno(thd));
 
+  thd->wsrep_bin_log_flag_save = thd->variables.option_bits & OPTION_BIN_LOG;
   while(buf_len)
   {
     int exec_res;
@@ -235,7 +248,7 @@ static wsrep_cb_status_t wsrep_apply_events(THD*        thd,
 
  error:
   mysql_mutex_lock(&thd->LOCK_wsrep_thd);
-  thd->wsrep_query_state= QUERY_IDLE;
+  wsrep_thd_set_query_state(thd, QUERY_IDLE);
   mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
 
   assert(thd->wsrep_exec_mode== REPL_RECV);
@@ -265,8 +278,8 @@ wsrep_cb_status_t wsrep_apply_cb(void* const             ctx,
                      "now "
                      "SIGNAL sync.wsrep_apply_cb_reached "
                      "WAIT_FOR signal.wsrep_apply_cb";
-                   DBUG_ASSERT(!debug_sync_set_action(thd,
-                                                      STRING_WITH_LEN(act)));
+                   assert(!debug_sync_set_action(thd,
+                                                 STRING_WITH_LEN(act)));
                  };);
 
   thd->wsrep_trx_meta = *meta;
@@ -427,6 +440,9 @@ wsrep_cb_status_t wsrep_commit_cb(void*         const     ctx,
     rcode = wsrep_commit(thd);
   else
     rcode = wsrep_rollback(thd);
+
+  thd->variables.option_bits |= thd->wsrep_bin_log_flag_save;
+  thd->wsrep_bin_log_flag_save = 0;
 
   wsrep_set_apply_format(thd, NULL);
   thd->mdl_context.release_transactional_locks();

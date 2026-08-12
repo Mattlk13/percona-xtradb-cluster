@@ -1,13 +1,20 @@
-/* Copyright (c) 2006, 2015, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2006, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -40,7 +47,7 @@ extern "C" int test_if_data_home_dir(const char *dir);
 
 bool stmt_causes_implicit_commit(const THD *thd, uint mask);
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 extern void turn_parser_debug_on();
 #endif
 
@@ -63,7 +70,11 @@ int prepare_schema_table(THD *thd, LEX *lex, Table_ident *table_ident,
                          enum enum_schema_tables schema_table_idx);
 void get_default_definer(THD *thd, LEX_USER *definer);
 LEX_USER *create_default_definer(THD *thd);
+#ifdef WITH_WSREP
+LEX_USER *get_current_user(THD *thd, LEX_USER *user, bool for_rewrite = false);
+#else
 LEX_USER *get_current_user(THD *thd, LEX_USER *user);
+#endif
 bool check_string_char_length(const LEX_CSTRING &str, const char *err_msg,
                               size_t max_char_length, const CHARSET_INFO *cs,
                               bool no_error);
@@ -120,6 +131,8 @@ bool shutdown(THD *thd, enum mysql_enum_shutdown_level level, enum enum_server_c
 extern uint sql_command_flags[];
 extern const LEX_STRING command_name[];
 
+size_t get_command_name_len(void);
+
 // Statement timeout function(s)
 void reset_statement_timer(THD *thd);
 
@@ -156,6 +169,7 @@ inline bool is_supported_parser_charset(const CHARSET_INFO *cs)
 #else
 
 #define WSREP_TO_ISOLATION_BEGIN(db_, table_, table_list_)
+#define WSREP_TO_ISOLATION_BEGIN_ALTER(db_, table_, table_list_, alter_info_, fk_tables_)
 #define WSREP_TO_ISOLATION_END 
 #define WSREP_TO_ISOLATION_BEGIN_WRTCHK(db_, table_, table_list_)
 #define WSREP_SYNC_WAIT(thd_, before_)
@@ -189,7 +203,7 @@ public:
   }
 private:
   ulong m_id;
-  bool  m_daemon_allowed;
+  const bool  m_daemon_allowed;
 };
 
 #ifdef HAVE_REPLICATION
@@ -198,5 +212,7 @@ bool all_tables_not_ok(THD *thd, TABLE_LIST *tables);
 bool some_non_temp_table_to_be_updated(THD *thd, TABLE_LIST *tables);
 
 bool lock_binlog_for_backup(THD *thd);
+
+bool execute_sqlcom_select(THD *thd, TABLE_LIST *all_tables);
 
 #endif /* SQL_PARSE_INCLUDED */

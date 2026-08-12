@@ -1,6 +1,6 @@
 /***********************************************************************
 
-Copyright (c) 1995, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1995, 2023, Oracle and/or its affiliates.
 Copyright (c) 2009, 2017, Percona Inc.
 
 Portions of this file contain modifications contributed and copyrighted
@@ -10,14 +10,21 @@ documentation. The contributions by Percona Inc. are incorporated with
 their permission, and subject to the conditions contained in the file
 COPYING.Percona.
 
-This program is free software; you can redistribute it and/or modify it
-under the terms of the GNU General Public License as published by the
-Free Software Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but
-WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
-Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -266,11 +273,26 @@ struct Compression {
 #endif /* UNIV_DEBUG */
 	}
 
+	/** Version of compressed page */
+	static const uint8_t FIL_PAGE_VERSION_1 = 1;
+	static const uint8_t FIL_PAGE_VERSION_2 = 2;
+
 	/** Check the page header type field.
 	@param[in]	page		Page contents
 	@return true if it is a compressed page */
 	static bool is_compressed_page(const byte* page)
 		MY_ATTRIBUTE((warn_unused_result));
+
+	/** Check the page header type field.
+	@param[in]   page            Page contents
+	@return true if it is a compressed and encrypted page */
+	static bool is_compressed_encrypted_page(const byte *page)
+		MY_ATTRIBUTE((warn_unused_result));
+
+	/** Check if the version on page is valid.
+	@param[in]   version         version
+	@return true if version is valid */
+	static bool is_valid_page_version(uint8_t version);
 
         /** Check wether the compression algorithm is supported.
         @param[in]      algorithm       Compression algorithm to check
@@ -355,6 +377,10 @@ static const char ENCRYPTION_KEY_MAGIC_V1[] = "lCA";
 version. */
 static const char ENCRYPTION_KEY_MAGIC_V2[] = "lCB";
 
+/** Encryption magic bytes for 5.7.28+, it's for checking the encryption information
+version. */
+static const char ENCRYPTION_KEY_MAGIC_V3[] = "lCC";
+
 static const char ENCRYPTION_KEY_MAGIC_PS_V1[] = "PSA";
 
 /** Encryption magic bytes for rotated redo log encryption, it's for checking the 
@@ -433,6 +459,9 @@ struct Encryption {
 
 		/** Version in > 5.7.11 */
 		ENCRYPTION_VERSION_2 = 1,
+
+		/** Version in > 5.7.29 */
+		ENCRYPTION_VERSION_3 = 2,
 	};
 
 	/** Default constructor */
@@ -810,8 +839,6 @@ private:
 struct Zip_compressed_info
 {
   bool is_zip_compressed;
-
-
 };
 
 /**
@@ -859,8 +886,11 @@ public:
 		and the truncate redo log. */
 		NO_COMPRESSION = 512,
 
+		/** Row log used in online DDL */
+		ROW_LOG = 1024,
+
 		/** Force write of decrypted pages in encrypted tablespace. */
-		NO_ENCRYPTION = 1024
+		NO_ENCRYPTION = 2048
 	};
 
 	/** Default constructor */
@@ -888,7 +918,7 @@ public:
                 m_is_page_zip_compressed(false),
                 m_zip_page_physical_size(0)
 	{
-		if (is_log()) {
+		if (is_log() || is_row_log()) {
 			disable_compression();
 		}
 
@@ -926,6 +956,13 @@ public:
 		MY_ATTRIBUTE((warn_unused_result))
 	{
 		return((m_type & LOG) == LOG);
+	}
+
+	/** @return true if it is a row log entry used in online DDL */
+	bool is_row_log() const
+		MY_ATTRIBUTE((warn_unused_result))
+	{
+		return((m_type & ROW_LOG) == ROW_LOG);
 	}
 
 	/** @return true if the simulated AIO thread should be woken up */
@@ -1078,7 +1115,7 @@ public:
 	}
 
 	/** @return true if the page write should not be encrypted */
-	MY_NODISCARD bool is_encryption_disabled() const
+	bool is_encryption_disabled() const MY_NODISCARD
 	{
 		return((m_type & NO_ENCRYPTION) != 0);
 	}
@@ -2194,11 +2231,8 @@ future.
 @param[in]	advice	advice for access pattern
 @return true if success */
 bool
-os_file_advise(
-	pfs_os_file_t   file,   /*!< in, own: handle to a file */
-	os_offset_t     offset, /*!< in: file region offset  */
-	os_offset_t     len,    /*!< in: file region length  */
-	ulint		advice);/*!< in: advice for access pattern */
+os_file_advise(pfs_os_file_t file, os_offset_t offset, os_offset_t len,
+               ulint advice);
 
 /** Gets a file size.
 @param[in]	file		handle to a file

@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 1997, 2017, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1997, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -22,6 +30,8 @@ Purge obsolete records
 
 Created 3/14/1997 Heikki Tuuri
 *******************************************************/
+
+#include <debug_sync.h>
 
 #include "row0purge.h"
 
@@ -69,18 +79,21 @@ row_purge_node_create(
 	que_thr_t*	parent,
 	mem_heap_t*	heap)
 {
-	purge_node_t*	node;
-
 	ut_ad(parent != NULL);
 	ut_ad(heap != NULL);
+
+	purge_node_t*	node;
 
 	node = static_cast<purge_node_t*>(
 		mem_heap_zalloc(heap, sizeof(*node)));
 
 	node->common.type = QUE_NODE_PURGE;
 	node->common.parent = parent;
-	node->done = TRUE;
+	node->done = true;
+
 	node->heap = mem_heap_create(256);
+
+	node->recs = NULL;
 
 	return(node);
 }
@@ -100,7 +113,8 @@ row_purge_reposition_pcur(
 	if (node->found_clust) {
 		ut_ad(node->validate_pcur());
 
-		node->found_clust = btr_pcur_restore_position(mode, &node->pcur, mtr);
+		node->found_clust =
+		    btr_pcur_restore_position(mode, &node->pcur, mtr);
 
 	} else {
 		node->found_clust = row_search_on_row_ref(
@@ -170,6 +184,16 @@ row_purge_remove_clust_if_poss_low(
 	} else {
 		dberr_t	err;
 		ut_ad(mode == (BTR_MODIFY_TREE | BTR_LATCH_FOR_DELETE));
+
+		DBUG_EXECUTE_IF("pessimistic_row_purge_clust", {
+			const char act[] =
+				"now SIGNAL pessimistic_row_purge_clust_pause "
+				"WAIT_FOR pessimistic_row_purge_clust_continue";
+			assert(opt_debug_sync_timeout > 0);
+			assert(!debug_sync_set_action(
+				       current_thd, STRING_WITH_LEN(act)));
+		});
+
 		btr_cur_pessimistic_delete(
 			&err, FALSE, btr_pcur_get_btr_cur(&node->pcur), 0,
 			false, &mtr);
@@ -878,7 +902,13 @@ try_again:
 		ib::info() << "Record with space id "
 			   << node->table->space
 			   << " belongs to table which is being truncated"
+			   << " or tablespace which is missing"
 			   << " therefore skipping this undo record.";
+		if (dict_table_is_encrypted(node->table)) {
+
+			ib::info() << "Skipped record belongs to encrypted tablespace,"
+				   << " Check if the keyring plugin is loaded.";
+		}
 #endif
 		ut_ad(dict_table_is_file_per_table(node->table));
 		dict_table_close(node->table, FALSE, FALSE);
@@ -942,14 +972,14 @@ err_exit:
 		goto close_exit;
 	}
 
-	ptr = trx_undo_rec_get_row_ref(ptr, clust_index, &(node->ref),
-				       node->heap);
+	ptr = trx_undo_rec_get_row_ref(
+		ptr, clust_index, &(node->ref), node->heap);
 
 	trx = thr_get_trx(thr);
 
-	ptr = trx_undo_update_rec_get_update(ptr, clust_index, type, trx_id,
-					     roll_ptr, info_bits, trx,
-					     node->heap, &(node->update));
+	ptr = trx_undo_update_rec_get_update(
+		ptr, clust_index, type, trx_id, roll_ptr, info_bits, trx,
+		node->heap, &(node->update));
 
 	/* Read to the partial row the fields that occur in indexes */
 
@@ -1040,39 +1070,41 @@ row_purge(
 	trx_undo_rec_t*	undo_rec,	/*!< in: record to purge */
 	que_thr_t*	thr)		/*!< in: query thread */
 {
-	if (undo_rec != &trx_purge_dummy_rec) {
-		bool	updated_extern;
+	bool	updated_extern;
 
-		while (row_purge_parse_undo_rec(
-			       node, undo_rec, &updated_extern, thr)) {
+	while (row_purge_parse_undo_rec(node, undo_rec, &updated_extern, thr)) {
 
-			bool purged = row_purge_record(
-				node, undo_rec, thr, updated_extern);
+		bool purged;
 
-			rw_lock_s_unlock(dict_operation_lock);
+		purged = row_purge_record(node, undo_rec, thr, updated_extern);
 
-			if (purged
-			    || srv_shutdown_state != SRV_SHUTDOWN_NONE) {
-				return;
-			}
+		rw_lock_s_unlock(dict_operation_lock);
 
-			/* Retry the purge in a second. */
-			os_thread_sleep(1000000);
+		if (purged || srv_shutdown_state != SRV_SHUTDOWN_NONE) {
+			return;
 		}
+
+		/* Retry the purge in a second. */
+		os_thread_sleep(1000000);
 	}
 }
 
-/***********************************************************//**
-Reset the purge query thread. */
-UNIV_INLINE
+/** Explicitly call the destructor, this is to get around Clang bug#12350.
+@param[in,out]	p		Instance on which to call the destructor */
+template<typename T>
 void
-row_purge_end(
-/*==========*/
-	que_thr_t*	thr)	/*!< in: query thread */
+call_destructor(T* p)
+{
+	p->~T();
+}
+
+/** Reset the purge query thread.
+@param[in,out]	thr		The query thread to execute */
+static
+void
+row_purge_end(que_thr_t* thr)
 {
 	purge_node_t*	node;
-
-	ut_ad(thr);
 
 	node = static_cast<purge_node_t*>(thr->run_node);
 
@@ -1080,27 +1112,34 @@ row_purge_end(
 
 	thr->run_node = que_node_get_parent(node);
 
-	node->undo_recs = NULL;
+	if (node->recs != NULL) {
 
-	node->done = TRUE;
+		ut_ad(node->recs->empty());
+
+		/* Note: We call the destructor explicitly here, but don't
+		want to free the memory. The Recs (and rows contained within)
+		were allocated from the purge_sys->heap */
+
+		call_destructor(node->recs);
+
+		node->recs = NULL;
+	}
+
+	node->done = true;
 
 	ut_a(thr->run_node != NULL);
 
 	mem_heap_empty(node->heap);
 }
 
-/***********************************************************//**
-Does the purge operation for a single undo log record. This is a high-level
+/** Does the purge operation for a single undo log record. This is a high-level
 function used in an SQL execution graph.
+@param[in,out]	thr		The query thread to execute
 @return query thread to run next or NULL */
 que_thr_t*
-row_purge_step(
-/*===========*/
-	que_thr_t*	thr)	/*!< in: query thread */
+row_purge_step(que_thr_t* thr)
 {
 	purge_node_t*	node;
-
-	ut_ad(thr);
 
 	node = static_cast<purge_node_t*>(thr->run_node);
 
@@ -1117,17 +1156,17 @@ row_purge_step(
 
 	ut_ad(que_node_get_type(node) == QUE_NODE_PURGE);
 
-	if (!(node->undo_recs == NULL || ib_vector_is_empty(node->undo_recs))) {
-		trx_purge_rec_t*purge_rec;
+	if (node->recs != NULL && !node->recs->empty()) {
+		purge_node_t::rec_t	rec;
 
-		purge_rec = static_cast<trx_purge_rec_t*>(
-			ib_vector_pop(node->undo_recs));
+		rec = node->recs->back();
+		node->recs->pop_back();
 
-		node->roll_ptr = purge_rec->roll_ptr;
+		node->roll_ptr = rec.roll_ptr;
 
-		row_purge(node, purge_rec->undo_rec, thr);
+		row_purge(node, rec.undo_rec, thr);
 
-		if (ib_vector_is_empty(node->undo_recs)) {
+		if (node->recs->empty()) {
 			row_purge_end(thr);
 		} else {
 			thr->run_node = node;
@@ -1136,9 +1175,12 @@ row_purge_step(
 		row_purge_end(thr);
 	}
 
-	if (thr->prebuilt !=0 && thr->prebuilt->compress_heap != 0) {
-		mem_heap_empty(thr->prebuilt->compress_heap);
+	/* We use blob_heap to decompress compressed column. */
+	if (thr->prebuilt !=0 && thr->prebuilt->blob_heap != 0) {
+		mem_heap_empty(thr->prebuilt->blob_heap);
 	}
+	/* compress_heap was not used */
+	ut_ad(thr->prebuilt == 0 || thr->prebuilt->compress_heap == 0);
 
 	return(thr);
 }

@@ -1,13 +1,20 @@
-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2025, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -57,7 +64,9 @@ using std::vector;
 #include <memory>
 #include "mysql/thread_type.h"
 
+#ifdef WITH_WSREP
 #include "log.h"
+#endif /* WITH_WSREP */
 #include "violite.h"                       /* SSL_handle */
 
 #include "query_strip_comments.h"
@@ -74,6 +83,7 @@ struct wsrep_thd_shadow {
   LEX_CSTRING          db;
   struct timeval       user_time;
   longlong             row_count_func;
+  Relay_log_info       * rli_slave;
 };
 #endif /* WITH_WSREP */
 
@@ -87,6 +97,7 @@ typedef struct st_mysql_lex_string LEX_STRING;
 typedef struct user_conn USER_CONN;
 
 extern ulong kill_idle_transaction_timeout;
+extern PSI_mutex_key key_LOCK_bloom_filter;
 
 /**
   The meat of thd_proc_info(THD*, char*), a macro that packs the last
@@ -259,11 +270,11 @@ enum enum_binlog_format {
 };
 
 #ifdef WITH_WSREP
-#define WSREP_BINLOG_FORMAT(my_format)                         \
-   ((wsrep_forced_binlog_format != BINLOG_FORMAT_UNSPEC) ?     \
-   wsrep_forced_binlog_format : my_format)
-#else
-#define WSREP_BINLOG_FORMAT(my_format) my_format
+#define WSREP_BINLOG_FORMAT(thd, my_format)                                 \
+   ((thd->wsrep_forced_binlog_format_override() != BINLOG_FORMAT_UNSPEC) ?  \
+     thd->wsrep_forced_binlog_format_override() :                           \
+     ((wsrep_forced_binlog_format != BINLOG_FORMAT_UNSPEC) ?                \
+       wsrep_forced_binlog_format : my_format))
 #endif /* WITH_WSREP */
 
 /* Bits for different SQL modes modes (including ANSI mode) */
@@ -347,7 +358,7 @@ public:
   CSET_STRING(const char *str_arg, size_t length_arg, const CHARSET_INFO *cs_arg) :
   cs(cs_arg)
   {
-    DBUG_ASSERT(cs_arg != NULL);
+    assert(cs_arg != NULL);
     string.str= str_arg;
     string.length= length_arg;
   }
@@ -539,7 +550,7 @@ class Time_zone;
 #define THD_SENTRY_MAGIC 0xfeedd1ff
 #define THD_SENTRY_GONE  0xdeadbeef
 
-#define THD_CHECK_SENTRY(thd) DBUG_ASSERT(thd->dbug_sentry == THD_SENTRY_MAGIC)
+#define THD_CHECK_SENTRY(thd) assert(thd->dbug_sentry == THD_SENTRY_MAGIC)
 
 typedef ulonglong sql_mode_t;
 
@@ -696,7 +707,7 @@ typedef struct system_variables
   my_bool sysdate_is_now;
   my_bool binlog_rows_query_log_events;
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   ulonglong query_exec_time;
   double    query_exec_time_double;
 #endif
@@ -704,12 +715,12 @@ typedef struct system_variables
   ulonglong log_slow_filter;
   ulonglong log_slow_verbosity;
 
-  ulong      innodb_io_reads;
-  ulonglong  innodb_io_read;
-  ulong      innodb_io_reads_wait_timer;
-  ulong      innodb_lock_que_wait_timer;
-  ulong      innodb_innodb_que_wait_timer;
-  ulong      innodb_page_access;
+  ulong     innodb_io_reads;
+  ulonglong innodb_io_read;
+  uint64_t  innodb_io_reads_wait_timer;
+  uint64_t  innodb_lock_que_wait_timer;
+  uint64_t  innodb_innodb_que_wait_timer;
+  ulong     innodb_page_access;
 
 #ifdef WITH_WSREP
   my_bool wsrep_on;
@@ -892,7 +903,7 @@ int unlock_keyrings(THD *thd);
 #ifdef MYSQL_SERVER
 
 /* The following macro is to make init of Query_arena simpler */
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 #define INIT_ARENA_DBUG_INFO is_backup_arena= 0; is_reprepared= FALSE;
 #else
 #define INIT_ARENA_DBUG_INFO
@@ -907,7 +918,7 @@ public:
   */
   Item *free_list;
   MEM_ROOT *mem_root;                   // Pointer to current memroot
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   bool is_backup_arena; /* True if this arena is used for backup. */
   bool is_reprepared;
 #endif
@@ -970,6 +981,13 @@ public:
   { return strdup_root(mem_root,str); }
   inline char *strmake(const char *str, size_t size)
   { return strmake_root(mem_root,str,size); }
+  inline LEX_CSTRING strmake(LEX_CSTRING str)
+  {
+    LEX_CSTRING ret;
+    ret.str= strmake(str.str, str.length);
+    ret.length= ret.str ? str.length : 0;
+    return ret;
+  }
   inline void *memdup(const void *str, size_t size)
   { return memdup_root(mem_root,str,size); }
 
@@ -1079,7 +1097,7 @@ enum enum_locked_tables_mode
   LTM_PRELOCKED_UNDER_LOCK_TABLES
 };
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 /**
   Getter for the enum enum_locked_tables_mode
   @param locked_tables_mode enum for types of locked tables mode
@@ -1284,13 +1302,13 @@ public:
   ulong      tmp_tables_disk_used;
   ulonglong  tmp_tables_size;
 
-  bool       innodb_was_used;
-  ulong      innodb_io_reads;
-  ulonglong  innodb_io_read;
-  ulong      innodb_io_reads_wait_timer;
-  ulong      innodb_lock_que_wait_timer;
-  ulong      innodb_innodb_que_wait_timer;
-  ulong      innodb_page_access;
+  bool      innodb_was_used;
+  ulong     innodb_io_reads;
+  ulonglong innodb_io_read;
+  uint64_t  innodb_io_reads_wait_timer;
+  uint64_t  innodb_lock_que_wait_timer;
+  uint64_t  innodb_innodb_que_wait_timer;
+  ulong     innodb_page_access;
 
   ulong      query_plan_flags;
   ulong      query_plan_fsort_passes;
@@ -1586,7 +1604,11 @@ public:
       m_mdl_blocks_commits_lock(NULL)
   {}
 
+#ifdef WITH_WSREP
   bool lock_global_read_lock(THD *thd, bool *own_lock);
+#else
+  bool lock_global_read_lock(THD *thd);
+#endif /* WITH_WSREP */
   void unlock_global_read_lock(THD *thd);
 
   /**
@@ -1732,26 +1754,32 @@ class Bloom_filter {
 
   typedef std::bitset<SIZE> Bit_set;
 
-  /** The bit set, which is allocated in a MEM_ROOT */
-  Bit_set *bit_set;
+
+  Bit_set* bit_set;
+  // Protects the bit set from concurrent assignment
+  mysql_mutex_t LOCK_bit_set;
 
   // Non-copyable
   Bloom_filter (const Bloom_filter &);
   Bloom_filter & operator = (const Bloom_filter &);
 
  public:
-  Bloom_filter() : bit_set(NULL) {}
+  Bloom_filter() : bit_set(NULL) {
+    mysql_mutex_init(key_LOCK_bloom_filter,
+                     &LOCK_bit_set, MY_MUTEX_INIT_FAST);
+  }
 
-  ~Bloom_filter()
-  {
-    // Do not delete, just destruct, due to MEM_ROOT allocation
-    bit_set->~bitset();
+  ~Bloom_filter() {
+    clear();
+    mysql_mutex_destroy(&LOCK_bit_set);
   }
 
   void clear()
   {
-    // Do not delete, just force new MEM_ROOT allocation on the next use
+    mysql_mutex_lock(&LOCK_bit_set);
+    delete bit_set;
     bit_set= NULL;
+    mysql_mutex_unlock(&LOCK_bit_set);
   }
 
   /**
@@ -1764,23 +1792,22 @@ class Bloom_filter {
      @return if true, the key might be a member of the set. If false, the key
      is definitely not a member of the set.
   */
-  bool test_and_set(MEM_ROOT *mem_root, ulong key)
+  bool test_and_set(ulong key)
   {
-    if (!bit_set)
+    mysql_mutex_lock(&LOCK_bit_set);
+    if (bit_set == NULL)
     {
-      void *bit_set_place= alloc_root(mem_root, sizeof(Bit_set));
-      // FIXME: memory allocation failure is eaten silently. Nonexact stats are
-      // the least of the concerns then.
-      if (!bit_set_place)
-        return false;
-      bit_set= new (bit_set_place) Bit_set();
+      bit_set= new Bit_set();
     }
     // Duplicating ut_hash_ulint calculation
     const ulong pos= (key ^ 1653893711) % SIZE;
-    DBUG_ASSERT(pos < SIZE);
-    if (bit_set->test(pos))
+    assert(pos < SIZE);
+    if (bit_set->test(pos)) {
+      mysql_mutex_unlock(&LOCK_bit_set);
       return false;
+    }
     bit_set->set(pos);
+    mysql_mutex_unlock(&LOCK_bit_set);
     return true;
   }
 };
@@ -1797,16 +1824,16 @@ class THD :public MDL_context_owner,
 {
 private:
   inline bool is_stmt_prepare() const
-  { DBUG_ASSERT(0); return Query_arena::is_stmt_prepare(); }
+  { assert(0); return Query_arena::is_stmt_prepare(); }
 
   inline bool is_stmt_prepare_or_first_sp_execute() const
-  { DBUG_ASSERT(0); return Query_arena::is_stmt_prepare_or_first_sp_execute(); }
+  { assert(0); return Query_arena::is_stmt_prepare_or_first_sp_execute(); }
 
   inline bool is_stmt_prepare_or_first_stmt_execute() const
-  { DBUG_ASSERT(0); return Query_arena::is_stmt_prepare_or_first_stmt_execute(); }
+  { assert(0); return Query_arena::is_stmt_prepare_or_first_stmt_execute(); }
 
   inline bool is_conventional() const
-  { DBUG_ASSERT(0); return Query_arena::is_conventional(); }
+  { assert(0); return Query_arena::is_conventional(); }
 
 public:
   MDL_context mdl_context;
@@ -1851,7 +1878,7 @@ private:
   */
   LEX_CSTRING m_query_string;
   String m_normalized_query;
-
+  volatile int32 m_safe_to_display;
   /**
     Currently selected catalog.
   */
@@ -1871,8 +1898,6 @@ private:
   */
   LEX_CSTRING m_db;
 
-public:
-
   /**
     In some cases, we may want to modify the query (i.e. replace
     passwords with their hashes before logging the statement etc.).
@@ -1887,8 +1912,17 @@ public:
     may follow at a later date, both pre- and post parsing of the query.
     Rewriting of binloggable statements must preserve all pertinent
     information.
+
+    Similar restrictions as for m_query_string (see there) hold for locking:
+    - Value may only be (re)set from owning thread (current_thd)
+    - Value must be modified using (reset|swap)_rewritten_query().
+      Doing so will protect the update with LOCK_thd_query.
+    - The owner (current_thd) may read the value without holding the lock.
+    - Other threads may read the value, but must hold LOCK_thd_query to do so.
   */
-  String      rewritten_query;
+  String      m_rewritten_query;
+
+public:
 
   /* Used to execute base64 coded binlog events in MySQL server */
   Relay_log_info* rli_fake;
@@ -2006,7 +2040,7 @@ public:
   */
   void save_current_query_costs()
   {
-    DBUG_ASSERT(!status_var_aggregated);
+    assert(!status_var_aggregated);
     status_var.last_query_cost= m_current_query_cost;
     status_var.last_query_partial_plans= m_current_query_partial_plans;
   }
@@ -2120,7 +2154,7 @@ public:
 
   SSL_handle get_ssl() const
   {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     if (current_thd != this)
     {
       /*
@@ -2141,8 +2175,8 @@ public:
   */
   Protocol_classic *get_protocol_classic() const
   {
-    DBUG_ASSERT(m_protocol->type() == Protocol::PROTOCOL_TEXT ||
-                m_protocol->type() == Protocol::PROTOCOL_BINARY);
+    assert(m_protocol->type() == Protocol::PROTOCOL_TEXT ||
+           m_protocol->type() == Protocol::PROTOCOL_BINARY);
 
     return (Protocol_classic *) m_protocol;
   }
@@ -2190,7 +2224,7 @@ public:
   public:
     /// Asserts that current_thd has locked this plan, if it does not own it.
     void assert_plan_is_locked_if_other() const
-#ifdef DBUG_OFF
+#ifdef NDEBUG
     {}
 #else
     ;
@@ -2275,7 +2309,7 @@ public:
     chapter 'Miscellaneous functions', for functions GET_LOCK, RELEASE_LOCK.
   */
   HASH ull_hash;
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   uint dbug_sentry; // watch out for memory corruption
 #endif
   bool is_killable;
@@ -2352,12 +2386,12 @@ public:
     Following Variables innodb_*** (is |should be) different from
     default values only if (innodb_was_used==true)
   */
-  ulonglong  innodb_trx_id;
-  ulong      innodb_io_reads;
-  ulonglong  innodb_io_read;
-  ulong      innodb_io_reads_wait_timer;
-  ulong      innodb_lock_que_wait_timer;
-  ulong      innodb_innodb_que_wait_timer;
+  ulonglong innodb_trx_id;
+  ulong     innodb_io_reads;
+  ulonglong innodb_io_read;
+  uint64_t  innodb_io_reads_wait_timer;
+  uint64_t  innodb_lock_que_wait_timer;
+  uint64_t  innodb_innodb_que_wait_timer;
 
  private:
   /*
@@ -2371,15 +2405,15 @@ public:
 
   void mark_innodb_used(ulonglong trx_id)
   {
-    DBUG_ASSERT(innodb_slow_log_enabled());
-    DBUG_ASSERT(innodb_trx_id == 0 || innodb_trx_id == trx_id || trx_id == 0);
+    assert(innodb_slow_log_enabled());
+    assert(innodb_trx_id == 0 || innodb_trx_id == trx_id || trx_id == 0);
     if (trx_id) innodb_trx_id= trx_id;
     innodb_was_used= true;
   }
 
   void access_distinct_page(ulong page_id)
   {
-    if (approx_distinct_pages.test_and_set(&main_mem_root, page_id))
+    if (approx_distinct_pages.test_and_set(page_id))
       innodb_page_access++;
   }
 
@@ -2520,10 +2554,14 @@ public:
     format.
    */
   int is_current_stmt_binlog_format_row() const {
-    DBUG_ASSERT(current_stmt_binlog_format == BINLOG_FORMAT_STMT ||
-                current_stmt_binlog_format == BINLOG_FORMAT_ROW);
-    return (WSREP_BINLOG_FORMAT((ulong)current_stmt_binlog_format) ==
+    assert(current_stmt_binlog_format == BINLOG_FORMAT_STMT ||
+           current_stmt_binlog_format == BINLOG_FORMAT_ROW);
+#ifdef WITH_WSREP
+    return (WSREP_BINLOG_FORMAT(this, (ulong)current_stmt_binlog_format) ==
             BINLOG_FORMAT_ROW);
+#else
+    return current_stmt_binlog_format == BINLOG_FORMAT_ROW;
+#endif /* WITH_WSREP */
   }
 
   bool is_current_stmt_binlog_disabled() const;
@@ -2556,13 +2594,13 @@ public:
 
   inline void clear_binlog_local_stmt_filter()
   {
-    DBUG_ASSERT(m_binlog_filter_state == BINLOG_FILTER_UNKNOWN);
+    assert(m_binlog_filter_state == BINLOG_FILTER_UNKNOWN);
     m_binlog_filter_state= BINLOG_FILTER_CLEAR;
   }
 
   inline void set_binlog_local_stmt_filter()
   {
-    DBUG_ASSERT(m_binlog_filter_state == BINLOG_FILTER_UNKNOWN);
+    assert(m_binlog_filter_state == BINLOG_FILTER_UNKNOWN);
     m_binlog_filter_state= BINLOG_FILTER_SET;
   }
 
@@ -2647,6 +2685,8 @@ private:
   NET     net;                          // client connection descriptor
   String  packet;                       // dynamic buffer for network I/O
 public:
+  const NET *get_net() const { return &net; }
+
   void set_skip_readonly_check()
   {
     skip_readonly_check= true;
@@ -3266,7 +3306,7 @@ public:
   void set_trans_pos(const char *file, my_off_t pos)
   {
     DBUG_ENTER("THD::set_trans_pos");
-    DBUG_ASSERT(((file == 0) && (pos == 0)) || ((file != 0) && (pos != 0)));
+    assert(((file == 0) && (pos == 0)) || ((file != 0) && (pos != 0)));
     if (file)
     {
       DBUG_PRINT("enter", ("file: %s, pos: %llu", file, pos));
@@ -3274,7 +3314,7 @@ public:
       m_trans_log_file= file + dirname_length(file);
       if (!m_trans_fixed_log_file)
         m_trans_fixed_log_file= (char*) alloc_root(&main_mem_root, FN_REFLEN+1);
-      DBUG_ASSERT(strlen(m_trans_log_file) <= FN_REFLEN);
+      assert(strlen(m_trans_log_file) <= FN_REFLEN);
       strcpy(m_trans_fixed_log_file, m_trans_log_file);
     }
     else
@@ -3327,6 +3367,7 @@ public:
   {
     CE_NONE= 0,
     CE_FLUSH_ERROR,
+    CE_FLUSH_GNO_EXHAUSTED_ERROR,
     CE_SYNC_ERROR,
     CE_COMMIT_ERROR,
     CE_ERROR_COUNT
@@ -3511,6 +3552,7 @@ public:
   } binlog_evt_union;
 
 #ifdef WITH_WSREP
+  ulonglong                 wsrep_bin_log_flag_save;
   const bool                wsrep_applier; /* dedicated slave applier thread */
   bool                      wsrep_applier_closing; /* applier marked to close */
   bool                      wsrep_client_thread; /* to identify client threads*/
@@ -3565,7 +3607,11 @@ public:
   /* DDL statement. skip registering wsrep_hton handler.
   This is normally blocked by checking wsrep_exec_state != TOTAL_ORDER
   but if sql_log_bin = 0 then the state is not set and DDL should is expected
-  not be replicated. This variable helps identify situation like these. */
+  not be replicated. This variable helps identify situation like these.
+
+  As a side-effect, this variable is used to determine if the thread is
+  in TO isolation (see wsrep_is_in_to_isolation()).
+  While this is set to true, the thread cannot be interrupted/killed. */
   bool                      wsrep_skip_wsrep_hton;
 
   /* This field is set when wsrep try to do an intermediate special
@@ -3605,7 +3651,7 @@ public:
    */
   void set_wsrep_next_trx_id(query_id_t query_id)
   {
-    DBUG_ASSERT(wsrep_ws_handle.trx_id == WSREP_UNDEFINED_TRX_ID);
+    assert(wsrep_ws_handle.trx_id == WSREP_UNDEFINED_TRX_ID);
     m_wsrep_next_trx_id = (wsrep_trx_id_t) query_id;
   }
 
@@ -3617,6 +3663,11 @@ public:
     return m_wsrep_next_trx_id;
   }
 
+  ulong wsrep_forced_binlog_format_override() const
+  {
+    return m_wsrep_forced_binlog_format_override;
+  }
+
 private:
   /* Imagine this be a query-id that is assigned to all statements
   including non-replicating statement like SELECT/SET.
@@ -3624,6 +3675,24 @@ private:
   For data-changing DML statement wsrep_ws_handle trx_id is set
   to real-transaction-id. */
   wsrep_trx_id_t m_wsrep_next_trx_id; /* cast from query_id_t */
+
+  /**
+    Used for overriding wsrep_forced_binlog_format variable per session.
+
+    Main idea: stay unspecified most part of time (BINLOG_FORMAT_UNSPEC),
+    but after clear_current_stmt_binlog_format_row become BINLOG_FORMAT_STMT
+    to override global variable. And after set_current_stmt_binlog_format_row
+    become unspeficied again.
+
+    Because wsrep_forced_binlog_format is also used for overriding original
+    binlog format, this is pretty tricky logic. Probably it should be refactored,
+    but because wsrep_forced_binlog_format is deprecated, that's considered OK.
+
+    @see WSREP_BINLOG_FORMAT
+    @see set_current_stmt_binlog_format_row
+    @see clear_current_stmt_binlog_format_row
+  */
+  ulong m_wsrep_forced_binlog_format_override;
 public:
 #endif /* WITH_WSREP */
   /**
@@ -3890,13 +3959,16 @@ public:
 
 #ifdef HAVE_PSI_THREAD_INTERFACE
     PSI_THREAD_CALL(set_thread_start_time)(start_time.tv_sec);
+    PSI_THREAD_CALL(set_thread_start_time_usec)(start_utime);
 #endif
   }
   inline void set_current_time()
   {
-    my_micro_time_to_timeval(my_micro_time(), &start_time);
+    start_utime= utime_after_lock= my_micro_time();
+    my_micro_time_to_timeval(start_utime, &start_time);
 #ifdef HAVE_PSI_THREAD_INTERFACE
     PSI_THREAD_CALL(set_thread_start_time)(start_time.tv_sec);
+    PSI_THREAD_CALL(set_thread_start_time_usec)(start_utime);
 #endif
   }
   inline void set_time(const struct timeval *t)
@@ -3905,9 +3977,10 @@ public:
     start_utime= utime_after_lock= my_micro_time();
 #ifdef HAVE_PSI_THREAD_INTERFACE
     PSI_THREAD_CALL(set_thread_start_time)(start_time.tv_sec);
+    PSI_THREAD_CALL(set_thread_start_time_usec)(start_utime);
 #endif
   }
-  void get_time(QUERY_START_TIME_INFO *time_info)
+  void get_time(QUERY_START_TIME_INFO *time_info) const
   {
     time_info->start_time= start_time;
     time_info->start_utime= start_utime;
@@ -4120,7 +4193,7 @@ public:
   */
   inline void fatal_error()
   {
-    DBUG_ASSERT(get_stmt_da()->is_error() || killed);
+    assert(get_stmt_da()->is_error() || killed);
     is_fatal_error= 1;
     DBUG_PRINT("error",("Fatal error set"));
   }
@@ -4321,6 +4394,12 @@ public:
   /**
     @return true if there is an active attachable transaction.
   */
+  int is_attachable_transaction_active() const
+  { return m_attachable_trx != NULL; }
+
+  /**
+    @return true if there is an active attachable readonly transaction.
+  */
   bool is_attachable_ro_transaction_active() const
   { return m_attachable_trx != NULL && m_attachable_trx->is_read_only(); }
 
@@ -4344,7 +4423,7 @@ public:
       statement, remove the big comment below that, and remove the
       in_sub_stmt==0 condition from the following 'if'.
     */
-    /* DBUG_ASSERT(in_sub_stmt == 0); */
+    /* assert(in_sub_stmt == 0); */
     /*
       If in a stored/function trigger, the caller should already have done the
       change. We test in_sub_stmt to prevent introducing bugs where people
@@ -4354,7 +4433,11 @@ public:
       tests fail and so force them to propagate the
       lex->binlog_row_based_if_mixed upwards to the caller.
     */
-    if ((WSREP_BINLOG_FORMAT(variables.binlog_format) == BINLOG_FORMAT_MIXED)&&
+#ifdef WITH_WSREP
+    if ((WSREP_BINLOG_FORMAT(this, variables.binlog_format) == BINLOG_FORMAT_MIXED) &&
+#else
+    if ((variables.binlog_format == BINLOG_FORMAT_MIXED) &&
+#endif /* WITH_WSREP */
         (in_sub_stmt == 0))
       set_current_stmt_binlog_format_row();
 
@@ -4363,12 +4446,20 @@ public:
   inline void set_current_stmt_binlog_format_row()
   {
     DBUG_ENTER("set_current_stmt_binlog_format_row");
+#ifdef WITH_WSREP
+    m_wsrep_forced_binlog_format_override= BINLOG_FORMAT_UNSPEC;
+#endif
     current_stmt_binlog_format= BINLOG_FORMAT_ROW;
     DBUG_VOID_RETURN;
   }
   inline void clear_current_stmt_binlog_format_row()
   {
     DBUG_ENTER("clear_current_stmt_binlog_format_row");
+#ifdef WITH_WSREP
+    if (wsrep_forced_binlog_format != BINLOG_FORMAT_UNSPEC &&
+        wsrep_forced_binlog_format != BINLOG_FORMAT_STMT)
+      m_wsrep_forced_binlog_format_override= BINLOG_FORMAT_STMT;
+#endif
     current_stmt_binlog_format= BINLOG_FORMAT_STMT;
     DBUG_VOID_RETURN;
   }
@@ -4381,7 +4472,11 @@ public:
                 show_system_thread(system_thread)));
     if (in_sub_stmt == 0)
     {
-      if (WSREP_BINLOG_FORMAT(variables.binlog_format) == BINLOG_FORMAT_ROW)
+#ifdef WITH_WSREP
+      if (WSREP_BINLOG_FORMAT(this, variables.binlog_format) == BINLOG_FORMAT_ROW)
+#else
+      if (variables.binlog_format == BINLOG_FORMAT_ROW)
+#endif /* WITH_WSREP */
         set_current_stmt_binlog_format_row();
       else
         clear_current_stmt_binlog_format_row();
@@ -4694,7 +4789,7 @@ public:
 #ifdef HAVE_GTID_NEXT_LIST
       owned_gtid_set.clear();
 #else
-      DBUG_ASSERT(0);
+      assert(0);
 #endif
     }
     owned_gtid.clear();
@@ -4822,15 +4917,6 @@ public:
     return false;
   }
   thd_scheduler event_scheduler;
-
-  /* Returns string as 'IP:port' for the client-side
-     of the connnection represented
-     by 'client' as displayed by SHOW PROCESSLIST.
-     Allocates memory from the heap of
-     this THD and that is not reclaimed
-     immediately, so use sparingly. May return NULL.
-  */
-  char *get_client_host_port(THD *client);
 
 public:
   /**
@@ -4975,7 +5061,7 @@ public:
   */
   const LEX_CSTRING &query() const
   {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     if (current_thd != this)
       mysql_mutex_assert_owner(&LOCK_thd_query);
 #endif
@@ -5002,6 +5088,39 @@ public:
   }
 
   /**
+    Set query to be displayed in performance schema (threads table etc.).Also
+    mark the query safe to display for information_schema.process_list.
+  */
+  void set_query_for_display(const char *query_arg, size_t query_length_arg) {
+    // Set in pfs events statements table
+    MYSQL_SET_STATEMENT_TEXT(m_statement_psi, query_arg, query_length_arg);
+#ifdef HAVE_PSI_THREAD_INTERFACE
+    // Set in pfs threads table
+    PSI_THREAD_CALL(set_thread_info)(query_arg, query_length_arg);
+#endif
+    set_safe_display(true);
+  }
+
+  /**
+    Reset query string to be displayed in PFS. Also reset the safety flag
+    for information_schema.process_list for next query.
+  */
+  void reset_query_for_display() {
+    set_query_for_display(NULL, 0);
+    my_atomic_store32(&m_safe_to_display, 0);
+  }
+
+  /** Set if the query string to be safe to display.
+  @param[in]  safe  if it is safe to display query string */
+  void set_safe_display(bool safe) {
+    int32 value = safe ? 1 : 0;
+    my_atomic_store32(&m_safe_to_display, value);
+  }
+
+  /** @return true, if safe to display the query string. */
+  int32 safe_to_display() { return my_atomic_load32(&m_safe_to_display);}
+
+  /**
     Assign a new value to thd->m_query_string.
     Protected with the LOCK_thd_query mutex.
   */
@@ -5011,23 +5130,68 @@ public:
     set_query(tmp);
   }
   void set_query(const LEX_CSTRING& query_arg);
-  void reset_query() { set_query(LEX_CSTRING()); }
+  void reset_query() {
+    set_query(LEX_CSTRING());
+  }
+
+  /**
+    Set the rewritten query (with passwords obfuscated etc.) on the THD.
+    Wraps this in the LOCK_thd_query mutex to protect against race conditions
+    with SHOW PROCESSLIST inspecting that string.
+
+    This uses swap() and therefore "steals" the argument from the caller;
+    the caller MUST take care not to try to use its own string after calling
+    this function! This is an optimization for mysql_rewrite_query() so we
+    don't copy its temporary string (which may get very long, up to
+    @@max_allowed_packet).
+
+    Using this outside of mysql_rewrite_query() is almost certainly wrong;
+    please check with the runtime team!
+
+    @param query_arg  The rewritten query to use for slow/bin/general logging.
+                      The value will be released in the caller and MUST NOT
+                      be used there after calling this function.
+  */
+  void swap_rewritten_query(String& query_arg);
+
+  /**
+    Get the rewritten query (with passwords obfuscated etc.) from the THD.
+    If done from a different thread (from the one that the rewritten_query
+    is set on), the caller must hold LOCK_thd_query while calling this!
+  */
+  const String &rewritten_query() const {
+#ifndef NDEBUG
+    if (current_thd != this)
+      mysql_mutex_assert_owner(&LOCK_thd_query);
+#endif
+    return m_rewritten_query;
+  }
+
+  /**
+    Reset thd->rewritten_query. Protected with the LOCK_thd_query mutex.
+  */
+  void reset_rewritten_query() {
+    if (rewritten_query().length()) {
+      String empty;
+      swap_rewritten_query(empty);
+    }
+  }
 
   /**
     Assign a new value to thd->query_id.
     Protected with the LOCK_thd_data mutex.
   */
-  void set_query_id(query_id_t new_query_id
 #ifdef WITH_WSREP
-                  , bool update_wsrep_id= true
+  void set_query_id(query_id_t new_query_id, bool update_wsrep_id= true)
+#else
+  void set_query_id(query_id_t new_query_id)
 #endif /* WITH_WSREP */
-  )
   {
     mysql_mutex_lock(&LOCK_thd_data);
     query_id= new_query_id;
     mysql_mutex_unlock(&LOCK_thd_data);
 #ifdef WITH_WSREP
-    if (WSREP(this)
+    if (WSREP_NNULL(this)
         && wsrep_next_trx_id() == WSREP_UNDEFINED_TRX_ID
         && update_wsrep_id)
     {
@@ -5062,7 +5226,7 @@ public:
 
   void enter_locked_tables_mode(enum_locked_tables_mode mode_arg)
   {
-    DBUG_ASSERT(locked_tables_mode == LTM_NONE);
+    assert(locked_tables_mode == LTM_NONE);
 
     if (mode_arg == LTM_LOCK_TABLES)
     {
@@ -5080,7 +5244,7 @@ public:
     locked_tables_mode= mode_arg;
   }
   void leave_locked_tables_mode();
-  int decide_logging_format(TABLE_LIST *tables);
+  int decide_logging_format(TABLE_LIST *tables, bool use_cached_table_flags= true);
   /**
     is_dml_gtid_compatible() and is_ddl_gtid_compatible() check if the
     statement that is about to be processed will safely get a
@@ -5342,6 +5506,13 @@ private:
     aggregates THD.
   */
   bool is_a_srv_session_thd;
+
+private:
+  bool is_rpl_stmt_event_format_used;
+
+public:
+  void check_rpl_stmt_event_format_used();
+  bool get_rpl_stmt_event_format_used() const;
 };
 
 /* Returns string as 'IP' for the client-side of the connection represented by
@@ -5429,28 +5600,20 @@ my_eof(THD *thd)
 }
 
 #ifdef WITH_WSREP
-
-  #define tmp_disable_binlog(A)                                               \
-    {ulonglong tmp_disable_binlog__save_options= (A)->variables.option_bits;  \
-    my_bool tmp_disable_binlog__save_wsrep_on= (A)->variables.wsrep_on;       \
-    (A)->variables.wsrep_on= 0;                                               \
-    (A)->variables.option_bits&= ~OPTION_BIN_LOG
-  
-  #define reenable_binlog(A)                                                  \
-    (A)->variables.wsrep_on= tmp_disable_binlog__save_wsrep_on;               \
-    (A)->variables.option_bits= tmp_disable_binlog__save_options;}
-
-  #define reenable_wsrep(A)    (A)->variables.wsrep_on= tmp_disable_binlog__save_wsrep_on;
+#define tmp_disable_binlog(A)                                              \
+  {ulonglong tmp_disable_binlog__save_options= (A)->variables.option_bits; \
+  (A)->variables.option_bits&= ~OPTION_BIN_LOG;                            \
+  (A)->variables.option_bits|= OPTION_BIN_LOG_INTERNAL_OFF
 
 #else
 
-  #define tmp_disable_binlog(A)       \
-    {ulonglong tmp_disable_binlog__save_options= (A)->variables.option_bits; \
-    (A)->variables.option_bits&= ~OPTION_BIN_LOG
-
-  #define reenable_binlog(A)   (A)->variables.option_bits= tmp_disable_binlog__save_options;}
+#define tmp_disable_binlog(A)                                              \
+  {ulonglong tmp_disable_binlog__save_options= (A)->variables.option_bits; \
+  (A)->variables.option_bits&= ~OPTION_BIN_LOG
 
 #endif
+
+#define reenable_binlog(A)   (A)->variables.option_bits= tmp_disable_binlog__save_options;}
 
 LEX_STRING *
 make_lex_string_root(MEM_ROOT *mem_root,
@@ -5968,7 +6131,7 @@ class user_var_entry
   */
   void init(THD *thd, const Simple_cstring &name, const CHARSET_INFO *cs)
   {
-    DBUG_ASSERT(thd != NULL);
+    assert(thd != NULL);
     m_owner= thd;
     copy_name(name);
     reset_value();
@@ -6075,7 +6238,7 @@ public:
   */
   static user_var_entry *create(THD *thd, const Name_string &name, const CHARSET_INFO *cs)
   {
-    if (check_column_name(name.ptr()))
+    if (check_column_name(name))
     {
       my_error(ER_ILLEGAL_USER_VAR, MYF(0), name.ptr());
       return NULL;
@@ -6120,7 +6283,6 @@ public:
 
 class Query_dumpvar :public Query_result_interceptor {
   ha_rows row_count;
-  Item_func_set_user_var **set_var_items;
 public:
   List<PT_select_var> var_list;
   Query_dumpvar()  { var_list.empty(); row_count= 0;}
@@ -6339,8 +6501,6 @@ static inline bool is_engine_substitution_allowed(THD* thd)
 }
 
 /*************************************************************************/
-
-extern pthread_attr_t *get_connection_attrib(void);
 
 #endif /* MYSQL_SERVER */
 

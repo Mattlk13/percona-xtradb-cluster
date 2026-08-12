@@ -1,13 +1,20 @@
-# Copyright (c) 2017 Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2017, 2023, Oracle and/or its affiliates.
 #
 # This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; version 2 of the License.
+# it under the terms of the GNU General Public License, version 2.0,
+# as published by the Free Software Foundation.
+#
+# This program is also distributed with certain software (including
+# but not limited to OpenSSL) that is licensed under separate terms,
+# as designated in a particular file or component or in included license
+# documentation.  The authors of MySQL hereby grant you an additional
+# permission to link the program and your derivative works with the
+# separately licensed software that they have included with MySQL.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU General Public License, version 2.0, for more details.
 #
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
@@ -27,10 +34,15 @@ MACRO(MYSQL_CHECK_CURL)
      ENDIF()
      MESSAGE(STATUS "CURL_LIBRARY = ${CURL_LIBRARY}")
    ELSEIF(WITH_CURL)
+    # Explicit path given. Normalize path for the following regex replace.
+    FILE(TO_CMAKE_PATH "${WITH_CURL}" WITH_CURL)
+    # Pushbuild adds /lib to the CURL path
+    STRING(REGEX REPLACE "/lib$" "" WITH_CURL "${WITH_CURL}")
+
     LIST(REVERSE CMAKE_FIND_LIBRARY_SUFFIXES)
     FIND_LIBRARY(CURL_LIBRARY
       NAMES curl
-      PATHS ${WITH_CURL}/lib
+      PATHS ${WITH_CURL} ${WITH_CURL}/lib
       NO_DEFAULT_PATH
       NO_CMAKE_ENVIRONMENT_PATH
       NO_SYSTEM_ENVIRONMENT_PATH
@@ -43,7 +55,23 @@ MACRO(MYSQL_CHECK_CURL)
       SET(CURL_FOUND FALSE)
     ENDIF()
     LIST(REVERSE CMAKE_FIND_LIBRARY_SUFFIXES)
+    IF(NOT CURL_LIBRARY)
+      MESSAGE(FATAL_ERROR "CURL library not found under '${WITH_CURL}'")
+    ENDIF()
+
+    FIND_PATH(CURL_INCLUDE_DIR
+      NAMES curl/curl.h
+      PATHS ${WITH_CURL} ${WITH_CURL}/include
+      NO_DEFAULT_PATH
+      NO_CMAKE_ENVIRONMENT_PATH
+      NO_SYSTEM_ENVIRONMENT_PATH
+      )
+    IF(NOT CURL_INCLUDE_DIR)
+      MESSAGE(FATAL_ERROR "CURL include files not found under '${WITH_CURL}'")
+    ENDIF()
+
     MESSAGE(STATUS "CURL_LIBRARY = ${CURL_LIBRARY}")
+    MESSAGE(STATUS "CURL_INCLUDE_DIR = ${CURL_INCLUDE_DIR}")
    ELSE()
      MESSAGE(STATUS
        "You need to set WITH_CURL. This"
@@ -51,15 +79,3 @@ MACRO(MYSQL_CHECK_CURL)
    ENDIF()
   ENDIF()
 ENDMACRO()
-
-MACRO (CHECK_IF_CURL_DEPENDS_ON_RTMP project_name)
-  EXECUTE_PROCESS(COMMAND ldd ${CURL_LIBRARY}
-                  COMMAND grep rtmp
-                  OUTPUT_VARIABLE CURL_DEPENDS_ON_RTMP)
-  IF (NOT CURL_DEPENDS_ON_RTMP STREQUAL "")
-    message(WARNING "Not building ${project_name}. The supplied CURL library depends on rtmp library.
-Please provide CURL library that does not depend on rtmp library to build keyring_vault unittests.")
-    RETURN()
-  ENDIF()
-ENDMACRO()
-

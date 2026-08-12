@@ -1,13 +1,20 @@
-/* Copyright (c) 2012, 2015, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2012, 2023, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation; version 2 of the License.
+  it under the terms of the GNU General Public License, version 2.0,
+  as published by the Free Software Foundation.
+
+  This program is also distributed with certain software (including
+  but not limited to OpenSSL) that is licensed under separate terms,
+  as designated in a particular file or component or in included license
+  documentation.  The authors of MySQL hereby grant you an additional
+  permission to link the program and your derivative works with the
+  separately licensed software that they have included with MySQL.
 
   This program is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
+  GNU General Public License, version 2.0, for more details.
 
   You should have received a copy of the GNU General Public License
   along with this program; if not, write to the Free Software Foundation,
@@ -91,6 +98,12 @@ void pfs_set_thread_command_v1(int command);
 
 void pfs_set_thread_start_time_v1(time_t start_time);
 
+void pfs_set_thread_start_time_usec_v1(ulonglong start_time_usec);
+
+void pfs_set_thread_rows_sent_v1(ulonglong rows_sent);
+
+void pfs_set_thread_rows_examined_v1(ulonglong rows_examined);
+
 void pfs_set_thread_state_v1(const char* state);
 
 void pfs_set_connection_type_v1(opaque_vio_type conn_type);
@@ -158,6 +171,8 @@ void pfs_end_cond_wait_v1(PSI_cond_locker* locker, int rc);
 
 int pfs_set_thread_connect_attrs_v1(const char *buffer, uint length,
                                       const void *from_cs);
+
+void pfs_set_thread_peer_port_v1(PSI_thread *thread, uint port);
 
 C_MODE_END
 

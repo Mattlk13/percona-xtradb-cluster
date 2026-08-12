@@ -122,7 +122,7 @@ Used to enable and specify SST encryption mode:
 
 * Set ``encrypt=3`` to perform SST encryption based on SSL for just the key
   and certificate files as implemented in
-  `Galeracluster <http://galeracluster.com/documentation-webpages/ssl.html>`_
+  `Galera cluster <https://galeracluster.com/library/documentation/ssl-config.html>`__
 
   It does not provide certificate validation.
   In order to work correctly,
@@ -331,6 +331,20 @@ To disable initial SST timeout, set ``sst-initial-timeout=0``.
    or there is a high network latency or network disturbance
    (which can cause donor selection to take longer than 100 seconds).
 
+.. option:: sst-idle-timeout
+
+	:Version: Introducted in 5.7.34-31.51
+	:Default: 120
+	:Unit: seconds
+	
+This option configures the time the SST operation waits on the joiner to receive more data. The size of the joiner's sst directory is checked for the amount of data received. For example, the directory has received 50MB of data. The operation checks the data size again after the 120 seconds, the default value, has elapsed. If the data size is still 50MB, this operation is aborted. If the data has increased, the operation continues. 
+
+An example of setting the option:
+
+.. code-block:: text
+
+	[sst]
+	sst-idle-timeout=0
 .. option:: tmpdir
 
    :Version: Introduced in 5.7.17-29.20
@@ -391,14 +405,11 @@ and should be specified under the ``[sst]`` group.
 XtraBackup SST Dependencies
 ---------------------------
 
-Although any current version of |PXB| *may* be compatible
-with any current version of |PXC|,
-there are certain differences that may break compatibility.
-As a result, starting from |PXC| 5.6
-every version is tested against a specific |PXB| version only:
+Each suppored version of |PXC| is tested against a specific version of |PXB|:
 
 * |PXC| 5.6 requires |PXB| 2.3
 * |PXC| 5.7 requires |PXB| 2.4
+* |PXC| 8.0 requires |PXB| 8.0
 
 Other combinations are not guaranteed to work.
 
@@ -407,7 +418,7 @@ introduced by ``wsrep_sst_xtrabackup-v2``
 (except for obvious and direct dependencies):
 
 * ``qpress`` for decompression.
-  It is an optional dependency of |Percona XtraBackup| 2.1.4
+  It is an optional dependency of |Percona XtraBackup| 
   and it is available in our software repositories.
 
 * ``my_print_defaults`` to extract values from :file:`my.cnf`.

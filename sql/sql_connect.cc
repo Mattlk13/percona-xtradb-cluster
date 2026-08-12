@@ -1,14 +1,21 @@
 /*
-   Copyright (c) 2007, 2018, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2007, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -97,8 +104,8 @@ int get_or_create_user_conn(THD *thd, const char *user,
   char temp_user[USER_HOST_BUFF_SIZE];
   struct  user_conn *uc;
 
-  DBUG_ASSERT(user != 0);
-  DBUG_ASSERT(host != 0);
+  assert(user != 0);
+  assert(host != 0);
 
   user_len= strlen(user);
   temp_len= (my_stpcpy(my_stpcpy(temp_user, user)+1, host) - temp_user)+1;
@@ -165,7 +172,7 @@ void free_user_stats(USER_STATS* user_stats)
 }
 
 /* Free all memory for a my_hash table with THREAD_STATS entries */
-void free_thread_stats(THREAD_STATS* thread_stats)
+static void free_thread_stats(THREAD_STATS* thread_stats)
 {
   my_free((char *) thread_stats);
 }
@@ -201,8 +208,8 @@ void init_user_stats(USER_STATS *user_stats,
   DBUG_PRINT("info",
              ("Add user_stats entry for user %s - priv_user %s",
               user, priv_user));
-  strncpy(user_stats->user, user, sizeof(user_stats->user));
-  strncpy(user_stats->priv_user, priv_user, sizeof(user_stats->priv_user));
+  my_strncpy_trunc(user_stats->user, user, sizeof(user_stats->user));
+  my_strncpy_trunc(user_stats->priv_user, priv_user, sizeof(user_stats->priv_user));
 
   user_stats->user_len=               strlen(user_stats->user);
   user_stats->priv_user_len=          strlen(user_stats->priv_user);
@@ -316,7 +323,7 @@ void init_global_thread_stats(void)
 		   (my_hash_free_key) free_thread_stats, 0,
 		   key_memory_userstat_thread_stats))
   {
-    sql_print_error("Initializing global_client_stats failed.");
+    sql_print_error("Initializing global_thread_stats failed.");
     exit(1);
   }
 }
@@ -832,7 +839,7 @@ void decrease_user_connections(USER_CONN *uc)
 {
   DBUG_ENTER("decrease_user_connections");
   mysql_mutex_lock(&LOCK_user_conn);
-  DBUG_ASSERT(uc->connections);
+  assert(uc->connections);
   if (!--uc->connections && !mqh_used)
   {
     /* Last connection for user; Delete it */
@@ -858,7 +865,7 @@ void release_user_connection(THD *thd)
   if (uc)
   {
     mysql_mutex_lock(&LOCK_user_conn);
-    DBUG_ASSERT(uc->connections > 0);
+    assert(uc->connections > 0);
     thd->decrement_user_connections_counter();
     if (!uc->connections && !mqh_used)
     {
@@ -884,7 +891,7 @@ bool check_mqh(THD *thd, uint check_command)
   bool error= 0;
   const USER_CONN *uc=thd->get_user_connect();
   DBUG_ENTER("check_mqh");
-  DBUG_ASSERT(uc != 0);
+  assert(uc != 0);
 
   mysql_mutex_lock(&LOCK_user_conn);
 
@@ -1126,7 +1133,12 @@ static int check_connection(THD *thd, bool extra_port_connection)
     char ip[NI_MAXHOST];
     LEX_CSTRING main_sctx_ip;
 
+    if (extra_port_connection) {
+      vio_force_skip_proxy(net->vio);
+    }
+
     peer_rc= vio_peer_addr(net->vio, ip, &thd->peer_port, NI_MAXHOST);
+    mysql_thread_set_peer_port(thd->peer_port);
 
     /*
     ===========================================================================
@@ -1325,6 +1337,17 @@ static int check_connection(THD *thd, bool extra_port_connection)
   */
   thd->set_ssl(net->vio);
 
+  if (net->vio->ssl_arg) {
+    int version = SSL_version((SSL *)net->vio->ssl_arg);
+    if (version == TLS1_VERSION || version == TLS1_1_VERSION) {
+      Security_context *sctx = thd->security_context();
+      sql_print_warning(ER(ER_DEPRECATED_TLS_VERSION_SESSION),
+                        SSL_get_version((SSL *)net->vio->ssl_arg),
+                        sctx->priv_user().str, sctx->priv_host().str,
+                        sctx->host_or_ip().str, sctx->user().str);
+    }
+  }
+
   return auth_rc;
 }
 
@@ -1354,7 +1377,7 @@ static bool login_connection(THD *thd, bool extra_port_connection)
                       thd->thread_id()));
 
   /* Use "connect_timeout" value during connection phase */
-  thd->get_protocol_classic()->set_read_timeout(connect_timeout);
+  thd->get_protocol_classic()->set_read_timeout(connect_timeout, TRUE);
   thd->get_protocol_classic()->set_write_timeout(connect_timeout);
 
   error= check_connection(thd, extra_port_connection);
@@ -1576,6 +1599,11 @@ void close_connection(THD *thd, uint sql_errno,
   if (MYSQL_CONNECTION_DONE_ENABLED())
   {
     sleep(0); /* Workaround to avoid tailcall optimisation */
+#ifdef WITH_WSREP
+    mysql_mutex_lock(&thd->LOCK_wsrep_thd);
+    wsrep_thd_set_query_state(thd, QUERY_EXITING);
+    mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
+#endif /* WITH_WSREP */
   }
 
   if (generate_event)

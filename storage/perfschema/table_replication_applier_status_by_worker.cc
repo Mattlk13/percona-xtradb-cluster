@@ -1,14 +1,21 @@
 /*
-      Copyright (c) 2013, 2018, Oracle and/or its affiliates. All rights reserved.
+      Copyright (c) 2013, 2023, Oracle and/or its affiliates.
 
       This program is free software; you can redistribute it and/or modify
-      it under the terms of the GNU General Public License as published by
-      the Free Software Foundation; version 2 of the License.
+      it under the terms of the GNU General Public License, version 2.0,
+      as published by the Free Software Foundation.
+
+      This program is also distributed with certain software (including
+      but not limited to OpenSSL) that is licensed under separate terms,
+      as designated in a particular file or component or in included license
+      documentation.  The authors of MySQL hereby grant you an additional
+      permission to link the program and your derivative works with the
+      separately licensed software that they have included with MySQL.
 
       This program is distributed in the hope that it will be useful,
       but WITHOUT ANY WARRANTY; without even the implied warranty of
       MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-      GNU General Public License for more details.
+      GNU General Public License, version 2.0, for more details.
 
       You should have received a copy of the GNU General Public License
       along with this program; if not, write to the Free Software
@@ -85,6 +92,11 @@ TABLE_FIELD_DEF
 table_replication_applier_status_by_worker::m_field_def=
 { 8, field_types };
 
+PFS_engine_table_share_state
+table_replication_applier_status_by_worker::m_share_state = {
+  false /* m_checked */
+};
+
 PFS_engine_table_share
 table_replication_applier_status_by_worker::m_share=
 {
@@ -97,8 +109,9 @@ table_replication_applier_status_by_worker::m_share=
   sizeof(pos_t), /* ref length */
   &m_table_lock,
   &m_field_def,
-  false, /* checked */
-  false  /* perpetual */
+  false, /* m_perpetual */
+  false, /* m_optional */
+  &m_share_state
 };
 
 PFS_engine_table* table_replication_applier_status_by_worker::create(void)
@@ -237,8 +250,8 @@ void table_replication_applier_status_by_worker::make_row(Master_info *mi)
 
   m_row.thread_id= 0;
 
-  DBUG_ASSERT(mi != NULL);
-  DBUG_ASSERT(mi->rli != NULL);
+  assert(mi != NULL);
+  assert(mi->rli != NULL);
 
   mysql_mutex_lock(&mi->rli->data_lock);
 
@@ -286,7 +299,7 @@ void table_replication_applier_status_by_worker::make_row(Master_info *mi)
       AUTOMATIC_GROUP when the SQL thread is not executing any
       transaction.  For this case, the field should be empty.
     */
-    DBUG_ASSERT(mi->rli->currently_executing_gtid.type == AUTOMATIC_GROUP);
+    assert(mi->rli->currently_executing_gtid.type == AUTOMATIC_GROUP);
     m_row.last_seen_transaction_length= 0;
     memcpy(m_row.last_seen_transaction, "", 1);
   }
@@ -369,7 +382,7 @@ void table_replication_applier_status_by_worker::make_row(Slave_worker *w)
       AUTOMATIC_GROUP when the worker is not executing any
       transaction.  For this case, the field should be empty.
     */
-    DBUG_ASSERT(w->currently_executing_gtid.type == AUTOMATIC_GROUP);
+    assert(w->currently_executing_gtid.type == AUTOMATIC_GROUP);
     m_row.last_seen_transaction_length= 0;
     memcpy(m_row.last_seen_transaction, "", 1);
   }
@@ -403,7 +416,7 @@ int table_replication_applier_status_by_worker
   if (unlikely(! m_row_exists))
     return HA_ERR_RECORD_DELETED;
 
-  DBUG_ASSERT(table->s->null_bytes == 1);
+  assert(table->s->null_bytes == 1);
   buf[0]= 0;
 
   for (; (f= *fields) ; fields++)
@@ -440,7 +453,7 @@ int table_replication_applier_status_by_worker
         set_field_timestamp(f, m_row.last_error_timestamp);
         break;
       default:
-        DBUG_ASSERT(false);
+        assert(false);
       }
     }
   }

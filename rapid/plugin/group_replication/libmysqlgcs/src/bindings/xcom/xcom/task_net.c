@@ -1,13 +1,20 @@
-/* Copyright (c) 2015, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2015, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -40,6 +47,8 @@
 #include "task.h"
 #include "task_os.h"
 
+#define NR_GETADDRINFO_ATTEMPTS 10
+
 /**
  * Wrapper function which retries and checks errors from socket
  */
@@ -62,31 +71,40 @@ result	xcom_checked_socket(int domain, int type, int protocol)
 
 /**
  * Wrapper function which retries and checks errors from getaddrinfo
+ *
+ * We have observed that getaddrinfo returns EAI_AGAIN when called with an
+ * unresolvable hostname on systems using systemd-resolved for DNS resolution.
+ * Therefore, we only attempt to resolve nodename up to NR_GETADDRINFO_ATTEMPTS
+ * times, to avoid getting stuck in an infinite loop.
  */
 int
 checked_getaddrinfo(const char *nodename, const char *servname,
 const struct addrinfo *hints, struct addrinfo **res)
 {
-	int	errval = 0;
+	int	errval = EAI_AGAIN;
+	int attempt_nr = 0;
 	/** FIXME: Lookup IPv4 only for now */
 	struct addrinfo _hints;
 	memset(&_hints, 0, sizeof(_hints));
 	_hints.ai_family = PF_INET;
 	if (hints == NULL)
 		hints = &_hints;
-	do {
+	for (attempt_nr = 0;
+			 errval == EAI_AGAIN && attempt_nr < NR_GETADDRINFO_ATTEMPTS;
+			 attempt_nr++) {
 		if (*res) {
 			freeaddrinfo(*res);
 			*res = NULL;
 		}
 		errval = getaddrinfo(nodename, servname, hints, res);
-	} while (errval == EAI_AGAIN);
+	}
 #if defined(EAI_NODATA) && EAI_NODATA != EAI_NONAME
         /* Solaris may return EAI_NODATA as well as EAI_NONAME */
-        if (errval && errval != EAI_NONAME && errval != EAI_NODATA) {
+        if (errval && errval != EAI_NONAME && errval != EAI_NODATA &&
+            errval != EAI_AGAIN) {
 #else
         /* FreeBSD has removed the definition of EAI_NODATA altogether. */
-        if (errval && errval != EAI_NONAME) {
+        if (errval && errval != EAI_NONAME && errval != EAI_AGAIN) {
 #endif
 #if !defined(WIN32) && !defined(WIN64)
 		DBGOUT(NUMEXP(errval); STREXP(gai_strerror(errval));

@@ -1,4 +1,4 @@
-#!/bin/bash -ue
+#!/usr/bin/env bash
 
 # Copyright (C) 2010-2014 Codership Oy
 #
@@ -17,6 +17,8 @@
 # MA  02110-1301  USA.
 
 # This is a reference script for rsync-based state snapshot tansfer
+
+set -o nounset -o errexit
 
 RSYNC_PID=
 RSYNC_CONF=
@@ -84,15 +86,25 @@ check_pid_and_port()
     local rsync_pid=$2
     local rsync_port=$3
 
-    if ! which lsof > /dev/null; then
-        wsrep_log_error "lsof tool not found in PATH! Make sure you have it installed."
-        exit 2 # ENOENT
-    fi
+    case $OS in
+    FreeBSD)
+        local port_info="$(sockstat -46lp ${rsync_port} 2>/dev/null | \
+            grep ":${rsync_port}")"
+        local is_rsync="$(echo $port_info | \
+            grep -E '[[:space:]]+(rsync|stunnel)[[:space:]]+'"$rsync_pid" 2>/dev/null)"
+        ;;
+    *)
+        if ! which lsof > /dev/null; then
+            wsrep_log_error "lsof tool not found in PATH! Make sure you have it installed."
+            exit 2 # ENOENT
+        fi
 
-    local port_info=$(lsof -i :$rsync_port -Pn 2>/dev/null | \
-        grep "(LISTEN)")
-    local is_rsync=$(echo $port_info | \
-        grep -w '^rsync[[:space:]]\+'"$rsync_pid" 2>/dev/null)
+        local port_info="$(lsof -i :$rsync_port -Pn 2>/dev/null | \
+            grep "(LISTEN)")"
+        local is_rsync="$(echo $port_info | \
+            grep -E '^(rsync|stunnel)[[:space:]]+'"$rsync_pid" 2>/dev/null)"
+        ;;
+    esac
 
     if [ -n "$port_info" -a -z "$is_rsync" ]; then
         wsrep_log_error "******************* FATAL ERROR ********************** "
@@ -166,6 +178,7 @@ FILTER=(-f '- /lost+found'
 if [ "$WSREP_SST_OPT_ROLE" = "donor" ]
 then
 
+    RSYNC_CONN_TIMEOUT="--contimeout $WSREP_SST_DONOR_TIMEOUT"
     if [ $WSREP_SST_OPT_BYPASS -eq 0 ]
     then
 
@@ -209,10 +222,13 @@ then
         fi
 
         wsrep_log_info "Starting rsync of data-dir............"
+        COMMON_RSYNC_OPTS="--owner --group --perms --links --specials\
+                           --ignore-times --inplace --delete --quiet \
+                           $RSYNC_CONN_TIMEOUT"
+
         # first, the normal directories, so that we can detect incompatible protocol
         RC=0
-        rsync --owner --group --perms --links --specials \
-              --ignore-times --inplace --dirs --delete --quiet \
+        rsync $COMMON_RSYNC_OPTS --dirs \
               $WHOLE_FILE_OPT "${FILTER[@]}" "$WSREP_SST_OPT_DATA/" \
               rsync://$WSREP_SST_OPT_ADDR >&2 || RC=$?
 
@@ -236,8 +252,7 @@ then
         fi
 
         # second, we transfer InnoDB log files
-        rsync --owner --group --perms --links --specials \
-              --ignore-times --inplace --dirs --delete --quiet \
+        rsync $COMMON_RSYNC_OPTS --dirs \
               $WHOLE_FILE_OPT -f '+ /ib_logfile[0-9]*' -f '- **' "$WSREP_LOG_DIR/" \
               rsync://$WSREP_SST_OPT_ADDR-log_dir >&2 || RC=$?
 
@@ -272,8 +287,7 @@ then
 
         find . -maxdepth 1 -mindepth 1 -type d -not -name "lost+found" \
              -print0 | xargs -I{} -0 -P $count \
-             rsync --owner --group --perms --links --specials \
-             --ignore-times --inplace --recursive --delete --quiet \
+             rsync $COMMON_RSYNC_OPTS --recursive \
              $WHOLE_FILE_OPT --exclude '*/ib_logfile*' "$WSREP_SST_OPT_DATA"/{}/ \
              rsync://$WSREP_SST_OPT_ADDR/{} >&2 || RC=$?
 
@@ -302,7 +316,6 @@ then
 
 elif [ "$WSREP_SST_OPT_ROLE" = "joiner" ]
 then
-    wsrep_check_programs lsof
 
     touch $SST_PROGRESS_FILE
     MYSQLD_PID=$WSREP_SST_OPT_PARENT
@@ -310,6 +323,14 @@ then
     MODULE="rsync_sst"
 
     RSYNC_PID="$WSREP_SST_OPT_DATA/$MODULE.pid"
+    # give some time for lingering rsync from previous SST to complete
+    check_round=0
+    while check_pid $RSYNC_PID && [ $check_round -lt 10 ]
+    do
+        wsrep_log_info "lingering rsync daemon found at startup, waiting for it to exit"
+        check_round=$(( check_round + 1 ))
+        sleep 1
+    done
 
     if check_pid $RSYNC_PID
     then
@@ -330,7 +351,7 @@ cat << EOF > "$RSYNC_CONF"
 pid file = $RSYNC_PID
 use chroot = no
 read only = no
-timeout = 300
+timeout = $WSREP_SST_JOINER_TIMEOUT
 transfer logging = true
 log file = $RSYNC_LOG_FILE
 log format = %o %a file:%f %l

@@ -1,16 +1,24 @@
 /*****************************************************************************
 
-Copyright (c) 1997, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1997, 2023, Oracle and/or its affiliates.
 Copyright (c) 2012, Facebook Inc.
 Copyright (c) 2016, Percona Inc. All Rights Reserved.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -159,13 +167,13 @@ lsn_t	recv_max_page_lsn;
 mysql_pfs_key_t	trx_rollback_clean_thread_key;
 #endif /* UNIV_PFS_THREAD */
 
-#ifndef	DBUG_OFF
+#ifndef	NDEBUG
 /** Return string name of the redo log record type.
 @param[in]	type	record log record enum
 @return string name of record log record */
 const char*
 get_mlog_string(mlog_id_t type);
-#endif /* !DBUG_OFF */
+#endif /* !NDEBUG */
 
 /* prototypes */
 
@@ -1723,7 +1731,9 @@ recv_parse_or_apply_log_rec_body(
 
 			if (memcmp(ptr_copy, ENCRYPTION_KEY_MAGIC_V1,
 				ENCRYPTION_MAGIC_SIZE) == 0 ||
-			    memcmp(ptr, ENCRYPTION_KEY_MAGIC_V2,
+			    memcmp(ptr_copy, ENCRYPTION_KEY_MAGIC_V2,
+				ENCRYPTION_MAGIC_SIZE) == 0 ||
+			    memcmp(ptr_copy, ENCRYPTION_KEY_MAGIC_V3,
 				ENCRYPTION_MAGIC_SIZE) == 0) {
 
 				if (offset >= UNIV_PAGE_SIZE
@@ -3775,7 +3785,7 @@ recv_group_scan_log_recs(
 	bool		last_phase)
 {
 	DBUG_ENTER("recv_group_scan_log_recs");
-	DBUG_ASSERT(!last_phase || recv_sys->mlog_checkpoint_lsn > 0);
+	assert(!last_phase || recv_sys->mlog_checkpoint_lsn > 0);
 
 	mutex_enter(&recv_sys->mutex);
 	recv_sys->len = 0;
@@ -4622,7 +4632,7 @@ recv_dblwr_t::decrypt_sys_dblwr_pages()
 	}
 }
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 /** Return string name of the redo log record type.
 @param[in]	type	record log record enum
 @return string name of record log record */
@@ -4797,7 +4807,7 @@ get_mlog_string(mlog_id_t type)
 	case MLOG_TRUNCATE:
 		return("MLOG_TRUNCATE");
 	}
-	DBUG_ASSERT(0);
+	assert(0);
 	return(NULL);
 }
-#endif /* !DBUG_OFF */
+#endif /* !NDEBUG */

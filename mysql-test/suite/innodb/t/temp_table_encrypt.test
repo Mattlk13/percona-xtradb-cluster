@@ -1,3 +1,7 @@
+# innodb_encrypt_tables is read only for PXC, 
+# so no way to proceed with this test
+--skip innodb_encrypt_tables is read-only for PXC
+
 --source include/have_innodb.inc
 --source include/not_embedded.inc
 
@@ -88,10 +92,30 @@ connection default;
 disconnect other2;
 disconnect other1;
 
-CREATE TEMPORARY TABLE t01 (a INT) ENGINE=InnoDB ENCRYPTION='Y';
-INSERT INTO t01 VALUES (1), (2), (3);
+SET GLOBAL innodb_temp_tablespace_encrypt=ON;
 
-SET GLOBAL innodb_temp_tablespace_encrypt = OFF;
+CREATE TEMPORARY TABLE t1(a BLOB, KEY k1(a(500)), KEY k2(a(1000))) ENCRYPTION='Y';
+INSERT INTO t1 VALUES (REPEAT('a', 5000)),(REPEAT('b', 5000)),(REPEAT('c', 5000)),(REPEAT('d', 5000));
+
+CREATE TEMPORARY TABLE t2(a BLOB, KEY k1(a(500)), KEY k2(a(1000))) ENCRYPTION='Y';
+INSERT INTO t2 VALUES (REPEAT('a', 5000)),(REPEAT('b', 5000)),(REPEAT('c', 5000)),(REPEAT('d', 5000));
+
+--let $i=0
+while ($i < 5) {
+INSERT INTO t1 SELECT * FROM t2;
+INSERT INTO t2 SELECT * FROM t1;
+--inc $i
+}
+DROP TABLE t1,t2;
+
+--echo #
+--echo # PS-7062 : Crash recovery fails with compressed temporary tables
+--echo #
+CREATE TEMPORARY TABLE t3(a INT) ROW_FORMAT=COMPRESSED ENCRYPTION='Y';
+ALTER INSTANCE ROTATE INNODB MASTER KEY;
+
+DROP TABLE t3;
 
 --source include/wait_until_count_sessions.inc
+SET GLOBAL innodb_temp_tablespace_encrypt=default;
 --remove_file $MYSQL_TMP_DIR/ts_encrypt_keyring

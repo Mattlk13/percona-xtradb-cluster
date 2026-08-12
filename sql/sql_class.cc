@@ -1,15 +1,22 @@
 /*
-   Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+   Copyright (c) 2000, 2023, Oracle and/or its affiliates.
    Copyright (c) 2016, Percona Inc. All Rights Reserved.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -51,6 +58,7 @@
 #ifdef HAVE_REPLICATION
 #include "rpl_rli_pdb.h"                     // Slave_worker
 #include "rpl_slave_commit_order_manager.h"
+#include "rpl_master.h"                      // unregister_slave
 #endif
 
 #ifdef WITH_WSREP
@@ -74,6 +82,7 @@ using std::min;
 using std::max;
 
 ulong kill_idle_transaction_timeout= 0;
+PSI_mutex_key key_LOCK_bloom_filter;
 
 /*
   The following is used to initialise Table_ident with a internal
@@ -130,7 +139,7 @@ THD::Attachable_trx::Attachable_trx(THD *thd)
   // The THD::transaction_rollback_request is expected to be unset in the
   // attachable transaction. It's weird to start attachable transaction when the
   // SE asked to rollback the regular transaction.
-  DBUG_ASSERT(!m_thd->transaction_rollback_request);
+  assert(!m_thd->transaction_rollback_request);
 
   // Save the transaction state.
 
@@ -199,7 +208,7 @@ THD::Attachable_trx::~Attachable_trx()
   // experienced some sort of deadlock/timeout while processing the attachable
   // transaction. That is not possible by the definition of an attachable
   // transaction.
-  DBUG_ASSERT(!m_thd->transaction_rollback_request);
+  assert(!m_thd->transaction_rollback_request);
 
   // Commit the attachable transaction before discarding transaction state.
   // This is mostly needed to properly reset transaction state in SE.
@@ -840,17 +849,26 @@ extern "C" void wsrep_thd_set_exec_mode(THD *thd, enum wsrep_exec_mode mode)
 extern "C" void wsrep_thd_set_query_state(
 	THD *thd, enum wsrep_query_state state)
 {
+  /* async slave thread should never flag IDLE state, as it may
+     give rollbacker thread chance to interfere and rollback async slave
+     transaction.
+     in fact, async slave thread is never idle as it reads complete
+     transactions from relay log and applies them, as a whole.
+     BF abort happens voluntarily by async slave thread.
+  */
+  if (thd->slave_thread && state == QUERY_IDLE) {
+    WSREP_DEBUG("Skipping IDLE state change for slave SQL");
+    return;
+  }
+
   thd->wsrep_query_state= state;
 }
 extern "C" void wsrep_thd_set_conflict_state(
          THD *thd, bool lock, enum wsrep_conflict_state state)
 {
-  if (WSREP(thd))
-  {
-    if (lock) mysql_mutex_lock(&thd->LOCK_wsrep_thd);
-    thd->wsrep_conflict_state= state;
-    if (lock) mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
-  }
+  if (lock) mysql_mutex_lock(&thd->LOCK_wsrep_thd);
+  thd->wsrep_conflict_state= state;
+  if (lock) mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
 }
 extern "C" void wsrep_thd_mark_split_trx(THD *thd, bool split_trx)
 {
@@ -1003,13 +1021,16 @@ wsrep_trx_order_before(void *thd1, void *thd2)
 extern "C" int
 wsrep_trx_is_aborting(void *thd_ptr)
 {
-	if (thd_ptr) {
-		if ((((THD *)thd_ptr)->wsrep_conflict_state == MUST_ABORT) ||
-		    (((THD *)thd_ptr)->wsrep_conflict_state == ABORTING)) {
-		  return 1;
-		}
-	}
-	return 0;
+  mysql_mutex_lock(&((THD*)thd_ptr)->LOCK_wsrep_thd);
+  if (thd_ptr) {
+    if ((((THD *)thd_ptr)->wsrep_conflict_state == MUST_ABORT) ||
+        (((THD *)thd_ptr)->wsrep_conflict_state == ABORTING)) {
+      mysql_mutex_unlock(&((THD*)thd_ptr)->LOCK_wsrep_thd);
+      return 1;
+    }
+  }
+  mysql_mutex_unlock(&((THD*)thd_ptr)->LOCK_wsrep_thd);
+  return 0;
 }
 
 extern "C" void
@@ -1082,7 +1103,8 @@ extern "C"
 THD* thd_tx_arbitrate(THD *requestor, THD* holder)
 {
  /* Should be different sessions. */
- DBUG_ASSERT(holder != requestor);
+ assert(holder != requestor);
+
  return(thd_tx_priority(requestor) == thd_tx_priority(holder)
 	? requestor
 	: ((thd_tx_priority(requestor)
@@ -1102,13 +1124,14 @@ void thd_inc_row_count(THD *thd)
 
 extern "C" void thd_report_innodb_stat(THD *thd, unsigned long long trx_id,
                                        enum mysql_trx_stat_type type,
-                                       unsigned long long       value)
+                                       uint64_t value)
 {
+  assert(thd && !thd_is_background_thread(thd));
   thd->mark_innodb_used(trx_id);
   switch (type)
   {
     case MYSQL_TRX_STAT_IO_READ_BYTES:
-      DBUG_ASSERT(value > 0);
+      assert(value > 0);
       thd->innodb_io_read+= value;
       thd->innodb_io_reads++;
       break;
@@ -1234,7 +1257,7 @@ char *thd_security_context(THD *thd, char *buffer, size_t length,
     We have to copy the new string to the destination buffer because the string
     was reallocated to a larger buffer to be able to fit.
   */
-  DBUG_ASSERT(buffer != NULL);
+  assert(buffer != NULL);
   length= min(str.length(), length-1);
   memcpy(buffer, str.c_ptr_quick(), length);
   /* Make sure that the new string is null terminated */
@@ -1410,6 +1433,7 @@ THD::THD(bool enable_plugins)
    derived_tables_processing(FALSE),
    sp_runtime_ctx(NULL),
 #ifdef WITH_WSREP
+   wsrep_bin_log_flag_save(0),
    wsrep_applier(is_applier),
    wsrep_applier_closing(FALSE),
    wsrep_client_thread(0),
@@ -1447,7 +1471,8 @@ THD::THD(bool enable_plugins)
    m_query_rewrite_plugin_da_ptr(&m_query_rewrite_plugin_da),
    m_stmt_da(&main_da),
    duplicate_slave_id(false),
-   is_a_srv_session_thd(false)
+   is_a_srv_session_thd(false),
+   is_rpl_stmt_event_format_used(true)
 {
   main_lex.reset();
   set_psi(NULL);
@@ -1509,7 +1534,7 @@ THD::THD(bool enable_plugins)
   binlog_bytes_written= 0;
   updated_row_count=    0;
   sent_row_count_2=     0;
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   dbug_sentry=THD_SENTRY_MAGIC;
 #endif
 #ifndef EMBEDDED_LIBRARY
@@ -1523,6 +1548,7 @@ THD::THD(bool enable_plugins)
   get_transaction()->m_flags.enabled= true;
   active_vio = 0;
   m_SSL = NULL;
+  my_atomic_store32(&m_safe_to_display, 0);
   mysql_mutex_init(key_LOCK_thd_data, &LOCK_thd_data, MY_MUTEX_INIT_FAST);
   mysql_mutex_init(key_LOCK_thd_query, &LOCK_thd_query, MY_MUTEX_INIT_FAST);
   mysql_mutex_init(key_LOCK_thd_sysvar, &LOCK_thd_sysvar, MY_MUTEX_INIT_FAST);
@@ -1561,6 +1587,7 @@ THD::THD(bool enable_plugins)
   wsrep_skip_wsrep_GTID   = false;
   wsrep_split_trx         = false;
   m_wsrep_next_trx_id     = WSREP_UNDEFINED_TRX_ID;
+  m_wsrep_forced_binlog_format_override = BINLOG_FORMAT_UNSPEC;
   wsrep_skip_SE_checkpoint = false;
   wsrep_skip_wsrep_hton   = false;
 #endif /* WITH_WSREP */
@@ -1623,7 +1650,7 @@ THD::THD(bool enable_plugins)
 
 void THD::set_transaction(Transaction_ctx *transaction_ctx)
 {
-  DBUG_ASSERT(is_attachable_ro_transaction_active());
+  assert(is_attachable_ro_transaction_active());
 
   delete m_transaction.release();
   m_transaction.reset(transaction_ctx);
@@ -1665,7 +1692,7 @@ bool THD::handle_condition(uint sql_errno,
 
 Internal_error_handler *THD::pop_internal_handler()
 {
-  DBUG_ASSERT(m_internal_handler != NULL);
+  assert(m_internal_handler != NULL);
   Internal_error_handler *popped_handler= m_internal_handler;
   m_internal_handler= m_internal_handler->m_prev_internal_handler;
   return popped_handler;
@@ -1788,7 +1815,7 @@ Sql_condition* THD::raise_condition(uint sql_errno,
       (level == Sql_condition::SL_NOTE))
     DBUG_RETURN(NULL);
 
-  DBUG_ASSERT(sql_errno != 0);
+  assert(sql_errno != 0);
   if (sql_errno == 0) /* Safety in release build */
     sql_errno= ER_UNKNOWN_ERROR;
   if (msg == NULL)
@@ -1943,7 +1970,7 @@ void THD::init(void)
 #ifdef WITH_WSREP
   wsrep_exec_mode= wsrep_applier ? REPL_RECV :  LOCAL_STATE;
   wsrep_conflict_state= NO_CONFLICT;
-  wsrep_query_state= QUERY_IDLE;
+  wsrep_thd_set_query_state(this, QUERY_IDLE);
   wsrep_last_query_id= 0;
   wsrep_trx_meta.gtid= WSREP_GTID_UNDEFINED;
   wsrep_trx_meta.depends_on= WSREP_SEQNO_UNDEFINED;
@@ -1962,6 +1989,7 @@ void THD::init(void)
   wsrep_gtid_event_buf    = NULL;
   wsrep_gtid_event_buf_len = 0;
   m_wsrep_next_trx_id     = WSREP_UNDEFINED_TRX_ID;
+  m_wsrep_forced_binlog_format_override = BINLOG_FORMAT_UNSPEC;
   wsrep_sst_donor= false;
   wsrep_void_applier_trx  = true;
   wsrep_skip_SE_checkpoint = false;
@@ -2039,7 +2067,7 @@ void THD::update_stats(bool ran_command)
   {
     // The replication thread has the COM_CONNECT command.
 #ifndef WITH_WSREP
-    DBUG_ASSERT(get_command() != COM_SLEEP);
+    assert(get_command() != COM_SLEEP);
 #endif /* !WITH_WSREP */
     if ((get_command() == COM_QUERY || get_command() == COM_CONNECT) &&
         (lex->sql_command >= 0 && lex->sql_command < SQLCOM_END)) {
@@ -2108,12 +2136,11 @@ void THD::init_for_queries(Relay_log_info *rli)
     rli_slave= rli;
 
 #ifdef WITH_WSREP
-    DBUG_ASSERT(rli_slave->info_thd == this &&
-                (slave_thread ||
-                 wsrep_applier ||
-                 rli_slave->info_thd->wsrep_conflict_state == REPLAYING));
+    assert(rli_slave->info_thd == this &&
+           (slave_thread || wsrep_applier ||
+            rli_slave->info_thd->wsrep_conflict_state == REPLAYING));
 #else
-    DBUG_ASSERT(rli_slave->info_thd == this && slave_thread);
+    assert(rli_slave->info_thd == this && slave_thread);
 #endif /* WITH_WSREP */
   }
 #endif
@@ -2169,24 +2196,24 @@ void THD::cleanup_connection(void)
   profiling.cleanup();
 #endif
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     /* DEBUG code only (begin) */
     bool check_cleanup= FALSE;
     DBUG_EXECUTE_IF("debug_test_cleanup_connection", check_cleanup= TRUE;);
     if(check_cleanup)
     {
       /* isolation level should be default */
-      DBUG_ASSERT(variables.tx_isolation == ISO_REPEATABLE_READ);
+      assert(variables.tx_isolation == ISO_REPEATABLE_READ);
       /* check autocommit is ON by default */
-      DBUG_ASSERT(server_status == SERVER_STATUS_AUTOCOMMIT);
+      assert(server_status == SERVER_STATUS_AUTOCOMMIT);
       /* check prepared stmts are cleaned up */
-      DBUG_ASSERT(prepared_stmt_count == 0);
+      assert(prepared_stmt_count == 0);
       /* check diagnostic area is cleaned up */
-      DBUG_ASSERT(get_stmt_da()->status() == Diagnostics_area::DA_EMPTY);
+      assert(get_stmt_da()->status() == Diagnostics_area::DA_EMPTY);
       /* check if temp tables are deleted */
-      DBUG_ASSERT(temporary_tables == NULL);
+      assert(temporary_tables == NULL);
       /* check if tables are unlocked */
-      DBUG_ASSERT(locked_tables_list.locked_tables() == NULL);
+      assert(locked_tables_list.locked_tables() == NULL);
     }
     /* DEBUG code only (end) */
 #endif
@@ -2204,7 +2231,7 @@ void THD::cleanup(void)
   XID_STATE *xs= trn_ctx->xid_state();
 
   DBUG_ENTER("THD::cleanup");
-  DBUG_ASSERT(cleanup_done == 0);
+  assert(cleanup_done == 0);
   DEBUG_SYNC(this, "thd_cleanup_start");
 
   killed= KILL_CONNECTION;
@@ -2222,7 +2249,7 @@ void THD::cleanup(void)
   locked_tables_list.unlock_locked_tables(this);
   mysql_ha_cleanup(this);
 
-  DBUG_ASSERT(open_tables == NULL);
+  assert(open_tables == NULL);
   /*
     If the thread was in the middle of an ongoing transaction (rolled
     back a few lines above) or under LOCK TABLES (unlocked the tables
@@ -2241,6 +2268,18 @@ void THD::cleanup(void)
   if (global_read_lock.is_acquired())
     global_read_lock.unlock_global_read_lock(this);
 
+#ifdef WITH_WSREP
+  /*
+    Resume the provider if it was paused by this session during FLUSH TABLE(S)
+    FOR EXPORT and the session got disconnected.
+  */
+  if (WSREP_NNULL(this) && !global_read_lock.provider_resumed())
+  {
+    global_read_lock.wsrep_resume_once();
+    global_read_lock.pause_provider(false);
+  }
+#endif /* WITH_WSREP */
+
   mysql_ull_cleanup(this);
   /*
     All locking service locks must be released on disconnect.
@@ -2248,7 +2287,7 @@ void THD::cleanup(void)
   release_all_locking_service_locks(this);
 
   /* All metadata locks must have been released by now. */
-  DBUG_ASSERT(!mdl_context.has_locks());
+  assert(!mdl_context.has_locks());
 
   /* Protects user_vars. */
   mysql_mutex_lock(&LOCK_thd_data);
@@ -2291,7 +2330,7 @@ void THD::cleanup(void)
  */
 void THD::release_resources()
 {
-  DBUG_ASSERT(m_release_resources_done == false);
+  assert(m_release_resources_done == false);
 
   Global_THD_manager::get_instance()->release_thread_id(m_thread_id);
 
@@ -2309,7 +2348,7 @@ void THD::release_resources()
 #endif
 
   /* modification plan for UPDATE/DELETE should be freed. */
-  DBUG_ASSERT(query_plan.get_modification_plan() == NULL);
+  assert(query_plan.get_modification_plan() == NULL);
   mysql_mutex_unlock(&LOCK_query_plan);
   mysql_mutex_unlock(&LOCK_thd_data);
   mysql_mutex_lock(&LOCK_thd_query);
@@ -2333,7 +2372,7 @@ void THD::release_resources()
 
   plugin_thdvar_cleanup(this, m_enable_plugins);
 
-  DBUG_ASSERT(timer == NULL);
+  assert(timer == NULL);
 
   if (timer_cache)
     thd_timer_destroy(timer_cache);
@@ -2402,7 +2441,7 @@ THD::~THD()
   mysql_mutex_lock(&LOCK_thd_query);
   mysql_mutex_unlock(&LOCK_thd_query);
 
-  DBUG_ASSERT(!m_attachable_trx);
+  assert(!m_attachable_trx);
 
   my_free(const_cast<char*>(m_db.str));
   m_db= NULL_CSTR;
@@ -2414,7 +2453,7 @@ THD::~THD()
   mysql_mutex_destroy(&LOCK_thd_sysvar);
   mysql_mutex_destroy(&LOCK_current_cond);
   mysql_cond_destroy(&COND_thr_lock);
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   dbug_sentry= THD_SENTRY_GONE;
 #endif
 
@@ -2426,11 +2465,17 @@ THD::~THD()
     variables.gtid_next_list.gtid_set= NULL;
     variables.gtid_next_list.is_non_null= false;
 #else
-    DBUG_ASSERT(0);
+    assert(0);
 #endif
   }
   if (rli_slave)
     rli_slave->cleanup_after_session();
+  /*
+    As slaves can be added in one mysql command like COM_REGISTER_SLAVE
+    but then need to be removed on error scenarios, we call this method
+    here.
+  */
+  unregister_slave(this, true, true);
 #endif
 
   free_root(&main_mem_root, MYF(0));
@@ -2564,7 +2609,7 @@ void THD::awake(THD::killed_state state_to_set)
 
   if (state_to_set == THD::KILL_TIMEOUT)
   {
-    DBUG_ASSERT(!status_var_aggregated);
+    assert(!status_var_aggregated);
     status_var.max_execution_time_exceeded++;
   }
 
@@ -2603,8 +2648,8 @@ void THD::awake(THD::killed_state state_to_set)
                       {
                       const char act[]=
                       "now signal dump_thread_signal wait_for go_dump_thread";
-                      DBUG_ASSERT(!debug_sync_set_action(current_thd,
-                                                         STRING_WITH_LEN(act)));
+                      assert(!debug_sync_set_action(current_thd,
+                                                    STRING_WITH_LEN(act)));
                       };);
       mysql_mutex_lock(current_mutex);
       mysql_cond_broadcast(current_cond);
@@ -2758,7 +2803,7 @@ bool THD::store_globals()
     Assert that thread_stack is initialized: it's necessary to be able
     to track stack overrun.
   */
-  DBUG_ASSERT(thread_stack);
+  assert(thread_stack);
 
   if (my_thread_set_THR_THD(this) ||
       my_thread_set_THR_MALLOC(&mem_root))
@@ -2771,7 +2816,7 @@ bool THD::store_globals()
     another thread to the same TLS reference.
   */
   is_killable= true;
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   /*
     Let mysqld define the thread id (not mysys)
     This allows us to move THD to different threads if needed.
@@ -2795,7 +2840,7 @@ void THD::restore_globals()
     Assert that thread_stack is initialized: it's necessary to be able
     to track stack overrun.
   */
-  DBUG_ASSERT(thread_stack);
+  assert(thread_stack);
 
   /* Undocking the thread specific data. */
   my_thread_set_THR_THD(NULL);
@@ -3072,7 +3117,7 @@ void THD::add_changed_table(TABLE *table)
 {
   DBUG_ENTER("THD::add_changed_table(table)");
 
-  DBUG_ASSERT(in_multi_stmt_transaction_mode() && table->file->has_transactions());
+  assert(in_multi_stmt_transaction_mode() && table->file->has_transactions());
   add_changed_table(table->s->table_cache_key.str,
                     (long) table->s->table_cache_key.length);
   DBUG_VOID_RETURN;
@@ -3160,26 +3205,6 @@ const char *get_client_host(THD *client)
     client->security_context()->host().length ?
     client->security_context()->host().str : "";
 }
-
-char *THD::get_client_host_port(THD *client)
-{
-  Security_context *client_sctx= client->security_context();
-  char *client_host= NULL;
-
-  if (client->peer_port && (client_sctx->host().length
-                            || client_sctx->ip().length) &&
-      security_context()->host_or_ip().length)
-  {
-    if ((client_host= (char *) this->alloc(LIST_PROCESS_HOST_LEN+1)))
-      my_snprintf((char *) client_host, LIST_PROCESS_HOST_LEN,
-                  "%s:%u", client_sctx->host_or_ip().str, client->peer_port);
-  }
-  else
-    client_host= this->mem_strdup(get_client_host(client));
-
-  return client_host;
-}
-
 
 /*
   Register an item tree tree transformation, performed by the query
@@ -3751,9 +3776,9 @@ bool Query_result_export::send_data(List<Item> &items)
           so we have to use mbmaxlenlen == 2 here, which is only true
           for gb18030 currently.
         */
-        DBUG_ASSERT(character_set_client->mbmaxlen == 2 ||
-                    my_mbmaxlenlen(character_set_client) == 2 ||
-                    !character_set_client->escape_with_backslash_is_dangerous);
+        assert(character_set_client->mbmaxlen == 2 ||
+               my_mbmaxlenlen(character_set_client) == 2 ||
+               !character_set_client->escape_with_backslash_is_dangerous);
 	for (start=pos=(char*) res->ptr(),end=pos+used_length ;
 	     pos != end ;
 	     pos++)
@@ -3801,7 +3826,7 @@ bool Query_result_export::send_data(List<Item> &items)
             mbcharlen is equal to 2, because there are no
             character sets with mbmaxlen longer than 2
             and with escape_with_backslash_is_dangerous set.
-            DBUG_ASSERT before the loop makes that sure.
+            assert before the loop makes that sure.
 
             But gb18030 is an exception. First of all, 2-byte codes
             would be affected by the issue above without doubt.
@@ -3831,10 +3856,10 @@ bool Query_result_export::send_data(List<Item> &items)
             an ASCII char when we read it, which is correct.
           */
 
-          DBUG_ASSERT(in_escapable_4_bytes >= 0);
+          assert(in_escapable_4_bytes >= 0);
           if (in_escapable_4_bytes > 0)
           {
-            DBUG_ASSERT(check_following_byte);
+            assert(check_following_byte);
             /* We should escape or not escape all the 4 bytes. */
             need_escape= escape_4_bytes;
           }
@@ -3897,7 +3922,7 @@ bool Query_result_export::send_data(List<Item> &items)
 	}
 
         /* Assert that no escape mode is active here */
-        DBUG_ASSERT(in_escapable_4_bytes == 0);
+        assert(in_escapable_4_bytes == 0);
 
 	if (my_b_write(&cache,(uchar*) start,(uint) (pos-start)))
 	  goto err;
@@ -4052,7 +4077,7 @@ void Query_arena::set_query_arena(Query_arena *set)
 
 void Query_arena::cleanup_stmt()
 {
-  DBUG_ASSERT(! "Query_arena::cleanup_stmt() not implemented");
+  assert(! "Query_arena::cleanup_stmt() not implemented");
 }
 
 
@@ -4074,11 +4099,11 @@ void THD::end_statement()
 void THD::set_n_backup_active_arena(Query_arena *set, Query_arena *backup)
 {
   DBUG_ENTER("THD::set_n_backup_active_arena");
-  DBUG_ASSERT(backup->is_backup_arena == FALSE);
+  assert(backup->is_backup_arena == FALSE);
 
   backup->set_query_arena(this);
   set_query_arena(set);
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   backup->is_backup_arena= TRUE;
 #endif
   DBUG_VOID_RETURN;
@@ -4088,10 +4113,10 @@ void THD::set_n_backup_active_arena(Query_arena *set, Query_arena *backup)
 void THD::restore_active_arena(Query_arena *set, Query_arena *backup)
 {
   DBUG_ENTER("THD::restore_active_arena");
-  DBUG_ASSERT(backup->is_backup_arena);
+  assert(backup->is_backup_arena);
   set->set_query_arena(this);
   set_query_arena(backup);
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   backup->is_backup_arena= FALSE;
 #endif
   DBUG_VOID_RETURN;
@@ -4221,7 +4246,7 @@ void Prepared_statement_map::erase(Prepared_statement *statement)
 
   my_hash_delete(&st_hash, (uchar *) statement);
   mysql_mutex_lock(&LOCK_prepared_stmt_count);
-  DBUG_ASSERT(prepared_stmt_count > 0);
+  assert(prepared_stmt_count > 0);
   prepared_stmt_count--;
   mysql_mutex_unlock(&LOCK_prepared_stmt_count);
 }
@@ -4246,7 +4271,7 @@ void Prepared_statement_map::reset()
     }
 #endif
     mysql_mutex_lock(&LOCK_prepared_stmt_count);
-    DBUG_ASSERT(prepared_stmt_count >= st_hash.records);
+    assert(prepared_stmt_count >= st_hash.records);
     prepared_stmt_count-= st_hash.records;
     mysql_mutex_unlock(&LOCK_prepared_stmt_count);
   }
@@ -4262,7 +4287,7 @@ Prepared_statement_map::~Prepared_statement_map()
     We do not want to grab the global LOCK_prepared_stmt_count mutex here.
     reset() should already have been called to maintain prepared_stmt_count.
    */
-  DBUG_ASSERT(st_hash.records == 0);
+  assert(st_hash.records == 0);
 
   my_hash_free(&names_hash);
   my_hash_free(&st_hash);
@@ -4337,7 +4362,7 @@ void thd_increment_bytes_sent(size_t length)
   THD *thd= current_thd;
   if (likely(thd != NULL))
   { /* current_thd==NULL when close_connection() calls net_send_error() */
-    DBUG_ASSERT(!thd->status_var_aggregated);
+    assert(!thd->status_var_aggregated);
     thd->status_var.bytes_sent+= length;
     thd->bytes_sent+= length;
   }
@@ -4349,7 +4374,7 @@ void thd_increment_bytes_received(size_t length)
   THD *thd= current_thd;
   if (likely(thd != NULL))
   {
-    DBUG_ASSERT(!thd->status_var_aggregated);
+    assert(!thd->status_var_aggregated);
     thd->status_var.bytes_received+= length;
     thd->bytes_received+= length;
   }
@@ -4389,11 +4414,11 @@ void THD::restore_backup_open_tables_state(Open_tables_backup *backup)
     Before we will throw away current open tables state we want
     to be sure that it was properly cleaned up.
   */
-  DBUG_ASSERT(open_tables == 0 && temporary_tables == 0 &&
-              derived_tables == 0 &&
-              lock == 0 &&
-              locked_tables_mode == LTM_NONE &&
-              get_reprepare_observer() == NULL);
+  assert(open_tables == 0 && temporary_tables == 0 &&
+         derived_tables == 0 &&
+         lock == 0 &&
+         locked_tables_mode == LTM_NONE &&
+         get_reprepare_observer() == NULL);
 
   set_open_tables_state(backup);
   DBUG_VOID_RETURN;
@@ -4402,7 +4427,7 @@ void THD::restore_backup_open_tables_state(Open_tables_backup *backup)
 
 void THD::begin_attachable_ro_transaction()
 {
-  DBUG_ASSERT(!m_attachable_trx);
+  assert(!m_attachable_trx);
 
   m_attachable_trx= new Attachable_trx(this);
 }
@@ -4410,7 +4435,7 @@ void THD::begin_attachable_ro_transaction()
 
 void THD::end_attachable_transaction()
 {
-  DBUG_ASSERT(m_attachable_trx);
+  assert(m_attachable_trx);
 
   delete m_attachable_trx;
   m_attachable_trx= NULL;
@@ -4497,7 +4522,7 @@ extern "C" const struct charset_info_st *thd_charset(MYSQL_THD thd)
 */
 extern "C" LEX_CSTRING thd_query_unsafe(MYSQL_THD thd)
 {
-  DBUG_ASSERT(current_thd == thd);
+  assert(current_thd == thd);
   return thd->query();
 }
 
@@ -4536,15 +4561,26 @@ extern "C" int thd_non_transactional_update(const MYSQL_THD thd)
     Transaction_ctx::SESSION);
 }
 
+extern "C" int thd_has_active_attachable_trx(const MYSQL_THD thd)
+{
+  return thd->is_attachable_transaction_active();
+}
+
+extern "C" int thd_is_operating_gtid_table_implicitly(const MYSQL_THD thd)
+{
+  return thd->is_operating_gtid_table_implicitly;
+}
+
 extern "C" int thd_binlog_format(const MYSQL_THD thd)
 {
 #ifdef WITH_WSREP
   if (((WSREP(thd) && wsrep_emulate_bin_log) || mysql_bin_log.is_open()) &&
-      (thd->variables.option_bits & OPTION_BIN_LOG))
+      !(thd->variables.option_bits & OPTION_BIN_LOG_INTERNAL_OFF))
+    return (int) WSREP_BINLOG_FORMAT(thd, thd->variables.binlog_format);
 #else
   if (mysql_bin_log.is_open() && (thd->variables.option_bits & OPTION_BIN_LOG))
-#endif
-    return (int) WSREP_BINLOG_FORMAT(thd->variables.binlog_format);
+    return (int) thd->variables.binlog_format;
+#endif /* WITH_WSREP */
   else
     return BINLOG_FORMAT_UNSPEC;
 }
@@ -4552,7 +4588,7 @@ extern "C" int thd_binlog_format(const MYSQL_THD thd)
 extern "C" void thd_mark_transaction_to_rollback(MYSQL_THD thd, int all)
 {
   DBUG_ENTER("thd_mark_transaction_to_rollback");
-  DBUG_ASSERT(thd);
+  assert(thd);
   /*
     The parameter "all" has type int since the function is defined
     in plugin.h. The corresponding parameter in the call below has
@@ -4743,7 +4779,7 @@ void THD::reset_sub_statement_state(Sub_statement_state *backup,
    */
   if (rpl_master_erroneous_autoinc(this))
   {
-    DBUG_ASSERT(backup->auto_inc_intervals_forced.nb_elements() == 0);
+    assert(backup->auto_inc_intervals_forced.nb_elements() == 0);
     auto_inc_intervals_forced.swap(&backup->auto_inc_intervals_forced);
   }
 #endif
@@ -4769,6 +4805,9 @@ void THD::reset_sub_statement_state(Sub_statement_state *backup,
       !is_current_stmt_binlog_format_row())
   {
     variables.option_bits&= ~OPTION_BIN_LOG;
+#ifdef WITH_WSREP
+    variables.option_bits|= OPTION_BIN_LOG_INTERNAL_OFF;
+#endif
   }
 
   if ((backup->option_bits & OPTION_BIN_LOG) &&
@@ -4866,7 +4905,7 @@ void THD::restore_sub_statement_state(Sub_statement_state *backup)
   if (rpl_master_erroneous_autoinc(this))
   {
     backup->auto_inc_intervals_forced.swap(&auto_inc_intervals_forced);
-    DBUG_ASSERT(backup->auto_inc_intervals_forced.nb_elements() == 0);
+    assert(backup->auto_inc_intervals_forced.nb_elements() == 0);
   }
 #endif
 
@@ -4937,29 +4976,42 @@ void THD::set_sent_row_count(ha_rows count)
 {
   m_sent_row_count= count;
   MYSQL_SET_STATEMENT_ROWS_SENT(m_statement_psi, m_sent_row_count);
+#ifdef HAVE_PSI_THREAD_INTERFACE
+  PSI_THREAD_CALL(set_thread_rows_sent)(m_sent_row_count);
+#endif
 }
 
 void THD::set_examined_row_count(ha_rows count)
 {
   m_examined_row_count= count;
   MYSQL_SET_STATEMENT_ROWS_EXAMINED(m_statement_psi, m_examined_row_count);
+/* Not used - setting for consistency */
+#ifdef HAVE_PSI_THREAD_INTERFACE
+  PSI_THREAD_CALL(set_thread_rows_examined)(m_examined_row_count);
+#endif
 }
 
 void THD::inc_sent_row_count(ha_rows count)
 {
   m_sent_row_count+= count;
   MYSQL_SET_STATEMENT_ROWS_SENT(m_statement_psi, m_sent_row_count);
+#ifdef HAVE_PSI_THREAD_INTERFACE
+  PSI_THREAD_CALL(set_thread_rows_sent)(m_sent_row_count);
+#endif
 }
 
 void THD::inc_examined_row_count(ha_rows count)
 {
   m_examined_row_count+= count;
   MYSQL_SET_STATEMENT_ROWS_EXAMINED(m_statement_psi, m_examined_row_count);
+#ifdef HAVE_PSI_THREAD_INTERFACE
+  PSI_THREAD_CALL(set_thread_rows_examined)(m_examined_row_count);
+#endif
 }
 
 void THD::inc_status_created_tmp_disk_tables()
 {
-  DBUG_ASSERT(!status_var_aggregated);
+  assert(!status_var_aggregated);
   status_var.created_tmp_disk_tables++;
   query_plan_flags|= QPLAN_TMP_DISK;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
@@ -4969,7 +5021,7 @@ void THD::inc_status_created_tmp_disk_tables()
 
 void THD::inc_status_created_tmp_tables()
 {
-  DBUG_ASSERT(!status_var_aggregated);
+  assert(!status_var_aggregated);
   status_var.created_tmp_tables++;
   query_plan_flags|= QPLAN_TMP_TABLE;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
@@ -4979,7 +5031,7 @@ void THD::inc_status_created_tmp_tables()
 
 void THD::inc_status_select_full_join()
 {
-  DBUG_ASSERT(!status_var_aggregated);
+  assert(!status_var_aggregated);
   status_var.select_full_join_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_select_full_join)(m_statement_psi, 1);
@@ -4989,7 +5041,7 @@ void THD::inc_status_select_full_join()
 
 void THD::inc_status_select_full_range_join()
 {
-  DBUG_ASSERT(!status_var_aggregated);
+  assert(!status_var_aggregated);
   status_var.select_full_range_join_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_select_full_range_join)(m_statement_psi, 1);
@@ -4998,7 +5050,7 @@ void THD::inc_status_select_full_range_join()
 
 void THD::inc_status_select_range()
 {
-  DBUG_ASSERT(!status_var_aggregated);
+  assert(!status_var_aggregated);
   status_var.select_range_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_select_range)(m_statement_psi, 1);
@@ -5007,7 +5059,7 @@ void THD::inc_status_select_range()
 
 void THD::inc_status_select_range_check()
 {
-  DBUG_ASSERT(!status_var_aggregated);
+  assert(!status_var_aggregated);
   status_var.select_range_check_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_select_range_check)(m_statement_psi, 1);
@@ -5016,7 +5068,7 @@ void THD::inc_status_select_range_check()
 
 void THD::inc_status_select_scan()
 {
-  DBUG_ASSERT(!status_var_aggregated);
+  assert(!status_var_aggregated);
   status_var.select_scan_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_select_scan)(m_statement_psi, 1);
@@ -5026,7 +5078,7 @@ void THD::inc_status_select_scan()
 
 void THD::inc_status_sort_merge_passes()
 {
-  DBUG_ASSERT(!status_var_aggregated);
+  assert(!status_var_aggregated);
   status_var.filesort_merge_passes++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_sort_merge_passes)(m_statement_psi, 1);
@@ -5035,7 +5087,7 @@ void THD::inc_status_sort_merge_passes()
 
 void THD::inc_status_sort_range()
 {
-  DBUG_ASSERT(!status_var_aggregated);
+  assert(!status_var_aggregated);
   status_var.filesort_range_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_sort_range)(m_statement_psi, 1);
@@ -5044,7 +5096,7 @@ void THD::inc_status_sort_range()
 
 void THD::inc_status_sort_rows(ha_rows count)
 {
-  DBUG_ASSERT(!status_var_aggregated);
+  assert(!status_var_aggregated);
   status_var.filesort_rows+= count;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_sort_rows)(m_statement_psi,
@@ -5054,7 +5106,7 @@ void THD::inc_status_sort_rows(ha_rows count)
 
 void THD::inc_status_sort_scan()
 {
-  DBUG_ASSERT(!status_var_aggregated);
+  assert(!status_var_aggregated);
   status_var.filesort_scan_count++;
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_STATEMENT_CALL(inc_statement_sort_scan)(m_statement_psi, 1);
@@ -5088,14 +5140,42 @@ void THD::set_command(enum enum_server_command command)
 
 void THD::set_query(const LEX_CSTRING& query_arg)
 {
-  DBUG_ASSERT(this == current_thd);
+  assert(this == current_thd);
   mysql_mutex_lock(&LOCK_thd_query);
   m_query_string= query_arg;
   mysql_mutex_unlock(&LOCK_thd_query);
+}
 
-#ifdef HAVE_PSI_THREAD_INTERFACE
-  PSI_THREAD_CALL(set_thread_info)(query_arg.str, query_arg.length);
-#endif
+
+/**
+  Set the rewritten query (with passwords obfuscated etc.) on the THD.
+  Wraps this in the LOCK_thd_query mutex to protect against race conditions
+  with SHOW PROCESSLIST inspecting that string.
+
+  This uses swap() and therefore "steals" the argument from the caller;
+  the caller MUST take care not to try to use its own string after calling
+  this function! This is an optimization for mysql_rewrite_query() so we
+  don't copy its temporary string (which may get very long, up to
+  @@max_allowed_packet).
+
+  Using this outside of mysql_rewrite_query() is almost certainly wrong;
+  please check with the runtime team!
+
+  @param query_arg  The rewritten query to use for slow/bin/general logging.
+                    The value will be released in the caller and MUST NOT
+                    be used there after calling this function.
+*/
+void THD::swap_rewritten_query(String& query_arg)
+{
+  assert(this == current_thd);
+
+  mysql_mutex_lock(&LOCK_thd_query);
+  m_rewritten_query.mem_free();
+  m_rewritten_query.swap(query_arg);
+  // The rewritten query should always be a valid C string, just in case.
+  DBUG_EVALUATE_IF("simulate_out_of_memory",
+                    (void) NULL, (void) m_rewritten_query.c_ptr_safe());
+  mysql_mutex_unlock(&LOCK_thd_query);
 }
 
 
@@ -5121,7 +5201,7 @@ void THD::leave_locked_tables_mode()
     global_read_lock.set_explicit_lock_duration(this);
 
     /* Make sure backup locks are not released when leaving LTM */
-    DBUG_ASSERT(!backup_tables_lock.is_acquired());
+    assert(!backup_tables_lock.is_acquired());
     backup_binlog_lock.set_explicit_locks_duration(this);
 
     /*
@@ -5254,7 +5334,7 @@ void THD::decrement_user_connections_counter()
 {
   DBUG_ENTER("THD::decrement_user_connections_counter");
 
-  DBUG_ASSERT(m_user_connect->connections > 0);
+  assert(m_user_connect->connections > 0);
   m_user_connect->connections--;
 
   DBUG_VOID_RETURN;
@@ -5317,7 +5397,7 @@ void THD::time_out_user_resource_limits()
 }
 
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 void THD::Query_plan::assert_plan_is_locked_if_other() const
 {
   if (current_thd != thd)
@@ -5328,7 +5408,7 @@ void THD::Query_plan::assert_plan_is_locked_if_other() const
 void THD::Query_plan::set_query_plan(enum_sql_command sql_cmd,
                                      LEX *lex_arg, bool ps)
 {
-  DBUG_ASSERT(current_thd == thd);
+  assert(current_thd == thd);
 
   // No need to grab mutex for repeated (SQLCOM_END, NULL, false).
   if (sql_command == sql_cmd &&
@@ -5348,7 +5428,7 @@ void THD::Query_plan::set_query_plan(enum_sql_command sql_cmd,
 
 void THD::Query_plan::set_modification_plan(Modification_plan *plan_arg)
 {
-  DBUG_ASSERT(current_thd == thd);
+  assert(current_thd == thd);
   mysql_mutex_assert_owner(&thd->LOCK_query_plan);
   modification_plan= plan_arg;
 }
@@ -5449,7 +5529,7 @@ bool THD::send_result_set_row(List<Item> *row_items)
 void THD::send_statement_status()
 {
   DBUG_ENTER("send_statement_status");
-  DBUG_ASSERT(!get_stmt_da()->is_sent());
+  assert(!get_stmt_da()->is_sent());
   bool error= false;
   Diagnostics_area *da= get_stmt_da();
 
@@ -5477,7 +5557,7 @@ void THD::send_statement_status()
       break;
     case Diagnostics_area::DA_EMPTY:
     default:
-      DBUG_ASSERT(0);
+      assert(0);
           error= m_protocol->send_ok(server_status, 0, 0, 0, NULL);
           break;
   }
@@ -5527,8 +5607,8 @@ void THD::rpl_detach_engine_ha_data()
   Relay_log_info *rli=
     is_binlog_applier() ? rli_fake : (slave_thread ? rli_slave : NULL);
 
-  DBUG_ASSERT(!rli_fake  || !rli_fake-> is_engine_ha_data_detached);
-  DBUG_ASSERT(!rli_slave || !rli_slave->is_engine_ha_data_detached);
+  assert(!rli_fake  || !rli_fake-> is_engine_ha_data_detached);
+  assert(!rli_slave || !rli_slave->is_engine_ha_data_detached);
 
   if (rli)
     rli->detach_engine_ha_data(this);
@@ -5541,8 +5621,8 @@ void THD::rpl_reattach_engine_ha_data()
   Relay_log_info *rli =
       is_binlog_applier() ? rli_fake : (slave_thread ? rli_slave : NULL);
 
-  DBUG_ASSERT(!rli_fake || !rli_fake->is_engine_ha_data_detached);
-  DBUG_ASSERT(!rli_slave || !rli_slave->is_engine_ha_data_detached);
+  assert(!rli_fake || !rli_fake->is_engine_ha_data_detached);
+  assert(!rli_slave || !rli_slave->is_engine_ha_data_detached);
 
   if (rli) rli->reattach_engine_ha_data(this);
 #endif
@@ -5577,6 +5657,23 @@ bool THD::is_current_stmt_binlog_row_enabled_with_write_set_extraction() const
   return ((variables.transaction_write_set_extraction != HASH_ALGORITHM_OFF) &&
           is_current_stmt_binlog_format_row() &&
           !is_current_stmt_binlog_disabled());
+}
+
+void THD::check_rpl_stmt_event_format_used() {
+  for (TABLE_LIST* table = lex->query_tables; table;
+       table = table->next_global) {
+    if (!table->is_placeholder() && table->table != NULL &&
+        table->table->file != NULL) {
+      if (!table->table->file->rpl_can_handle_stm_event()) {
+        is_rpl_stmt_event_format_used = false;
+        return;
+      }
+    }
+  }
+}
+
+bool THD::get_rpl_stmt_event_format_used() const {
+  return is_rpl_stmt_event_format_used;
 }
 
 static my_bool lock_keyring(THD *thd, plugin_ref plugin, void *arg);

@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 2007, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2007, 2024, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -26,6 +34,7 @@ Created 2007-03-27 Sunny Bains
 #ifndef INNOBASE_FTS0TYPES_H
 #define INNOBASE_FTS0TYPES_H
 
+#include <stdint.h>
 #include "univ.i"
 #include "fts0fts.h"
 #include "fut0fut.h"
@@ -123,7 +132,8 @@ struct fts_sync_t {
 	doc_id_t	max_doc_id;	/*!< The doc id at which the cache was
 					noted as being full, we use this to
 					set the upper_limit field */
-	ib_time_t	start_time;	/*!< SYNC start time */
+	ib_time_monotonic_t	start_time;
+	/*!< SYNC start time */
 	bool		in_progress;	/*!< flag whether sync is in progress.*/
 	bool		unlock_cache;	/*!< flag whether unlock cache when
 					write fts node */
@@ -163,6 +173,9 @@ struct fts_cache_t {
 	ulint		total_size;	/*!< total size consumed by the ilist
 					field of all nodes. SYNC is run
 					whenever this gets too big */
+	uint64_t	total_size_before_sync;
+	/*!< total size of fts cache, when last SYNC request was sent */
+
 	fts_sync_t*	sync;		/*!< sync structure to sync data to
 					disk */
 	ib_alloc_t*	sync_heap;	/*!< The heap allocator, for indexes
@@ -292,48 +305,9 @@ struct fts_token_t {
 extern const fts_index_selector_t fts_index_selector[];
 
 /******************************************************************//**
-Compare two fts_trx_row_t instances doc_ids. */
-UNIV_INLINE
-int
-fts_trx_row_doc_id_cmp(
-/*===================*/
-						/*!< out:
-						< 0 if n1 < n2,
-						0 if n1 == n2,
-						> 0 if n1 > n2 */
-	const void*	p1,			/*!< in: id1 */
-	const void*	p2);			/*!< in: id2 */
-
-/******************************************************************//**
-Compare two fts_ranking_t instances doc_ids. */
-UNIV_INLINE
-int
-fts_ranking_doc_id_cmp(
-/*===================*/
-						/*!< out:
-						< 0 if n1 < n2,
-						0 if n1 == n2,
-						> 0 if n1 > n2 */
-	const void*	p1,			/*!< in: id1 */
-	const void*	p2);			/*!< in: id2 */
-
-/******************************************************************//**
-Compare two fts_update_t instances doc_ids. */
-UNIV_INLINE
-int
-fts_update_doc_id_cmp(
-/*==================*/
-						/*!< out:
-						< 0 if n1 < n2,
-						0 if n1 == n2,
-						> 0 if n1 > n2 */
-	const void*	p1,			/*!< in: id1 */
-	const void*	p2);			/*!< in: id2 */
-
-/******************************************************************//**
 Decode and return the integer that was encoded using our VLC scheme.*/
 UNIV_INLINE
-ulint
+uint64_t
 fts_decode_vlc(
 /*===========*/
 			/*!< out: value decoded */
@@ -357,22 +331,22 @@ fts_string_dup(
 /******************************************************************//**
 Return length of val if it were encoded using our VLC scheme. */
 UNIV_INLINE
-ulint
+unsigned int
 fts_get_encoded_len(
 /*================*/
 						/*!< out: length of value
 						 encoded, in bytes */
-	ulint		val);			/*!< in: value to encode */
+	uint64_t	val);			/*!< in: value to encode */
 
 /******************************************************************//**
 Encode an integer using our VLC scheme and return the length in bytes. */
 UNIV_INLINE
-ulint
+unsigned int
 fts_encode_int(
 /*===========*/
 						/*!< out: length of value
 						encoded, in bytes */
-	ulint		val,			/*!< in: value to encode */
+	uint64_t	val,			/*!< in: value to encode */
 	byte*		buf);			/*!< in: buffer, must have
 						enough space */
 

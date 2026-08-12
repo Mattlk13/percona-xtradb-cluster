@@ -1,16 +1,23 @@
 #ifndef TABLE_INCLUDED
 #define TABLE_INCLUDED
 
-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2025, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -50,6 +57,7 @@ struct LEX;
 typedef int8 plan_idx;
 class Opt_hints_qb;
 class Opt_hints_table;
+class Name_string;
 
 #define store_record(A,B) memcpy((A)->B,(A)->record[0],(size_t) (A)->s->reclength)
 #define restore_record(A,B) memcpy((A)->record[0],(A)->B,(size_t) (A)->s->reclength)
@@ -314,7 +322,7 @@ struct GRANT_INFO
      The set is implemented as a bitmap, with the bits defined in sql_acl.h.
    */
   ulong privilege;
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   /**
      @brief the set of privileges that the current user needs to fulfil in
      order to carry out the requested operation. Used in debug build to
@@ -643,7 +651,7 @@ struct TABLE_SHARE
   plugin_ref db_plugin;			/* storage engine plugin */
   inline handlerton *db_type() const	/* table_type for handler */
   { 
-    // DBUG_ASSERT(db_plugin);
+    // assert(db_plugin);
     return db_plugin ? plugin_data<handlerton*>(db_plugin) : NULL;
   }
   enum row_type row_type;		/* How rows are stored */
@@ -1353,7 +1361,7 @@ public:
 
   void set_keyread(bool flag)
   {
-    DBUG_ASSERT(file);
+    assert(file);
     if (flag && !key_read)
     {
       key_read= 1;
@@ -1378,7 +1386,7 @@ public:
   */
   inline bool index_contains_some_virtual_gcol(uint index_no)
   {
-    DBUG_ASSERT(index_no < s->keys);
+    assert(index_no < s->keys);
     return key_info[index_no].flags & HA_VIRTUAL_GEN_KEY;
   }
   bool update_const_key_parts(Item *conds);
@@ -1866,8 +1874,8 @@ struct TABLE_LIST
   void          set_join_cond(Item *val)
   {
     // If optimization has started, it's too late to change m_join_cond.
-    DBUG_ASSERT(m_join_cond_optim == NULL ||
-                m_join_cond_optim == (Item*)1);
+    assert(m_join_cond_optim == NULL ||
+           m_join_cond_optim == (Item*)1);
     m_join_cond= val;
   }
   Item *join_cond_optim() const { return m_join_cond_optim; }
@@ -1877,8 +1885,8 @@ struct TABLE_LIST
       Either we are setting to "empty", or there must pre-exist a
       permanent condition.
     */
-    DBUG_ASSERT(cond == NULL || cond == (Item*)1 ||
-                m_join_cond != NULL);
+    assert(cond == NULL || cond == (Item*)1 ||
+           m_join_cond != NULL);
     m_join_cond_optim= cond;
   }
   Item **join_cond_optim_ref() { return &m_join_cond_optim; }
@@ -1889,7 +1897,7 @@ struct TABLE_LIST
   /// Set the semi-join condition for a semi-join nest
   void set_sj_cond(Item *cond)
   {
-    DBUG_ASSERT(m_sj_cond == NULL);
+    assert(m_sj_cond == NULL);
     m_sj_cond= cond;
   }
 
@@ -1988,7 +1996,7 @@ struct TABLE_LIST
   /// Set table to be merged
   void set_merged()
   {
-    DBUG_ASSERT(effective_algorithm == VIEW_ALGORITHM_UNDEFINED);
+    assert(effective_algorithm == VIEW_ALGORITHM_UNDEFINED);
     effective_algorithm= VIEW_ALGORITHM_MERGE;
   }
 
@@ -2002,8 +2010,8 @@ struct TABLE_LIST
   void set_uses_materialization()
   {
     // @todo We should do this only once, but currently we cannot:
-    //DBUG_ASSERT(effective_algorithm == VIEW_ALGORITHM_UNDEFINED);
-    DBUG_ASSERT(effective_algorithm != VIEW_ALGORITHM_MERGE);
+    //assert(effective_algorithm == VIEW_ALGORITHM_UNDEFINED);
+    assert(effective_algorithm != VIEW_ALGORITHM_MERGE);
     effective_algorithm= VIEW_ALGORITHM_TEMPTABLE;
   }
 
@@ -2027,12 +2035,12 @@ struct TABLE_LIST
   {
     if (is_view_or_derived())
     {
-      DBUG_ASSERT(is_merged());         // Cannot be a materialized view
+      assert(is_merged());         // Cannot be a materialized view
       return leaf_tables_count() > 1;
     }
     else
     {
-      DBUG_ASSERT(nested_join == NULL); // Must be a base table
+      assert(nested_join == NULL); // Must be a base table
       return false;
     }
   }
@@ -2080,7 +2088,7 @@ struct TABLE_LIST
   /// Return the valid LEX object for a view.
   LEX *view_query() const
   {
-    DBUG_ASSERT(view != NULL && view != (LEX *)1);
+    assert(view != NULL && view != (LEX *)1);
     return view;
   }
 
@@ -2096,14 +2104,14 @@ struct TABLE_LIST
   /// Return the query expression of a derived table or view.
   st_select_lex_unit *derived_unit() const
   {
-    DBUG_ASSERT(derived);
+    assert(derived);
     return derived;
   }
 
   /// Set temporary name from underlying temporary table:
   void set_name_temporary()
   {
-    DBUG_ASSERT(is_view_or_derived() && uses_materialization());
+    assert(is_view_or_derived() && uses_materialization());
     table_name= table->s->table_name.str;
     table_name_length= table->s->table_name.length;
     db= (char *)"";
@@ -2113,8 +2121,8 @@ struct TABLE_LIST
   /// Reset original name for temporary table.
   void reset_name_temporary()
   {
-    DBUG_ASSERT(is_view_or_derived() && uses_materialization());
-    DBUG_ASSERT(db != view_db.str && table_name != view_name.str);
+    assert(is_view_or_derived() && uses_materialization());
+    assert(db != view_db.str && table_name != view_name.str);
     if (is_view())
     {
       db= view_db.str;
@@ -2209,6 +2217,7 @@ struct TABLE_LIST
     return view != NULL ? view_name.str : table_name;
   }
 
+#ifdef WITH_WSREP
   /**
      @brief Returns the table alias that this TABLE_LIST represents.
      This is needed to get the real name of the temporary table as the normal
@@ -2218,6 +2227,7 @@ struct TABLE_LIST
      @details The unqualified table alias
    */
   const char *get_table_alias() const { return alias; }
+#endif /* WITH_WSREP */
 
   int fetch_number_of_rows();
   bool update_derived_keys(Field*, Item**, uint);
@@ -2284,11 +2294,11 @@ struct TABLE_LIST
   TABLE_LIST *updatable_base_table()
   {
     TABLE_LIST *tbl= this;
-    DBUG_ASSERT(tbl->is_updatable() && !tbl->is_multiple_tables());
+    assert(tbl->is_updatable() && !tbl->is_multiple_tables());
     while (tbl->is_view_or_derived())
     {
       tbl= tbl->merge_underlying_list;
-      DBUG_ASSERT(tbl->is_updatable() && !tbl->is_multiple_tables());
+      assert(tbl->is_updatable() && !tbl->is_multiple_tables());
     }
     return tbl;
   }
@@ -2633,7 +2643,7 @@ public:
   /// Set table number
   void set_tableno(uint tableno)
   {
-    DBUG_ASSERT(tableno < MAX_TABLES);
+    assert(tableno < MAX_TABLES);
     m_tableno= tableno;
     m_map= (table_map)1 << tableno;
   }
@@ -2643,7 +2653,7 @@ public:
   /// Return table map derived from table number
   table_map map() const
   {
-    DBUG_ASSERT(((table_map)1 << m_tableno) == m_map);
+    assert(((table_map)1 << m_tableno) == m_map);
     return m_map;
   }
 
@@ -2924,7 +2934,7 @@ static inline void tmp_restore_column_map(MY_BITMAP *bitmap,
 static inline my_bitmap_map *dbug_tmp_use_all_columns(TABLE *table,
                                                       MY_BITMAP *bitmap)
 {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   return tmp_use_all_columns(table, bitmap);
 #else
   return 0;
@@ -2934,7 +2944,7 @@ static inline my_bitmap_map *dbug_tmp_use_all_columns(TABLE *table,
 static inline void dbug_tmp_restore_column_map(MY_BITMAP *bitmap,
                                                my_bitmap_map *old)
 {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   tmp_restore_column_map(bitmap, old);
 #endif
 }
@@ -2949,7 +2959,7 @@ static inline void dbug_tmp_use_all_columns(TABLE *table,
                                             MY_BITMAP *read_set,
                                             MY_BITMAP *write_set)
 {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   save[0]= read_set->bitmap;
   save[1]= write_set->bitmap;
   (void) tmp_use_all_columns(table, read_set);
@@ -2962,7 +2972,7 @@ static inline void dbug_tmp_restore_column_maps(MY_BITMAP *read_set,
                                                 MY_BITMAP *write_set,
                                                 my_bitmap_map **old)
 {
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   tmp_restore_column_map(read_set, old[0]);
   tmp_restore_column_map(write_set, old[1]);
 #endif
@@ -3023,7 +3033,7 @@ void open_table_error(TABLE_SHARE *share, int error, int db_errno, int errarg);
 void update_create_info_from_table(HA_CREATE_INFO *info, TABLE *form);
 enum_ident_name_check check_and_convert_db_name(LEX_STRING *db,
                                                 bool preserve_lettercase);
-bool check_column_name(const char *name);
+bool check_column_name(const Name_string &name);
 enum_ident_name_check check_table_name(const char *name, size_t length,
                                        bool check_for_path_chars);
 int rename_file_ext(const char * from,const char * to,const char * ext);
@@ -3083,6 +3093,20 @@ inline bool is_perfschema_db(const char *name)
 {
   return !my_strcasecmp(system_charset_info,
                         PERFORMANCE_SCHEMA_DB_NAME.str, name);
+}
+
+/**
+  Check if the table belongs to the P_S, excluding setup and threads tables.
+
+  @note Performance Schema tables must be accessible independently of the
+        LOCK TABLE mode. This function is needed to handle the special case
+        of P_S tables being used under LOCK TABLE mode.
+*/
+inline bool belongs_to_p_s(TABLE_LIST *tl)
+{
+  return (!strcmp("performance_schema", tl->db) &&
+          strcmp(tl->table_name, "threads") &&
+          strstr(tl->table_name, "setup_") == NULL);
 }
 
 TYPELIB *typelib(MEM_ROOT *mem_root, List<String> &strings);

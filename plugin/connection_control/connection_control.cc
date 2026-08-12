@@ -1,13 +1,20 @@
-/* Copyright (c) 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2016, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -54,6 +61,57 @@ Connection_control_variables g_variables;
 
 Connection_event_coordinator *g_connection_event_coordinator= 0;
 MYSQL_PLUGIN connection_control_plugin_info= 0;
+
+
+/* Performance Schema instrumentation */
+
+PSI_mutex_key key_connection_delay_mutex = PSI_NOT_INSTRUMENTED;
+
+static PSI_mutex_info all_connection_delay_mutex_info[]=
+{
+  {&key_connection_delay_mutex, "connection_delay_mutex", 0}
+};
+
+PSI_rwlock_key key_connection_event_delay_lock;
+
+static PSI_rwlock_info all_connection_delay_rwlock_info[]=
+{
+  {&key_connection_event_delay_lock, "connection_event_delay_lock", 0}
+};
+
+PSI_cond_key key_connection_delay_wait = PSI_NOT_INSTRUMENTED;
+
+static PSI_cond_info all_connection_delay_cond_info[]=
+{
+  {&key_connection_delay_wait, "connection_delay_wait_condition", 0}
+};
+
+PSI_stage_info stage_waiting_in_connection_control_plugin=
+{0, "Waiting in connection_control plugin", 0};
+
+static PSI_stage_info *all_connection_delay_stage_info[]=
+{&stage_waiting_in_connection_control_plugin};
+
+
+/** Register all performance schema instrumentation for connection_control */
+static void
+init_performance_schema()
+{
+  const char *category = "conn_delay";
+
+  int count_mutex = array_elements(all_connection_delay_mutex_info);
+  PSI_server->register_mutex(category, all_connection_delay_mutex_info, count_mutex);
+
+  int count_rwlock = array_elements(all_connection_delay_rwlock_info);
+  mysql_rwlock_register(category, all_connection_delay_rwlock_info,
+                        count_rwlock);
+
+  int count_cond = array_elements(all_connection_delay_cond_info);
+  PSI_server->register_cond(category, all_connection_delay_cond_info, count_cond);
+
+  int count_stage = array_elements(all_connection_delay_stage_info);
+  mysql_stage_register(category, all_connection_delay_stage_info, count_stage);
+}
 
 
 /**
@@ -108,6 +166,13 @@ connection_control_notify(MYSQL_THD thd,
 static int
 connection_control_init(MYSQL_PLUGIN plugin_info)
 {
+
+  /*
+    Declare all performance schema instrumentation up front,
+    so it is discoverable.
+  */
+  init_performance_schema();
+
   connection_control_plugin_info= plugin_info;
   Connection_control_error_handler error_handler(connection_control_plugin_info);
   g_connection_event_coordinator= new Connection_event_coordinator();

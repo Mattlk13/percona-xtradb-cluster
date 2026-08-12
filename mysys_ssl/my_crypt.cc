@@ -18,14 +18,10 @@
 #include <my_global.h>
 #include <string.h>
 
-#ifdef HAVE_YASSL
-#include "yassl.cc"
-#else
 #include <openssl/evp.h>
 #include <openssl/aes.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
-#endif
 #include <my_crypt.h>
 #include <boost/move/unique_ptr.hpp>
 #include <boost/core/noncopyable.hpp>
@@ -115,8 +111,8 @@ int MyEncryptionCTX::init(const my_aes_mode mode, int encrypt, const uchar *key,
                          key, iv, encrypt))
     return MY_AES_OPENSSL_ERROR;
 
-  DBUG_ASSERT(EVP_CIPHER_CTX_key_length(ctx) == (int)klen);
-  DBUG_ASSERT(EVP_CIPHER_CTX_iv_length(ctx) <= (int)ivlen);
+  assert(EVP_CIPHER_CTX_key_length(ctx) == (int)klen);
+  assert(EVP_CIPHER_CTX_iv_length(ctx) <= (int)ivlen);
 
   return MY_AES_OK;
 }
@@ -149,8 +145,12 @@ public:
     this->key= key;
     this->klen= klen;
     this->buf_len= 0;
-    memcpy(oiv, iv, ivlen);
-    DBUG_ASSERT(ivlen == 0 || ivlen == sizeof(oiv));
+    if (iv) {
+      memcpy(oiv, iv, ivlen);
+      assert(ivlen == sizeof(oiv));
+    } else {
+      assert(ivlen == 0);
+    }
 
     int res= MyEncryptionCTX::init(mode, encrypt, key, klen, iv, ivlen);
     if (res == MY_AES_OK)
@@ -161,6 +161,13 @@ public:
   int update(const uchar *src, size_t slen, uchar *dst, size_t *dlen)
   {
     buf_len+= slen;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    size_t new_reminder_len = buf_len % MY_AES_BLOCK_SIZE;
+    size_t reminder_from = (slen < new_reminder_len ? new_reminder_len - slen : 0);
+    size_t reminder_n = new_reminder_len - reminder_from;
+    assert(reminder_n <= slen);
+    memcpy(remainder + reminder_from, src + slen - reminder_n, reminder_n);
+#endif
     return MyEncryptionCTX::update(src, slen, dst, dlen);
   }
 
@@ -169,7 +176,11 @@ public:
     buf_len %= MY_AES_BLOCK_SIZE;
     if (buf_len)
     {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+      uchar *buf= remainder;
+#else
       uchar *buf= EVP_CIPHER_CTX_buf_noconst(ctx);
+#endif
       /*
         Not much we can do, block ciphers cannot encrypt data that aren't
         a multiple of the block length. At least not without padding.
@@ -186,7 +197,7 @@ public:
                                oiv, sizeof(mask), mask, &mlen, key, klen, 0, 0);
       if (result != MY_AES_OK)
         return result;
-      DBUG_ASSERT(mlen == sizeof(mask));
+      assert(mlen == sizeof(mask));
 
       for (uint i=0; i < buf_len; i++)
         dst[i]= buf[i] ^ mask[i];
@@ -199,6 +210,9 @@ private:
   const uchar *key;
   uint klen, buf_len;
   uchar oiv[MY_AES_BLOCK_SIZE];
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+  uchar remainder[MY_AES_BLOCK_SIZE];
+#endif
 };
 
 
@@ -256,7 +270,7 @@ public:
     int fin;
     if (!EVP_CipherFinal_ex(ctx, dst, &fin))
       return MY_AES_BAD_DATA;
-    DBUG_ASSERT(fin == 0);
+    assert(fin == 0);
 
     if (EVP_CIPHER_CTX_encrypting(ctx))
     {
@@ -370,16 +384,6 @@ size_t my_aes_crypt_get_size(enum my_aes_mode mode MY_ATTRIBUTE((unused)), size_
   return (source_length / MY_AES_BLOCK_SIZE + 1) * MY_AES_BLOCK_SIZE;
 }
 
-#ifdef HAVE_YASSL
-#include <random.hpp>
-int my_random_bytes(uchar* buf, int num)
-{
-  TaoCrypt::RandomNumberGenerator rand;
-  rand.GenerateBlock((TaoCrypt::byte*) buf, num);
-  return MY_AES_OK;
-}
-#else
-
 int my_random_bytes(uchar *buf, int num)
 {
   /*
@@ -393,4 +397,3 @@ int my_random_bytes(uchar *buf, int num)
     return MY_AES_OPENSSL_ERROR;
   return MY_AES_OK;
 }
-#endif

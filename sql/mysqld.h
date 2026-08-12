@@ -1,13 +1,25 @@
-/* Copyright (c) 2010, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
+
+   Without limiting anything contained in the foregoing, this file,
+   which is part of C Driver for MySQL (Connector/C), is also subject to the
+   Universal FOSS Exception, version 1.0, a copy of which can be found at
+   http://oss.oracle.com/licenses/universal-foss-exception.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -155,7 +167,7 @@ extern my_bool opt_require_secure_transport;
 extern my_bool opt_slave_preserve_commit_order;
 #endif
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 extern uint slave_rows_last_search_algorithm_used;
 #endif
 extern ulong mts_parallel_option;
@@ -394,13 +406,13 @@ extern bool THR_MALLOC_initialized;
 
 static inline MEM_ROOT ** my_thread_get_THR_MALLOC()
 {
-  DBUG_ASSERT(THR_MALLOC_initialized);
+  assert(THR_MALLOC_initialized);
   return (MEM_ROOT**) my_get_thread_local(THR_MALLOC);
 }
 
 static inline int my_thread_set_THR_MALLOC(MEM_ROOT ** hdl)
 {
-  DBUG_ASSERT(THR_MALLOC_initialized);
+  assert(THR_MALLOC_initialized);
   return my_set_thread_local(THR_MALLOC, hdl);
 }
 
@@ -413,15 +425,20 @@ extern bool THR_THD_initialized;
 
 static inline THD * my_thread_get_THR_THD()
 {
-  DBUG_ASSERT(THR_THD_initialized);
+  if (!THR_THD_initialized) return NULL;
   return (THD*)my_get_thread_local(THR_THD);
 }
 
 static inline int my_thread_set_THR_THD(THD *thd)
 {
-  DBUG_ASSERT(THR_THD_initialized);
+  assert(THR_THD_initialized);
   return my_set_thread_local(THR_THD, thd);
 }
+
+/**
+  Set m_opt_tracking_mode with a user given value associated with sysvar.
+*/
+void set_mysqld_opt_tracking_mode();
 
 #ifdef HAVE_PSI_INTERFACE
 
@@ -993,6 +1010,7 @@ enum options_mysqld
   OPT_SSL_KEY,
   OPT_UPDATE_LOG,
   OPT_WANT_CORE,
+  OPT_COREDUMPER,
   OPT_LOG_ERROR,
 #ifdef WITH_WSREP
   OPT_WSREP_PROVIDER,
@@ -1119,6 +1137,11 @@ static inline THD *_current_thd(void)
 #ifdef _WIN32
 bool update_named_pipe_full_access_group(const char *new_group_name);
 #endif
+
+/* coredumper */
+extern bool  opt_libcoredumper;
+extern char *opt_libcoredumper_path;
+bool         validate_libcoredumper_path(char *opt_libcoredumper_path);
 
 #ifdef WITH_WSREP
 extern "C" void *start_wsrep_THD(void*);

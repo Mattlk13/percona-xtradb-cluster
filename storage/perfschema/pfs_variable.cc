@@ -1,13 +1,20 @@
-/* Copyright (c) 2015, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2015, 2023, Oracle and/or its affiliates.
 
   This program is free software; you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation; version 2 of the License.
+  it under the terms of the GNU General Public License, version 2.0,
+  as published by the Free Software Foundation.
+
+  This program is also distributed with certain software (including
+  but not limited to OpenSSL) that is licensed under separate terms,
+  as designated in a particular file or component or in included license
+  documentation.  The authors of MySQL hereby grant you an additional
+  permission to link the program and your derivative works with the
+  separately licensed software that they have included with MySQL.
 
   This program is distributed in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
+  GNU General Public License, version 2.0, for more details.
 
   You should have received a copy of the GNU General Public License
   along with this program; if not, write to the Free Software
@@ -36,7 +43,7 @@
 */
 bool PFS_system_variable_cache::init_show_var_array(enum_var_type scope, bool strict)
 {
-  DBUG_ASSERT(!m_initialized);
+  assert(!m_initialized);
   m_query_scope= scope;
 
   mysql_rwlock_rdlock(&LOCK_system_variables_hash);
@@ -123,7 +130,7 @@ int PFS_system_variable_cache::do_materialize_global(void)
   {
     const char* name= show_var->name;
     sys_var *value= (sys_var *)show_var->value;
-    DBUG_ASSERT(value);
+    assert(value);
 
     if ((m_query_scope == OPT_GLOBAL) &&
         (!my_strcasecmp(system_charset_info, name, "sql_log_bin")))
@@ -151,7 +158,7 @@ int PFS_system_variable_cache::do_materialize_global(void)
         The assert below will fail once SQL_LOG_BIN really is defined
         as SESSION_ONLY (in 5.8), so that this special case can be removed.
       */
-      DBUG_ASSERT(value->scope() == sys_var::SESSION);
+      assert(value->scope() == sys_var::SESSION);
       continue;
     }
 
@@ -201,7 +208,7 @@ int PFS_system_variable_cache::do_materialize_all(THD *unsafe_thd)
     {
       const char* name= show_var->name;
       sys_var *value= (sys_var *)show_var->value;
-      DBUG_ASSERT(value);
+      assert(value);
       bool ignore= false;
 
       if (value->scope() == sys_var::SESSION &&
@@ -312,7 +319,7 @@ int PFS_system_variable_cache::do_materialize_session(PFS_thread *pfs_thread)
   mysql_mutex_lock(&LOCK_plugin_delete);
 
   /* The SHOW_VAR array must be initialized externally. */
-  DBUG_ASSERT(m_initialized);
+  assert(m_initialized);
 
   /* Use a temporary mem_root to avoid depleting THD mem_root. */
   if (m_use_mem_root)
@@ -376,7 +383,7 @@ int PFS_system_variable_cache::do_materialize_session(PFS_thread *pfs_thread, ui
   mysql_mutex_lock(&LOCK_plugin_delete);
 
   /* The SHOW_VAR array must be initialized externally. */
-  DBUG_ASSERT(m_initialized);
+  assert(m_initialized);
 
   /* Get and lock a validated THD from the thread manager. */
   if ((m_safe_thd= get_THD(pfs_thread)) != NULL)
@@ -514,7 +521,7 @@ void System_variable::init(THD *target_thd, const SHOW_VAR *show_var,
     return;
 
   enum_mysql_show_type show_var_type= show_var->type;
-  DBUG_ASSERT(show_var_type == SHOW_SYS);
+  assert(show_var_type == SHOW_SYS);
   
   m_name= show_var->name;
   m_name_length= strlen(m_name);
@@ -537,7 +544,7 @@ void System_variable::init(THD *target_thd, const SHOW_VAR *show_var,
   mysql_mutex_lock(&LOCK_global_system_variables);
 
   sys_var *system_var= (sys_var *)show_var->value;
-  DBUG_ASSERT(system_var != NULL);
+  assert(system_var != NULL);
   m_charset= system_var->charset(target_thd);
   m_type= system_var->show_type();
   m_scope= system_var->scope();
@@ -548,7 +555,9 @@ void System_variable::init(THD *target_thd, const SHOW_VAR *show_var,
                               NULL, &m_charset, m_value_str, &m_value_length);
 
 #ifdef WITH_WSREP
-  m_value_length= MY_MIN(m_value_length, ((SHOW_VAR_FUNC_BUFF_SIZE > 2048) ? SHOW_VAR_FUNC_BUFF_SIZE : 2048));
+  m_value_length= std::min(
+      m_value_length,
+      size_t(std::max(SHOW_VAR_FUNC_BUFF_SIZE, WSREP_PS_VAR_VALUE_BUFF_SIZE)));
 #else
   m_value_length= MY_MIN(m_value_length, SHOW_VAR_FUNC_BUFF_SIZE);
 #endif /* WITH_WSREP */
@@ -679,8 +688,8 @@ bool PFS_status_variable_cache::match_scope(SHOW_SCOPE variable_scope, bool stri
 */
 bool PFS_status_variable_cache::filter_by_name(const SHOW_VAR *show_var)
 {
-  DBUG_ASSERT(show_var);
-  DBUG_ASSERT(show_var->name);
+  assert(show_var);
+  assert(show_var->name);
 
   if (show_var->type == SHOW_ARRAY)
   {
@@ -792,7 +801,7 @@ bool PFS_status_variable_cache::filter_show_var(const SHOW_VAR *show_var, bool s
 */
 bool PFS_status_variable_cache::init_show_var_array(enum_var_type scope, bool strict)
 {
-  DBUG_ASSERT(!m_initialized);
+  assert(!m_initialized);
 
   /* Resize if necessary. */
   m_show_var_array.reserve(all_status_vars.size()+1);
@@ -870,7 +879,7 @@ void PFS_status_variable_cache::expand_show_var_array(const SHOW_VAR *show_var_a
 char * PFS_status_variable_cache::make_show_var_name(const char* prefix, const char* name,
                                                      char *name_buf, size_t buf_len)
 {
-  DBUG_ASSERT(name_buf != NULL);
+  assert(name_buf != NULL);
   char *prefix_end= name_buf;
 
   if (prefix && *prefix)
@@ -986,7 +995,7 @@ int PFS_status_variable_cache::do_materialize_global(void)
 int PFS_status_variable_cache::do_materialize_all(THD* unsafe_thd)
 {
   int ret= 1;
-  DBUG_ASSERT(unsafe_thd != NULL);
+  assert(unsafe_thd != NULL);
 
   m_unsafe_thd= unsafe_thd;
   m_materialized= false;
@@ -1033,7 +1042,7 @@ int PFS_status_variable_cache::do_materialize_all(THD* unsafe_thd)
 int PFS_status_variable_cache::do_materialize_session(THD* unsafe_thd)
 {
   int ret= 1;
-  DBUG_ASSERT(unsafe_thd != NULL);
+  assert(unsafe_thd != NULL);
 
   m_unsafe_thd= unsafe_thd;
   m_materialized= false;
@@ -1080,7 +1089,7 @@ int PFS_status_variable_cache::do_materialize_session(THD* unsafe_thd)
 int PFS_status_variable_cache::do_materialize_session(PFS_thread *pfs_thread)
 {
   int ret= 1;
-  DBUG_ASSERT(pfs_thread != NULL);
+  assert(pfs_thread != NULL);
 
   m_pfs_thread= pfs_thread;
   m_materialized= false;
@@ -1091,7 +1100,7 @@ int PFS_status_variable_cache::do_materialize_session(PFS_thread *pfs_thread)
     mysql_mutex_lock(&LOCK_status);
 
   /* The SHOW_VAR array must be initialized externally. */
-  DBUG_ASSERT(m_initialized);
+  assert(m_initialized);
 
     /* Get and lock a validated THD from the thread manager. */
   if ((m_safe_thd= get_THD(pfs_thread)) != NULL)
@@ -1123,7 +1132,7 @@ int PFS_status_variable_cache::do_materialize_session(PFS_thread *pfs_thread)
 */
 int PFS_status_variable_cache::do_materialize_client(PFS_client *pfs_client)
 {
-  DBUG_ASSERT(pfs_client != NULL);
+  assert(pfs_client != NULL);
   STATUS_VAR status_totals;
 
   m_pfs_client= pfs_client;
@@ -1135,7 +1144,7 @@ int PFS_status_variable_cache::do_materialize_client(PFS_client *pfs_client)
     mysql_mutex_lock(&LOCK_status);
 
   /* The SHOW_VAR array must be initialized externally. */
-  DBUG_ASSERT(m_initialized);
+  assert(m_initialized);
 
   /*
     Generate status totals from active threads and from totals aggregated

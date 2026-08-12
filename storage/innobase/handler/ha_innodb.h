@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 2000, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2000, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -494,6 +502,12 @@ protected:
 	doesn't give any clue that it is called at the end of a statement. */
 	int end_stmt();
 
+	/** Can reuse the template. Mainly used for partition.
+	@retval true Can reuse the mysql_template */
+	virtual bool can_reuse_mysql_template() {
+		return(false);
+	}
+
 
 	/** The multi range read session object */
 	DsMrr_impl		m_ds_mrr;
@@ -566,6 +580,18 @@ int thd_slave_thread(const MYSQL_THD thd);
 @retval 0 the user thread is not running a non-transactional update
 @retval 1 the user thread is running a non-transactional update */
 int thd_non_transactional_update(const MYSQL_THD thd);
+
+/** Check if the thread has attachable transaction
+@param thd user thread
+@retval 0 thd doesn't have attachable trx
+@retval 1 thd has attachable trx */
+int thd_has_active_attachable_trx(const MYSQL_THD thd);
+
+/** Check if the thread is doing a gtid operation implicitly
+@param thd user thread
+@retval 0 thd is not doing any gtid implicit operation
+@retval 1 thd is doing gtid implicit operation */
+int thd_is_operating_gtid_table_implicitly(const MYSQL_THD thd);
 
 /** Get the user thread's binary logging format
 @param thd user thread
@@ -653,6 +679,12 @@ typedef struct new_ft_info
 	row_prebuilt_t*		ft_prebuilt;
 	fts_result_t*		ft_result;
 } NEW_FT_INFO;
+
+/* Check if the thread can skip  innodb concurrency check
+@param[in]	row_prebuilt_t*	 prebuilt
+@return true if thread can skip innodb concurrency check*/
+ibool
+skip_concurrency_ticket(row_prebuilt_t* prebuilt);
 
 /**
 Allocates an InnoDB transaction for a MySQL handler object.
@@ -1240,3 +1272,6 @@ innobase_create_zip_dict_references(
 /** Free InnoDB session specific data.
 @param[in,out]	thd	MySQL thread handler. */
 void thd_free_innodb_session(THD* thd);
+
+uint innodb_force_index_records_in_range(THD* thd);
+uint innodb_records_in_range(THD* thd);

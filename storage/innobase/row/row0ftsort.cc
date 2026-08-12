@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 2010, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2010, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -505,7 +513,9 @@ row_merge_fts_doc_tokenize(
 
 	/* Tokenize the data and add each word string, its corresponding
 	doc id and position to sort buffer */
-	while (t_ctx->processed_len < doc->text.f_len) {
+	while (parser == NULL ?
+			t_ctx->processed_len < doc->text.f_len :
+			t_ctx->processed_len == 0 || UT_LIST_GET_LEN(t_ctx->fts_token_list) != 0) {
 		ulint		idx = 0;
 		ib_uint32_t	position;
 		ulint		cur_len = 0;
@@ -765,7 +775,6 @@ fts_parallel_tokenization(
 	row_merge_block_t**	block;
 	int			tmpfd[FTS_NUM_AUX_INDEX];
 	ulint			mycount[FTS_NUM_AUX_INDEX];
-	ib_uint64_t		total_rec = 0;
 	ulint			num_doc_processed = 0;
 	doc_id_t		last_doc_id = 0;
 	mem_heap_t*		blob_heap = NULL;
@@ -847,7 +856,6 @@ loop:
 			/* Not yet finish processing the "doc" on hand,
 			continue processing it */
 			ut_ad(doc.text.f_str);
-			ut_ad(t_ctx.processed_len < doc.text.f_len);
 		}
 
 		processed = row_merge_fts_doc_tokenize(
@@ -858,7 +866,6 @@ loop:
 
 		/* Current sort buffer full, need to recycle */
 		if (!processed) {
-			ut_ad(t_ctx.processed_len < doc.text.f_len);
 			ut_ad(t_ctx.rows_added[t_ctx.buf_used]);
 			break;
 		}
@@ -1034,7 +1041,6 @@ exit:
 			goto func_exit;
 		}
 
-		total_rec += merge_file[i]->n_rec;
 		close(tmpfd[i]);
 	}
 

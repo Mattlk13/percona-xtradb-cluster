@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 2011, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2011, 2024, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -126,6 +134,8 @@ should not exceed FTS_DOC_ID_MAX_STEP */
 #define FTS_INDEX_DOC_COUNT_LEN		4
 /* BLOB COLUMN, 0 means VARIABLE SIZE */
 #define FTS_INDEX_ILIST_LEN		0
+/* Maximum nested expression in fulltext binary search string */
+#define FTS_MAX_NESTED_EXP		31
 
 /** Variable specifying the FTS parallel sort degree */
 extern ulong		fts_sort_pll_degree;
@@ -1039,7 +1049,10 @@ fts_drop_index(
 /*===========*/
 	dict_table_t*	table,	/*!< in: Table where indexes are dropped */
 	dict_index_t*	index,	/*!< in: Index to be dropped */
-	trx_t*		trx);	/*!< in: Transaction for the drop */
+	trx_t*		trx,	/*!< in: Transaction for the drop */
+	bool		adding_another = false); /*!< in: Another FTS index is
+                                                      to be added as part of
+                                                      the same transaction */
 
 /****************************************************************//**
 Rename auxiliary tables for all fts index for a table

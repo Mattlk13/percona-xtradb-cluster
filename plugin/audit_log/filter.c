@@ -67,9 +67,9 @@ static PSI_rwlock_info all_rwlock_list[]=
 
 #endif
 
-mysql_rwlock_t LOCK_account_list;
-mysql_rwlock_t LOCK_database_list;
-mysql_rwlock_t LOCK_command_list;
+static mysql_rwlock_t LOCK_account_list;
+static mysql_rwlock_t LOCK_database_list;
+static mysql_rwlock_t LOCK_command_list;
 
 /*
   Initialize account
@@ -78,7 +78,7 @@ static
 void account_init(account *acc, const char *user, size_t user_length,
                                 const char *host, size_t host_length)
 {
-  DBUG_ASSERT(user_length + host_length + 2 <= sizeof(acc->name));
+  assert(user_length + host_length + 2 <= sizeof(acc->name));
 
   memcpy(acc->name, user, user_length);
   memcpy(acc->name + user_length + 1, host, host_length);
@@ -106,6 +106,7 @@ account *account_create(const char *user, size_t user_length,
 /*
   Get account key
 */
+static
 uchar *account_get_key(const account *acc, size_t *length,
                        my_bool not_used MY_ATTRIBUTE((unused)))
 {
@@ -119,7 +120,7 @@ uchar *account_get_key(const account *acc, size_t *length,
 static
 void database_init(database *db, const char *name, size_t length)
 {
-  DBUG_ASSERT(length + 1 <= sizeof(db->name));
+  assert(length + 1 <= sizeof(db->name));
 
   memcpy(db->name, name, length);
   db->name[length]= 0;
@@ -144,6 +145,7 @@ database *database_create(const char *name, size_t length)
 /*
   Get database key
 */
+static
 uchar *database_get_key(const database *db, size_t *length,
                         my_bool not_used MY_ATTRIBUTE((unused)))
 {
@@ -157,7 +159,7 @@ uchar *database_get_key(const database *db, size_t *length,
 static
 void command_init(command *cmd, const char *name, size_t length)
 {
-  DBUG_ASSERT(length + 1 <= sizeof(cmd->name));
+  assert(length + 1 <= sizeof(cmd->name));
 
   memcpy(cmd->name, name, length);
   cmd->name[length]= 0;
@@ -182,6 +184,7 @@ command *command_create(const char *name, size_t length)
 /*
   Get command key
 */
+static
 uchar *command_get_key(const command *acc, size_t *length,
                        my_bool not_used MY_ATTRIBUTE((unused)))
 {

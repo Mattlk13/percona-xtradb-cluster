@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 2006, 2016, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 2006, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -153,8 +161,8 @@ innobase_mysql_print_thd(
 /*=====================*/
 	FILE*	f,		/*!< in: output stream */
 	THD*	thd,		/*!< in: pointer to a MySQL THD object */
-	uint	max_query_len);	/*!< in: max query length to print, or 0 to
-				   use the default max length */
+	uint	max_query_len);	/*!< in: max query length to print, 
+				 must be positive */
 
 /** Converts a MySQL type to an InnoDB type. Note that this function returns
 the 'mtype' of InnoDB. InnoDB differentiates between MySQL's old <= 4.1
@@ -248,9 +256,8 @@ int wsrep_innobase_kill_one_trx(
 	trx_t*		victim_trx,
 	ibool		signal);
 
-my_bool wsrep_thd_set_PA_safe(
-	void*		thd_ptr,
-	my_bool		safe);
+my_bool wsrep_thd_set_PA_unsafe(
+	void*		thd_ptr);
 
 int wsrep_thd_conflict_state(
 	void*		thd_ptr,
@@ -325,6 +332,17 @@ innobase_get_at_most_n_mbchars(
 	ulint data_len,		/*!< in: length of the string in bytes */
 	const char* str);	/*!< in: character string */
 
+/** Checks sys_vars and determines if allocator should mark
+large memory segments with MADV_DONTDUMP
+@return true if @@global.core_file AND
+NOT @@global.innodb_buffer_pool_in_core_file */
+bool innobase_should_madvise_buf_pool();
+
+/** Make sure that core file will not be generated, as generating a core file
+might violate our promise to not dump buffer pool data, and/or might dump not
+the expected memory pages due to failure in using madvise */
+void innobase_disable_core_dump();
+
 /******************************************************************//**
 Returns the lock wait timeout for the current connection.
 @return the lock wait timeout, in seconds */
@@ -370,7 +388,7 @@ innobase_get_table_cache_size(void);
 ulong
 thd_flush_log_at_trx_commit(
 /*================================*/
-	void*	thd);
+	THD*	thd);
 
 /**********************************************************************//**
 Get the current setting of the lower_case_table_names global parameter from

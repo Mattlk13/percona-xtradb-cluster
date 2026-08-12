@@ -1,13 +1,20 @@
-/* Copyright (c) 2010, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2010, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -122,7 +129,7 @@ Alter_table_ctx::Alter_table_ctx()
     tables_opened(0),
     db(NULL), table_name(NULL), alias(NULL),
     new_db(NULL), new_name(NULL), new_alias(NULL)
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     , tmp_table(false)
 #endif
 {
@@ -136,7 +143,7 @@ Alter_table_ctx::Alter_table_ctx(THD *thd, TABLE_LIST *table_list,
   : datetime_field(NULL), error_if_not_empty(false),
     tables_opened(tables_opened_arg),
     new_db(new_db_arg), new_name(new_name_arg)
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     , tmp_table(false)
 #endif
 {
@@ -213,7 +220,7 @@ Alter_table_ctx::Alter_table_ctx(THD *thd, TABLE_LIST *table_list,
       this case. This fact is enforced with assert.
     */
     build_tmptable_filename(thd, tmp_path, sizeof(tmp_path));
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     tmp_table= true;
 #endif
   }
@@ -261,9 +268,9 @@ bool Sql_cmd_alter_table::execute(THD *thd)
     priv_needed|= DROP_ACL;
 
   /* Must be set in the parser */
-  DBUG_ASSERT(select_lex->db);
-  DBUG_ASSERT(!(alter_info.flags & Alter_info::ALTER_EXCHANGE_PARTITION));
-  DBUG_ASSERT(!(alter_info.flags & Alter_info::ALTER_ADMIN_PARTITION));
+  assert(select_lex->db);
+  assert(!(alter_info.flags & Alter_info::ALTER_EXCHANGE_PARTITION));
+  assert(!(alter_info.flags & Alter_info::ALTER_ADMIN_PARTITION));
   if (check_access(thd, priv_needed, first_table->db,
                    &first_table->grant.privilege,
                    &first_table->grant.m_internal,
@@ -348,6 +355,26 @@ bool Sql_cmd_alter_table::execute(THD *thd)
 
 
 #ifdef WITH_WSREP
+  /* Check if foreign keys are accessible.
+  1. Transaction is replicated first, then is done locally.
+  2. Replicated node applies write sets in context
+  of root user.
+  Above two conditions may cause that even if we have no access to FKs,
+  transactions will replicate with success, but fail locally.
+
+  Here we check only for FK access, not if the engine supports FKs.
+  That's enough, because right now we need only to know if transaction
+  should be rolled back because of lack of access and not replicated,
+  or we can replicate it and let replicated node do the rest of the job. */
+  if (alter_info.flags & Alter_info::ADD_FOREIGN_KEY)
+  {
+    if (check_fk_parent_table_access(thd, select_lex->db,
+                                     &create_info, &alter_info, false))
+    {
+      DBUG_RETURN(TRUE);
+    }
+  }
+
   /* PXC doesn't recommend/allow ALTER operation on table created using
   non-transactional storage engine (like MyISAM, HEAP/MEMORY, etc....)
   except ALTER operation to change storage engine to transactional storage

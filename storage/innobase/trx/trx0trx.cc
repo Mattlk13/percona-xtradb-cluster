@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -61,10 +69,6 @@ Created 3/26/1996 Heikki Tuuri
 #include <wsrep_mysqld.h>
 #endif /* WITH_WSREP */
 static const ulint MAX_DETAILED_ERROR_LEN = 256;
-
-#ifdef WITH_WSREP
-#include <wsrep_mysqld.h>
-#endif /* WITH_WSREP */
 
 /** Set of table_id */
 typedef std::set<
@@ -260,6 +264,9 @@ struct TrxFactory {
 		trx->state = TRX_STATE_NOT_STARTED;
 
 		trx->dict_operation_lock_mode = 0;
+
+		ut_a(trx->in_innodb == 0);
+		ut_a(trx->in_depth == 0);
 
 		trx->xid = UT_NEW_NOKEY(xid_t());
 
@@ -530,10 +537,12 @@ trx_free(trx_t*& trx)
 
 	ut_ad(trx->read_view == NULL);
 	ut_ad(trx->is_dd_trx == false);
+	ut_ad(trx->in_depth == 0);
 
 	/* trx locking state should have been reset before returning trx
 	to pool */
 	ut_ad(trx->will_lock == 0);
+	trx->in_innodb &= TRX_FORCE_ROLLBACK_MASK;
 
 	trx_pools->mem_free(trx);
 
@@ -552,6 +561,8 @@ trx_allocate_for_background(void)
 	trx = trx_create_low();
 
 	trx->sess = trx_dummy_sess;
+
+	trx->stats.set(false);
 
 	return(trx);
 }
@@ -666,6 +677,7 @@ trx_free_prepared(
 	was not called. */
 	trx->lock.table_locks.clear();
 
+	trx_validate_state_before_free(trx);
 	trx_free(trx);
 }
 
@@ -2071,13 +2083,6 @@ trx_commit_in_memory(
 		}
 	}
 
-	if (trx->rsegs.m_redo.rseg != NULL) {
-		trx_rseg_t*	rseg = trx->rsegs.m_redo.rseg;
-		mutex_enter(&rseg->mutex);
-		ut_ad(rseg->trx_ref_count > 0);
-		--rseg->trx_ref_count;
-		mutex_exit(&rseg->mutex);
-	}
 
 	if (mtr != NULL) {
 
@@ -2147,6 +2152,24 @@ trx_commit_in_memory(
 		master thread, purge thread or page_cleaner thread might
 		have some work to do. */
 		srv_active_wake_master_thread();
+	}
+
+	/* Do not decrement the reference count before this point.
+	There is a potential issue where a thread attempting to truncate
+	an undo tablespace may end up truncating this undo space
+	before this thread can complete the cleanup.
+	While truncating an undo space, the server tries to find if any
+	transaction is actively using the undo log being truncated. A
+	non-zero reference count ensures that the thread attempting to
+	truncate the undo tablespace cannot be successful as the undo log
+	cannot be truncated until it is empty. */
+	if (trx->rsegs.m_redo.rseg != NULL) {
+		trx_rseg_t*	rseg = trx->rsegs.m_redo.rseg;
+		mutex_enter(&rseg->mutex);
+		ut_ad(rseg->trx_ref_count > 0);
+		--rseg->trx_ref_count;
+		mutex_exit(&rseg->mutex);
+		trx->rsegs.m_redo.rseg = NULL;
 	}
 
 	/* Free all savepoints, starting from the first. */
@@ -2266,7 +2289,7 @@ trx_commit_low(
 	} else {
 		serialised = false;
 	}
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 	/* In case of this function is called from a stack executing
 	   THD::release_resources -> ...
               innobase_connection_close() ->
@@ -2434,7 +2457,6 @@ trx_commit_or_rollback_prepare(
 	switch (trx->state) {
 	case TRX_STATE_NOT_STARTED:
 	case TRX_STATE_FORCED_ROLLBACK:
-
 #ifdef WITH_WSREP
 		ut_d(trx->start_file = __FILE__);
 		ut_d(trx->start_line = __LINE__);
@@ -2695,7 +2717,7 @@ trx_print_low(
 			/*!< in: transaction */
 	ulint		max_query_len,
 			/*!< in: max query length to print,
-			or 0 to use the default max length */
+			must be positive */
 	ulint		n_rec_locks,
 			/*!< in: lock_number_of_rows_locked(&trx->lock) */
 	ulint		n_trx_locks,
@@ -3318,9 +3340,18 @@ trx_get_trx_by_xid_low(
 		    && trx_state_eq(trx, TRX_STATE_PREPARED)
 		    && xid->eq(trx->xid)) {
 
+#ifdef WITH_WSREP
+			/* The commit of a prepared recovered Galera
+			transaction needs a valid trx->xid for
+			invoking trx_sys_update_wsrep_checkpoint(). */
+			if (!wsrep_is_wsrep_xid(trx->xid)) {
+#endif
 			/* Invalidate the XID, so that subsequent calls
 			will not find it. */
 			trx->xid->reset();
+#ifdef WITH_WSREP
+			}
+#endif /* WITH_WSREP */
 			break;
 		}
 	}
@@ -3739,5 +3770,4 @@ trx_kill_blocking(trx_t* trx)
 
 		row_mysql_freeze_data_dictionary(trx);
 	}
-
 }

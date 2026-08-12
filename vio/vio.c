@@ -1,13 +1,25 @@
-/* Copyright (c) 2000, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
+
+   Without limiting anything contained in the foregoing, this file,
+   which is part of C Driver for MySQL (Connector/C), is also subject to the
+   Universal FOSS Exception, version 1.0, a copy of which can be found at
+   http://oss.oracle.com/licenses/universal-foss-exception.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -101,6 +113,7 @@ static void vio_init(Vio *vio, enum enum_vio_type type,
   memset(vio, 0, sizeof(*vio));
   vio->type= type;
   vio->mysql_socket= MYSQL_INVALID_SOCKET;
+  vio->force_skip_proxy= FALSE;
   mysql_socket_setfd(&vio->mysql_socket, sd);
   vio->localhost= flags & VIO_LOCALHOST;
   vio->read_timeout= vio->write_timeout= -1;
@@ -223,7 +236,7 @@ my_bool vio_reset(Vio* vio, enum enum_vio_type type,
   DBUG_ENTER("vio_reset");
 
   /* The only supported rebind is from a socket-based transport type. */
-  DBUG_ASSERT(vio->type == VIO_TYPE_TCPIP || vio->type == VIO_TYPE_SOCKET);
+  assert(vio->type == VIO_TYPE_TCPIP || vio->type == VIO_TYPE_SOCKET);
 
   vio_init(&new_vio, type, sd, flags);
 
@@ -422,11 +435,10 @@ void vio_delete(Vio* vio)
 */
 void vio_end(void)
 {
-#if defined(HAVE_YASSL)
-  yaSSL_CleanUp();
-#elif defined(HAVE_OPENSSL)
+#if defined(HAVE_OPENSSL)
   vio_ssl_end();
 #endif
+  vio_proxy_cleanup();
 }
 
 struct vio_string

@@ -1,14 +1,21 @@
-# Copyright (c) 2006, 2018, Oracle and/or its affiliates. All rights reserved.
+# Copyright (c) 2006, 2023, Oracle and/or its affiliates.
 # 
 # This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; version 2 of the License.
-# 
+# it under the terms of the GNU General Public License, version 2.0,
+# as published by the Free Software Foundation.
+#
+# This program is also distributed with certain software (including
+# but not limited to OpenSSL) that is licensed under separate terms,
+# as designated in a particular file or component or in included license
+# documentation.  The authors of MySQL hereby grant you an additional
+# permission to link the program and your derivative works with the
+# separately licensed software that they have included with MySQL.
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-# 
+# GNU General Public License, version 2.0, for more details.
+#
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
@@ -30,7 +37,6 @@ INCLUDE_DIRECTORIES(
   ${SSL_INCLUDE_DIRS}
   ${SSL_INTERNAL_INCLUDE_DIRS}
   ${CMAKE_SOURCE_DIR}/sql/backup
-  ${LZ4_INCLUDE_DIR}
 )
 INCLUDE_DIRECTORIES(SYSTEM
   ${BOOST_PATCHES_DIR}
@@ -71,7 +77,7 @@ SET(SQL_EMBEDDED_SOURCES
   libmysqld.c
   ${GEN_SOURCES}
   ${GEN_YACC_SOURCES}
-  ../extra/lz4/xxhash.c
+  ${BUNDLED_LZ4_PATH}/xxhash.c
   ../client/get_password.c
   ../libmysql/errmsg.c
   ../libmysql/libmysql.c
@@ -116,16 +122,23 @@ SET(SQL_EMBEDDED_SOURCES
 INCLUDE(${MYSQL_CMAKE_SCRIPT_DIR}/compile_flags.cmake)
 
 ADD_COMPILE_FLAGS(
-  ../extra/lz4/xxhash.c
-  COMPILE_FLAGS -DXXH_NAMESPACE=MY_
+  ${BUNDLED_LZ4_PATH}/xxhash.c
+  COMPILE_FLAGS -DXXH_NAMESPACE=MY_ -I${BUNDLED_LZ4_PATH}
 )
+
+ADD_COMPILE_FLAGS(
+  ../sql/rpl_write_set_handler.cc
+  COMPILE_FLAGS -I${CMAKE_SOURCE_DIR}/extra/lz4 -I${BUNDLED_LZ4_PATH}
+  )
 
 # Fixes "C1128: number of sections exceeded object file format limit" in MSVC /MD
 # The flag /bigobj is not added if the build is not /MD
 IF(WIN32 AND CMAKE_SIZEOF_VOID_P MATCHES 8)
   FOREACH(flag 
+     CMAKE_C_FLAGS_MINSIZEREL
      CMAKE_C_FLAGS_RELEASE    CMAKE_C_FLAGS_RELWITHDEBINFO 
      CMAKE_C_FLAGS_DEBUG      CMAKE_C_FLAGS_DEBUG_INIT 
+     CMAKE_CXX_FLAGS_MINSIZEREL
      CMAKE_CXX_FLAGS_RELEASE  CMAKE_CXX_FLAGS_RELWITHDEBINFO
      CMAKE_CXX_FLAGS_DEBUG    CMAKE_CXX_FLAGS_DEBUG_INIT)
     
@@ -156,6 +169,11 @@ IF(HAVE_NO_UNUSED_TYPEDEFS)
   )
 ENDIF()
 
+# Suppress warnings for gcc-12 or newer
+IF(CMAKE_COMPILER_IS_GNUCXX AND NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 12)
+  ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-maybe-uninitialized FILES ../sql/item_geofunc_buffer.cc)
+ENDIF()
+
 # Segfault in boost::geometry code at high optimization levels
 IF(CMAKE_CXX_COMPILER_ID MATCHES "SunPro")
   STRING(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKEBT)
@@ -177,6 +195,30 @@ IF(HAVE_MISLEADING_INDENTATION)
     ../sql/item_geofunc_relchecks_bgwrap.cc
     ../sql/item_geofunc_setops.cc    
     COMPILE_FLAGS "-Wno-misleading-indentation")
+ENDIF()
+
+# Suppress warnings for gcc-11 or newer
+IF(CMAKE_COMPILER_IS_GNUCXX AND NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11)
+  ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-array-bounds FILES ../sql/spatial.cc)
+  ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-stringop-overflow FILES ../sql/spatial.cc)
+  # a false positive with a bison-generated file (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=98753)
+  ADD_CXX_COMPILE_FLAGS_TO_FILES(-Wno-free-nonheap-object FILES ${CMAKE_CURRENT_BINARY_DIR}/sql_hints.yy.cc)
+ENDIF()
+
+# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=98753
+IF(MY_COMPILER_IS_GNU AND NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11)
+  ADD_COMPILE_FLAGS(
+    ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc.cc
+    ${CMAKE_CURRENT_BINARY_DIR}/sql_hints.yy.cc
+    COMPILE_FLAGS "-Wno-free-nonheap-object -Wno-unused-label")
+ENDIF()
+
+IF(MY_COMPILER_IS_GNU OR
+   MY_COMPILER_IS_CLANG AND NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 4)
+  ADD_COMPILE_FLAGS(
+    ${CMAKE_CURRENT_BINARY_DIR}/sql_yacc.cc
+    ${CMAKE_CURRENT_BINARY_DIR}/sql_hints.yy.cc
+    COMPILE_FLAGS "-Wno-unused-label")
 ENDIF()
 
 # Handle out-of-source build from source package with possibly broken 
@@ -253,6 +295,11 @@ SET(LIBS
   ${MYSQLD_STATIC_EMBEDDED_PLUGIN_LIBS}
   sql_embedded
 )
+
+IF(WIN32)
+  LIST(APPEND LIBS crypt32)
+ENDIF()
+
 
 # Some storage engine were compiled for embedded specifically
 # (with corresponding target ${engine}_embedded)

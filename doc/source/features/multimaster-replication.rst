@@ -1,22 +1,22 @@
-.. _multi-master-replication:
+.. _multi-source-replication:
 
 ========================
-Multi-Master Replication
+Multi-Source Replication
 ========================
 
-Multi-master replication means that you can write to any node
+Multi-source replication means that you can write to any node
 and be sure that the write will be consistent for all nodes in the cluster.
 This is different from regular MySQL replication,
-where you have to apply writes to master to ensure that it will be synced.
+where you have to apply writes to source to ensure that it will be synced.
 
-With multi-master replication any write is either committed on all nodes
+With multi-source replication any write is either committed on all nodes
 or not committed at all.
 The following diagram shows how it works for two nodes,
 but the same logic is applied with any number of nodes in the cluster:
 
 .. figure:: ../_static/certificationbasedreplication.png
 
-   *Image source:* `Galera documentation - HOW CERTIFICATION-BASED REPLICATION WORKS <http://galeracluster.com/documentation-webpages/certificationbasedreplication.html#how-certification-based-replication-works>`_
+   *Image source:* `Galera documentation - HOW CERTIFICATION-BASED REPLICATION WORKS <https://galeracluster.com/library/documentation/certification-based-replication.html>`_
 
 All queries are executed locally on the node,
 and there is special handling only on ``COMMIT``.
@@ -37,21 +37,21 @@ Response time of ``COMMIT`` includes the following:
 There are two important consequences of this architecture:
 
 * Several appliers can be used in parallel.
-  This enables truely parallel replication.
-  A slave can have many parallel threads configured
+  This enables truly parallel replication.
+  A replica can have many parallel threads configured
   using the :option:`wsrep_slave_threads` variable.
 
-* There might be a small period of time when a slave is out of sync.
-  This happens because the master may apply events faster than the slave.
-  And if you do read from the slave,
+* There might be a small period of time when a replica is out of sync.
+  This happens because the source may apply events faster than the replica.
+  And if you do read from the replica,
   you may read the data that has not changed yet.
   You can see that from the diagram.
 
   However, this behavior can be changed
   by setting the :option:`wsrep_causal_reads=ON` variable.
-  In this case, the read on the slave will wait until the event is applied
+  In this case, the read on the replica will wait until the event is applied
   (this will obviously increase the response time of the read).
-  The gap between the slave and the master is the reason
+  The gap between the replica and the source is the reason
   why this replication is called *virtually synchronous replication*,
   and not *real synchronous replication*.
 
@@ -70,7 +70,7 @@ in response to a particular query, but not on ``COMMIT``.
 It is good practice to check the error codes after a ``COMMIT`` query,
 but there are still many applications that do not do that.
 
-If you plan to use multi-master replication
+If you plan to use multi-source replication
 and run write transactions on several nodes,
 you may need to make sure you handle the responses on ``COMMIT`` queries.
 

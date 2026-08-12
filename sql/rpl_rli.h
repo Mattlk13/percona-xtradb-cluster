@@ -1,13 +1,20 @@
-/* Copyright (c) 2005, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2005, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software Foundation,
@@ -143,7 +150,7 @@ public:
   */
   inline bool belongs_to_client()
   {
-    DBUG_ASSERT(info_thd);
+    assert(info_thd);
     return !info_thd->slave_thread;
   }
 /* Instrumentation key for performance schema for mts_temp_table_LOCK */
@@ -303,7 +310,7 @@ public:
   void add_logged_gtid(rpl_sidno sidno, rpl_gno gno)
   {
     global_sid_lock->assert_some_lock();
-    DBUG_ASSERT(sidno <= global_sid_map->get_max_sidno());
+    assert(sidno <= global_sid_map->get_max_sidno());
     gtid_set.ensure_sidno(sidno);
     gtid_set._add_gtid(sidno, gno);
   }
@@ -533,7 +540,7 @@ public:
 
   bool get_table_data(TABLE *table_arg, table_def **tabledef_var, TABLE **conv_table_var) const
   {
-    DBUG_ASSERT(tabledef_var && conv_table_var);
+    assert(tabledef_var && conv_table_var);
     for (TABLE_LIST *ptr= tables_to_lock ; ptr != NULL ; ptr= ptr->next_global)
       if (ptr->table == table_arg)
       {
@@ -819,7 +826,7 @@ public:
   {
     bool ret= (slave_parallel_workers > 0) && !is_mts_recovery();
 
-    DBUG_ASSERT(!ret || !workers.empty());
+    assert(!ret || !workers.empty());
 
     return ret;
   }
@@ -833,6 +840,9 @@ public:
     return is_parallel_exec() &&
       mts_group_status == MTS_IN_GROUP;
   }
+
+  bool mts_workers_queue_empty() const;
+  bool cannot_safely_rollback() const;
 
   /**
      While a group is executed by a Worker the relay log can change.
@@ -868,12 +878,14 @@ public:
   void cleanup_after_session()
   {
     if (deferred_events)
+#ifdef WITH_WSREP
     {
+#endif /* WITH_WSREP */
       delete deferred_events;
 #ifdef WITH_WSREP
       deferred_events= NULL;
-#endif /* WITH_WSREP */
     }
+#endif /* WITH_WSREP */
   };
    
   /**
@@ -1012,7 +1024,7 @@ public:
   inline ulonglong get_group_master_log_pos() { return m_group_master_log_pos; }
   inline void set_group_master_log_name(const char *log_file_name)
   {
-    DBUG_ASSERT(!info_thd ||
+    assert(!info_thd ||
                 info_thd->backup_binlog_lock.is_protection_acquired());
 
     strmake(m_group_master_log_name, log_file_name,
@@ -1020,7 +1032,7 @@ public:
   }
   inline void set_group_master_log_pos(ulonglong log_pos)
   {
-    DBUG_ASSERT(!info_thd ||
+    assert(!info_thd ||
                 info_thd->backup_binlog_lock.is_protection_acquired());
     m_group_master_log_pos= log_pos;
   }
@@ -1312,6 +1324,18 @@ private:
   */
   int thd_tx_priority;
 
+  /**
+    If the SQL thread should or not ignore the set limit for
+    write set collection
+   */
+  bool m_ignore_write_set_memory_limit;
+
+  /**
+    Even if a component says all transactions require write sets,
+    this variable says the SQL thread transactions can drop them
+  */
+  bool m_allow_drop_write_set;
+
 public:
   /*
     The boolean is set to true when the binlog (rli_fake) or slave
@@ -1333,6 +1357,21 @@ public:
   {
     return thd_tx_priority;
   }
+
+  void set_ignore_write_set_memory_limit(bool ignore_limit) {
+    m_ignore_write_set_memory_limit = ignore_limit;
+  }
+
+  bool get_ignore_write_set_memory_limit() {
+    return m_ignore_write_set_memory_limit;
+  }
+
+  void set_allow_drop_write_set(bool does_not_require_ws) {
+    m_allow_drop_write_set = does_not_require_ws;
+  }
+
+  bool get_allow_drop_write_set() { return m_allow_drop_write_set; }
+
   /**
     Detaches the engine ha_data from THD. The fact
     is memorized in @c is_engine_ha_detached flag.

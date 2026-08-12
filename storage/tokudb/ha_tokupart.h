@@ -37,11 +37,14 @@ class ha_tokupart : public native_part::Partition_base {
 
     ~ha_tokupart() override {}
 
+    enum row_type get_partition_row_type(uint part_id) override;
+
    private:
     handler *get_file_handler(TABLE_SHARE *share, MEM_ROOT *alloc) override;
     handler *clone(const char *name, MEM_ROOT *mem_root) override;
     ulong index_flags(uint inx, uint part, bool all_parts) const override;
     const char **bas_ext() const override;
+    Table_flags default_table_flags() const override;
 };
 
 #endif  // _HA_TOKUPART_H

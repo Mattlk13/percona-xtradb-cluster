@@ -1,13 +1,20 @@
-/* Copyright (c) 2015, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2015, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -301,10 +308,10 @@ void Gcs_xcom_state_exchange::reset_with_flush()
 void Gcs_xcom_state_exchange::reset()
 {
 #ifndef NDEBUG
-  Gcs_xcom_communication_interface *binding_broadcaster=
+  Gcs_xcom_communication_interface *binding_broadcaster MY_ATTRIBUTE((unused)) =
     static_cast<Gcs_xcom_communication_interface *>(m_broadcaster);
-#endif
   assert(binding_broadcaster->number_buffered_messages() == 0);
+#endif
 
   m_configuration_id= null_synode;
 
@@ -514,7 +521,9 @@ enum_gcs_error Gcs_xcom_state_exchange::broadcast_state(
   */
   if (exchangeable_data_len > 0)
   {
+#ifndef NDEBUG
     uint64_t slider_total_len= 0;
+#endif
     uint64_t slider_len= 0;
     for (it=exchangeable_data.begin(); it != it_ends; ++it)
     {
@@ -529,7 +538,9 @@ enum_gcs_error Gcs_xcom_state_exchange::broadcast_state(
         );
         msg_data->encode(slider, &slider_len);
         slider += slider_len;
+#ifndef NDEBUG
         slider_total_len += slider_len;
+#endif
         delete msg_data;
       }
     }

@@ -103,6 +103,8 @@ ulong   pxc_maint_transition_period   = 30;
 /* enables PXC SSL auto-config */
 my_bool pxc_encrypt_cluster_traffic   = 0;
 
+/* Set of WSREP features that are enabled */
+ulonglong wsrep_mode                  = 0;
 /*
  * End configuration options
  */
@@ -305,7 +307,7 @@ static void wsrep_pfs_instr_cb(
     void**                        alliedvalue __attribute__((unused)),
     const void*                   ts __attribute__((unused)))
 {
-  DBUG_ASSERT(!wsrep_psi_key_vec.empty());
+  assert(!wsrep_psi_key_vec.empty());
 
   if (type == WSREP_PFS_INSTR_TYPE_MUTEX)
   {
@@ -565,6 +567,43 @@ static void wsrep_pfs_instr_cb(
 }
 #endif /* HAVE_PSI_INTERFACE */
 
+void WSREP_LOG(void (*fun)(const char* fmt, ...), const char* fmt, ...)
+{
+  /* Allocate short buffer from stack. If the vsnprintf() return value
+     indicates that the message was truncated, a new buffer will be allocated
+     dynamically and the message will be reprinted. */
+  char msg[128] = {'\0'};
+  va_list arglist;
+  va_start(arglist, fmt);
+  int n= vsnprintf(msg, sizeof(msg) - 1, fmt, arglist);
+  va_end(arglist);
+  if (n < 0)
+  {
+    sql_print_warning("WSREP: Printing message failed");
+  }
+  else if (n < (int)sizeof(msg))
+  {
+    fun("WSREP: %s", msg);
+  }
+  else
+  {
+    try
+    {
+      std::vector<char> dynbuf(std::max(n, 4096));
+      va_start(arglist, fmt);
+      (void)vsnprintf(&dynbuf[0], dynbuf.size() - 1, fmt, arglist);
+      va_end(arglist);
+      dynbuf[dynbuf.size() - 1] = '\0';
+      fun("WSREP: %s", &dynbuf[0]);
+    }
+    catch (const std::bad_alloc&)
+    {
+      /* Memory allocation for vector failed, print truncated message. */
+      fun("WSREP: %s", msg);
+    }
+  }
+}
+
 static void wsrep_log_cb(wsrep_log_level_t level, const char *msg) {
   switch (level) {
   case WSREP_LOG_INFO:
@@ -695,7 +734,7 @@ wsrep_view_handler_cb (void*                    app_ctx,
   default:
       WSREP_ERROR("Unsupported application protocol version: %d",
                   view->proto_ver);
-      unireg_abort(1);
+      return WSREP_CB_FAILURE;
   }
 
   if (view->state_gap)
@@ -743,11 +782,14 @@ wsrep_view_handler_cb (void*                    app_ctx,
     {
       if (wsrep_before_SE())
       {
-        wsrep_SE_init_grab();
         // Signal mysqld init thread to continue
         wsrep_sst_complete (&cluster_uuid, view->state_id.seqno, false);
         // and wait for SE initialization
-        wsrep_SE_init_wait(thd);
+        if (wsrep_SE_init_wait(thd) == WSREP_SE_INIT_RESULT_FAILURE)
+        {
+            WSREP_ERROR("Storage engine initialization failed.");
+            return WSREP_CB_FAILURE;
+        }
       }
       else
       {
@@ -766,7 +808,7 @@ wsrep_view_handler_cb (void*                    app_ctx,
       WSREP_ERROR("Undetected state gap. Can't continue.");
       wsrep_log_states(WSREP_LOG_FATAL, &cluster_uuid, view->state_id.seqno,
                        &local_uuid, -1);
-      unireg_abort(1);
+      return WSREP_CB_FAILURE;
     }
   }
 
@@ -838,10 +880,10 @@ void wsrep_ready_wait ()
   if (mysql_mutex_lock (&LOCK_wsrep_ready)) abort();
   while (!wsrep_ready)
   {
-    WSREP_INFO("Waiting to reach ready state");
+    WSREP_DEBUG("Waiting to reach ready state");
     mysql_cond_wait (&COND_wsrep_ready, &LOCK_wsrep_ready);
   }
-  WSREP_INFO("Ready state reached");
+  WSREP_DEBUG("Ready state reached");
   mysql_mutex_unlock (&LOCK_wsrep_ready);
 }
 
@@ -853,12 +895,13 @@ static void wsrep_synced_cb(void* app_ctx)
 
   if (signal_main)
   {
-      wsrep_SE_init_grab();
-      // Signal mysqld init thread to continue
-      wsrep_sst_complete (&local_uuid, local_seqno, false);
-      // and wait for SE initialization
-      /* we don't have recv_ctx (THD*) here */
-      wsrep_SE_init_wait(current_thd);
+    // Signal mysqld init thread to continue
+    wsrep_sst_complete (&local_uuid, local_seqno, false);
+    // And wait for SE initialization. Return immediately in
+    // case of failure, the server is going to shut down.
+    /* we don't have recv_ctx (THD*) here */
+    if (wsrep_SE_init_wait(current_thd) == WSREP_SE_INIT_RESULT_FAILURE)
+      return;
   }
   if (wsrep_restart_slave_activated)
   {
@@ -880,8 +923,8 @@ static void wsrep_synced_cb(void* app_ctx)
 static void wsrep_init_position()
 {
   /* read XIDs from storage engines */
-  wsrep_uuid_t uuid;
-  wsrep_seqno_t seqno;
+  wsrep_uuid_t uuid= WSREP_UUID_UNDEFINED;
+  wsrep_seqno_t seqno= WSREP_SEQNO_UNDEFINED;
   wsrep_get_SE_checkpoint(uuid, seqno);
 
   if (!memcmp(&uuid, &WSREP_UUID_UNDEFINED, sizeof(wsrep_uuid_t)))
@@ -954,6 +997,7 @@ int wsrep_init()
   {
     // enable normal operation in case no provider is specified
     wsrep_ready_set(TRUE);
+    wsrep_provider_set = false;
     global_system_variables.wsrep_on = 0;
     wsrep_init_args args;
     args.logger_cb = wsrep_log_cb;
@@ -980,6 +1024,12 @@ int wsrep_init()
             wsrep->provider_version, sizeof(provider_version) - 1);
     strncpy(provider_vendor,
             wsrep->provider_vendor,  sizeof(provider_vendor) - 1);
+
+    /* All three buffers are zero-initialized on declaration, but
+       let's avoid the confusion */
+    provider_name[sizeof(provider_name) - 1] = '\0';
+    provider_version[sizeof(provider_version) - 1] = '\0';
+    provider_vendor[sizeof(provider_vendor) - 1] = '\0';
   }
 
   /* wsrep_cluster_name is restricted to WSREP_CLUSTER_NAME_MAX_LEN characters
@@ -1014,12 +1064,12 @@ int wsrep_init()
   if (!wsrep_data_home_dir || strlen(wsrep_data_home_dir) == 0)
     wsrep_data_home_dir = mysql_real_data_home;
 
-  char node_addr[512]= { 0, };
-  size_t const node_addr_max= sizeof(node_addr) - 1;
+  static const size_t node_addr_buf_size= 512;
+  char node_addr[node_addr_buf_size];
   if (!wsrep_node_address || !strcmp(wsrep_node_address, ""))
   {
-    size_t const ret= wsrep_guess_ip(node_addr, node_addr_max);
-    if (!(ret > 0 && ret < node_addr_max))
+    size_t const ret= wsrep_guess_ip(node_addr, node_addr_buf_size);
+    if (!(ret > 0 && ret < node_addr_buf_size))
     {
       WSREP_WARN("Failed to guess base node address. Set it explicitly via "
                  "wsrep_node_address.");
@@ -1028,7 +1078,22 @@ int wsrep_init()
   }
   else
   {
-    strncpy(node_addr, wsrep_node_address, node_addr_max);
+    /* node_addr is 512 bytes, wsrep_node_address is <ip_address>[:port]
+       so for ipv6 host part is at most 45 characters (IPv4-mapped IPv6).
+       The whole wsrep_node_address will entirely fit into ip_buf leaving
+       space for trailing zero. */
+    if (unlikely(strlen(wsrep_node_address) >= node_addr_buf_size))
+    {
+      WSREP_ERROR("Failed to initialize node address: "
+                  "Host address does not fit into temporary buffer. "
+                  "wsrep_node_address: %s, length: %lu",
+                  wsrep_node_address, strlen(wsrep_node_address));
+      node_addr[0]= '\0';
+    }
+    else {
+      strncpy(node_addr, wsrep_node_address, node_addr_buf_size - 1);
+      node_addr[node_addr_buf_size - 1] = '\0';
+    }
   }
 
   char inc_addr[512]= { 0, };
@@ -1218,6 +1283,10 @@ extern int wsrep_on(void *);
 
 void wsrep_init_startup (bool first)
 {
+  /* if server is started with --help (--verbose) options, there is no need
+     to start replication, skipping wsrep initialization
+  */
+  if (opt_help) return;
   if (wsrep_init()) unireg_abort(1);
 
   wsrep_thr_lock_init(wsrep_thd_is_BF, wsrep_abort_thd,
@@ -1242,6 +1311,7 @@ void wsrep_init_startup (bool first)
 
 void wsrep_deinit()
 {
+  wsrep_sst_auth_free();
   wsrep_unload(wsrep);
   wsrep= 0;
   provider_name[0]=    '\0';
@@ -1312,8 +1382,9 @@ void wsrep_filter_new_cluster (int* argc, char* argv[])
   {
     /* make a copy of the argument to convert possible underscores to hyphens.
      * the copy need not to be longer than WSREP_NEW_CLUSTER option */
-    char arg[sizeof(WSREP_NEW_CLUSTER) + 1]= { 0, };
+    char arg[sizeof(WSREP_NEW_CLUSTER) + 1];
     strncpy(arg, argv[i], sizeof(arg) - 1);
+    arg[sizeof(arg) - 1]= '\0';
     char* underscore(arg);
     while (NULL != (underscore= strchr(underscore, '_'))) *underscore= '-';
 
@@ -1389,6 +1460,11 @@ bool wsrep_start_replication()
   return true;
 }
 
+bool wsrep_check_mode (uint mask)
+{
+  return wsrep_mode & (1ULL << mask);
+}
+
 bool wsrep_must_sync_wait (THD* thd, uint mask)
 {
   return (thd->variables.wsrep_sync_wait & mask) &&
@@ -1438,6 +1514,73 @@ bool wsrep_sync_wait (THD* thd, uint mask)
   }
 
   return false;
+}
+
+bool wsrep_is_show_query(enum enum_sql_command command)
+{
+  assert(command >= 0 && command <= SQLCOM_END);
+  return (sql_command_flags[command] & CF_STATUS_COMMAND) != 0;
+}
+
+static bool wsrep_is_diagnostic_query(enum enum_sql_command command)
+{
+  assert(command >= 0 && command <= SQLCOM_END);
+  return (sql_command_flags[command] & CF_DIAGNOSTIC_STMT) != 0;
+}
+
+static enum enum_wsrep_sync_wait
+wsrep_sync_wait_mask_for_command(enum enum_sql_command command)
+{
+  switch (command)
+  {
+  case SQLCOM_SELECT:
+  case SQLCOM_CHECKSUM:
+    return WSREP_SYNC_WAIT_BEFORE_READ;
+  case SQLCOM_DELETE:
+  case SQLCOM_DELETE_MULTI:
+  case SQLCOM_UPDATE:
+  case SQLCOM_UPDATE_MULTI:
+    return WSREP_SYNC_WAIT_BEFORE_UPDATE_DELETE;
+  case SQLCOM_REPLACE:
+  case SQLCOM_INSERT:
+  case SQLCOM_REPLACE_SELECT:
+  case SQLCOM_INSERT_SELECT:
+    return WSREP_SYNC_WAIT_BEFORE_INSERT_REPLACE;
+  default:
+    if (wsrep_is_diagnostic_query(command))
+    {
+      return WSREP_SYNC_WAIT_NONE;
+    }
+    if (wsrep_is_show_query(command))
+    {
+      switch (command)
+      {
+      case SQLCOM_SHOW_PROFILE:
+      case SQLCOM_SHOW_PROFILES:
+      case SQLCOM_SHOW_SLAVE_HOSTS:
+      case SQLCOM_SHOW_RELAYLOG_EVENTS:
+      case SQLCOM_SHOW_SLAVE_STAT:
+      case SQLCOM_SHOW_MASTER_STAT:
+      case SQLCOM_SHOW_ENGINE_STATUS:
+      case SQLCOM_SHOW_ENGINE_MUTEX:
+      case SQLCOM_SHOW_ENGINE_LOGS:
+      case SQLCOM_SHOW_PROCESSLIST:
+      case SQLCOM_SHOW_PRIVILEGES:
+        return WSREP_SYNC_WAIT_NONE;
+      default:
+        return WSREP_SYNC_WAIT_BEFORE_SHOW;
+      }
+    }
+  }
+  return WSREP_SYNC_WAIT_NONE;
+}
+
+bool wsrep_sync_wait(THD* thd, enum enum_sql_command command)
+{
+  bool res = false;
+  if (WSREP_CLIENT(thd) && thd->variables.wsrep_sync_wait)
+    res = wsrep_sync_wait(thd, wsrep_sync_wait_mask_for_command(command));
+  return res;
 }
 
 void wsrep_keys_free(wsrep_key_arr_t* key_arr)
@@ -1673,7 +1816,7 @@ bool wsrep_prepare_key_for_innodb(const uchar* cache_key,
 int wsrep_to_buf_helper(
     THD* thd, const char *query, uint query_len, uchar** buf, size_t* buf_len)
 {
-  IO_CACHE tmp_io_cache;
+  IO_CACHE tmp_io_cache = {};
   if (open_cached_file(&tmp_io_cache, mysql_tmpdir, TEMP_PREFIX,
                        65536, MYF(MY_WME)))
     return 1;
@@ -1698,6 +1841,12 @@ int wsrep_to_buf_helper(
   {
     *buf     = (uchar *)thd->wsrep_gtid_event_buf;
     *buf_len = thd->wsrep_gtid_event_buf_len;
+  }
+
+  if ((thd->variables.option_bits & OPTION_BIN_LOG) == 0)
+  {
+    Intvar_log_event ev((uchar)binary_log::Intvar_event::BINLOG_CONTROL_EVENT, 0);
+    if (ev.write(&tmp_io_cache)) ret= 1;
   }
 
   /* if there is prepare query, add event for it */
@@ -1814,7 +1963,7 @@ static int wsrep_drop_table_query(THD* thd, uchar** buf, size_t* buf_len)
   TABLE_LIST* first_table= select_lex->table_list.first;
   String buff;
 
-  DBUG_ASSERT(!lex->drop_temporary);
+  assert(!lex->drop_temporary);
 
   bool found_temp_table= false;
   for (TABLE_LIST* table= first_table; table; table= table->next_global)
@@ -1874,10 +2023,6 @@ static int wsrep_drop_table_query(THD* thd, uchar** buf, size_t* buf_len)
 static bool wsrep_can_run_in_toi(THD *thd, const char *db, const char *table,
                                  const TABLE_LIST *table_list)
 {
-  /* Only if binlog is enabled and user can try to set sql_log_bin=0. */
-  if (mysql_bin_log.is_open() && !(thd->variables.option_bits & OPTION_BIN_LOG))
-    return false;
-
   /* compression dictionary is not table object that has temporary qualifier
   attached to it. Neither it is dependent on other object that needs
   validation. */
@@ -1885,8 +2030,8 @@ static bool wsrep_can_run_in_toi(THD *thd, const char *db, const char *table,
       || thd->lex->sql_command == SQLCOM_DROP_COMPRESSION_DICTIONARY)
     return true;
 
-  DBUG_ASSERT(!table || db);
-  DBUG_ASSERT(table_list || db);
+  assert(!table || db);
+  assert(table_list || db);
 
   LEX* lex= thd->lex;
   SELECT_LEX* select_lex= lex->select_lex;
@@ -1895,7 +2040,6 @@ static bool wsrep_can_run_in_toi(THD *thd, const char *db, const char *table,
   switch (lex->sql_command)
   {
   case SQLCOM_CREATE_TABLE:
-    DBUG_ASSERT(!table_list);
     if (thd->lex->create_info.options & HA_LEX_CREATE_TMP_TABLE)
     {
       return false;
@@ -1904,8 +2048,8 @@ static bool wsrep_can_run_in_toi(THD *thd, const char *db, const char *table,
 
   case SQLCOM_CREATE_VIEW:
 
-    DBUG_ASSERT(!table_list);
-    DBUG_ASSERT(first_table); /* First table is view name */
+    assert(!table_list);
+    assert(first_table); /* First table is view name */
     /*
       If any of the remaining tables refer to temporary table error
       is returned to client, so TOI can be skipped
@@ -1923,9 +2067,9 @@ static bool wsrep_can_run_in_toi(THD *thd, const char *db, const char *table,
 
 #if 0
     /* Trigger statement is invoked with table_list with length = 1 */
-    DBUG_ASSERT(!table_list);
+    assert(!table_list);
 #endif
-    DBUG_ASSERT(first_table);
+    assert(first_table);
 
     if (find_temporary_table(thd, first_table))
     {
@@ -1969,7 +2113,25 @@ static int wsrep_TOI_begin(THD *thd, const char *db_, const char *table_,
   size_t buf_len(0);
   int buf_err;
 
+  DEBUG_SYNC(thd, "wsrep_TOI_begin_before_wsrep_skip_wsrep_hton");
+  mysql_mutex_lock(&thd->LOCK_thd_data);
+
+  /*
+    Setting wsrep_skip_wsrep_hton=true has a side-effect that this
+    query/thread cannot be killed.
+  */
   thd->wsrep_skip_wsrep_hton= true;
+  bool is_thd_killed = thd->is_killed();
+
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
+  DEBUG_SYNC(thd, "wsrep_TOI_begin_after_wsrep_skip_wsrep_hton");
+
+  if (is_thd_killed) {
+    WSREP_DEBUG("Can't execute %s in TOI mode because the query has been killed",
+                WSREP_QUERY(thd));
+    return -1;
+  }
+
   if (wsrep_can_run_in_toi(thd, db_, table_, table_list) == false)
   {
     WSREP_DEBUG("Can't execute %s in TOI mode", WSREP_QUERY(thd));
@@ -2279,8 +2441,8 @@ int wsrep_to_isolation_begin(THD *thd, const char *db_, const char *table_,
   }
   mysql_mutex_unlock(&thd->LOCK_wsrep_thd);
 
-  DBUG_ASSERT(thd->wsrep_exec_mode == LOCAL_STATE);
-  DBUG_ASSERT(thd->wsrep_trx_meta.gtid.seqno == WSREP_SEQNO_UNDEFINED);
+  assert(thd->wsrep_exec_mode == LOCAL_STATE);
+  assert(thd->wsrep_trx_meta.gtid.seqno == WSREP_SEQNO_UNDEFINED);
 
   if (thd->global_read_lock.can_acquire_protection())
   {
@@ -2321,6 +2483,7 @@ int wsrep_to_isolation_begin(THD *thd, const char *db_, const char *table_,
     switch (thd->variables.wsrep_OSU_method) {
     case WSREP_OSU_TOI:
       ret= wsrep_TOI_begin(thd, db_, table_, table_list, alter_info);
+      DEBUG_SYNC(thd, "wsrep_after_toi_begin");
       break;
     case WSREP_OSU_RSU:
       ret= wsrep_RSU_begin(thd, db_, table_);
@@ -2345,6 +2508,20 @@ int wsrep_to_isolation_begin(THD *thd, const char *db_, const char *table_,
   return ret;
 }
 
+bool wsrep_thd_is_in_to_isolation(THD *thd, bool flock)
+{
+  bool status = false;
+  if (thd)
+  {
+    if (flock) mysql_mutex_lock(&thd->LOCK_thd_data);
+
+    status = thd->wsrep_skip_wsrep_hton;
+
+    if (flock) mysql_mutex_unlock(&thd->LOCK_thd_data);
+  }
+  return status;
+}
+
 void wsrep_to_isolation_end(THD *thd)
 {
   if (thd->wsrep_exec_mode == TOTAL_ORDER)
@@ -2361,8 +2538,13 @@ void wsrep_to_isolation_end(THD *thd)
     wsrep_cleanup_transaction(thd);
   }
 
-  if (thd->wsrep_skip_wsrep_hton)
-    thd->wsrep_skip_wsrep_hton= false;
+  DEBUG_SYNC(thd, "wsrep_to_isolation_end_before_wsrep_skip_wsrep_hton");
+  mysql_mutex_lock(&thd->LOCK_thd_data);
+
+  thd->wsrep_skip_wsrep_hton = false;
+
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
+  DEBUG_SYNC(thd, "wsrep_to_isolation_end_after_wsrep_skip_wsrep_hton");
 }
 
 #define WSREP_MDL_LOG(severity, msg, schema, schema_len, req, gra)             \
@@ -2379,13 +2561,13 @@ void wsrep_to_isolation_end(THD *thd)
       wsrep_get_query_state(req->wsrep_query_state),                           \
       wsrep_get_conflict_state(req->wsrep_conflict_state),                     \
       req->get_command(), req->lex->sql_command,                               \
-      (req->rewritten_query.length() ? req->rewritten_query.c_ptr_safe() : req->query().str), \
+      (req->rewritten_query().length() ? wsrep_thd_rewritten_query(req).c_ptr_safe() : req->query().str), \
       gra->thread_id(), (long long)wsrep_thd_trx_seqno(gra),                   \
       wsrep_get_exec_mode(gra->wsrep_exec_mode),                               \
       wsrep_get_query_state(gra->wsrep_query_state),                           \
       wsrep_get_conflict_state(gra->wsrep_conflict_state),                     \
       gra->get_command(), gra->lex->sql_command,                               \
-      (gra->rewritten_query.length() ? gra->rewritten_query.c_ptr_safe() : gra->query().str));
+      (gra->rewritten_query().length() ? wsrep_thd_rewritten_query(gra).c_ptr_safe() : gra->query().str))
 
 bool
 wsrep_grant_mdl_exception(const MDL_context *requestor_ctx,
@@ -2397,6 +2579,26 @@ wsrep_grant_mdl_exception(const MDL_context *requestor_ctx,
   THD *request_thd  = requestor_ctx->wsrep_get_thd();
   THD *granted_thd  = ticket->get_ctx()->wsrep_get_thd();
   bool ret          = FALSE;
+
+  /* If the said thd/transaction is already aborted and is in process of
+  rolling back avoid re-aborting it. During first abort (initated through
+  can_grant) bf-query-id is updated in trx->wsrep_killed_by_query field.
+  This field is reset to 0 on successful rollback. If before transaction
+  completes rollback flow (post resetting value to 0) and second attempt to kill
+  the same transaction is done it will reset the said field
+  (trx->wsrep_killed_by_query) one more time but this time there is no post
+  rollback action to clear it up.
+
+  Other approach of solving it could be clearing this field as part of
+  wsrep_cleanup_transaction but this action of double killing is anyway
+  redundant so better skip it. */
+  if (granted_thd->wsrep_conflict_state == MUST_ABORT)
+  {
+    /* Granted thd is already scheduled for abort.
+    No point in repeating the action .*/
+    WSREP_DEBUG("state of granted_thd: %d\n", granted_thd->killed);
+    return (ret);
+  }
 
   const char* schema= key->db_name();
   int schema_len= key->db_name_length();
@@ -2562,4 +2764,18 @@ const char* wsrep_get_wsrep_status(wsrep_status status)
   }
 
   return "NULL";
+}
+
+/*
+ Returns non-const copy of thd->rewritten_query().
+
+ PXC code uses rewritten_query.c_ptr_safe() in several places.
+ As c_ptr_save() is non const method, it requires non const object.
+ Here we return copy of thd->rewritten_query() instead of const-casting
+ thd->rewritten_query() in place.
+ This is to avoid interference of PXC specific part with generic server part.
+ */
+String wsrep_thd_rewritten_query(THD *thd)
+{
+  return thd->rewritten_query();
 }

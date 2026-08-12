@@ -1,13 +1,20 @@
-/* Copyright (c) 2014, 2016, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2014, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -51,9 +58,9 @@ protected:
 */
 struct Bad_path
 {
-  const bool m_begins_with_column_id;  ///< true if column scope
-  const char *m_path_expression;       ///< the path to parse
-  const size_t m_expected_index;       ///< the offset of the syntax error
+  bool m_begins_with_column_id;  ///< true if column scope
+  const char *m_path_expression; ///< the path to parse
+  size_t m_expected_index;       ///< the offset of the syntax error
 };
 
 /**
@@ -69,9 +76,9 @@ class JsonBadPathTestP : public ::testing::TestWithParam<Bad_path>
 */
 struct Good_path
 {
-  const bool m_begins_with_column_id;  ///< true if column scope
-  const char *m_path_expression;       ///< the path to parse
-  const char *m_expected_path;         ///< expected canonical path
+  bool m_begins_with_column_id;  ///< true if column scope
+  const char *m_path_expression; ///< the path to parse
+  const char *m_expected_path;   ///< expected canonical path
 };
 
 /**
@@ -80,9 +87,9 @@ struct Good_path
 */
 struct Location_tuple
 {
-  const bool m_begins_with_column_id;  // true if column scope
-  const char *m_json_text;             // the document text
-  const char *m_path_expression;       // the path to parse
+  bool m_begins_with_column_id;  // true if column scope
+  const char *m_json_text;       // the document text
+  const char *m_path_expression; // the path to parse
 };
 
 /**
@@ -91,10 +98,10 @@ struct Location_tuple
 */
 struct Ono_tuple
 {
-  const bool m_begins_with_column_id;  // true if column scope
-  const char *m_json_text;             // the document text
-  const char *m_path_expression;       // the path to parse
-  const uint m_expected_hits;         // total number of matches
+  bool m_begins_with_column_id;  // true if column scope
+  const char *m_json_text;       // the document text
+  const char *m_path_expression; // the path to parse
+  uint m_expected_hits;          // total number of matches
 };
 
 /**
@@ -102,9 +109,9 @@ struct Ono_tuple
 */
 struct Clone_tuple
 {
-  const bool m_begins_with_column_id;  // true if column scope
-  const char *m_path_expression_1;     // the first path to parse
-  const char *m_path_expression_2;     // the second path to parse
+  bool m_begins_with_column_id;    // true if column scope
+  const char *m_path_expression_1; // the first path to parse
+  const char *m_path_expression_2; // the second path to parse
 };
 
 /**

@@ -1,15 +1,22 @@
-/* Copyright (c) 2001, 2019, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2001, 2023, Oracle and/or its affiliates.
    Copyright (c) 2018, Percona and/or its affiliates. All rights reserved.
    Copyright (c) 2010, 2015, MariaDB
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -395,7 +402,7 @@ Unique::reset()
     file_ptrs.clear();
     MY_ATTRIBUTE((unused)) int reinit_res=
       reinit_io_cache(&file, WRITE_CACHE, 0L, 0, 1);
-    DBUG_ASSERT(reinit_res == 0);
+    assert(reinit_res == 0);
   }
   elements= 0;
 }
@@ -496,7 +503,7 @@ static bool merge_walk(uchar *merge_buffer, size_t merge_buffer_size,
   // read_to_buffer() needs only rec_length.
   Sort_param sort_param;
   sort_param.rec_length= key_length;
-  DBUG_ASSERT(!sort_param.using_addon_fields());
+  assert(!sort_param.using_addon_fields());
 
   /*
     Invariant: queue must contain top element from each tree, until a tree
@@ -512,7 +519,7 @@ static bool merge_walk(uchar *merge_buffer, size_t merge_buffer_size,
     bytes_read= read_to_buffer(file, top, &sort_param);
     if (bytes_read == (uint) (-1))
       goto end;
-    DBUG_ASSERT(bytes_read);
+    assert(bytes_read);
     queue.push(top);
   }
   top= queue.top();
@@ -653,7 +660,7 @@ bool Unique::get(TABLE *table)
   if (my_b_tell(&file) == 0)
   {
     /* Whole tree is in memory;  Don't use disk if you don't need to */
-    DBUG_ASSERT(table->sort.sorted_result == NULL);
+    assert(table->sort.sorted_result == NULL);
     if ((record_pointers= table->sort.sorted_result= (uchar*)
 	 my_malloc(key_memory_Filesort_info_record_pointers,
                    size * tree.elements_in_tree, MYF(0))))

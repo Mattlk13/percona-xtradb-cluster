@@ -1,13 +1,20 @@
-/* Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2000, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -42,6 +49,11 @@
 #endif
 #ifdef HAVE_ARPA_INET_H
 # include <arpa/inet.h>
+#endif
+
+#include <sys/types.h>
+#ifdef HAVE_SYS_MMAN_H
+#include <sys/mman.h>
 #endif
 
 #include "sql_parse.h"    // test_if_data_home_dir
@@ -154,8 +166,12 @@
 #include "item_strfunc.h"               // Item_func_uuid
 #include "handler.h"
 
-#if defined(HAVE_OPENSSL) && !defined(HAVE_YASSL)
+#if defined(HAVE_OPENSSL)
 #include <openssl/crypto.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/evp.h>
+#include <openssl/provider.h>
+#endif
 #endif
 
 #ifndef EMBEDDED_LIBRARY
@@ -173,11 +189,6 @@ using std::max;
 using std::vector;
 
 #define mysqld_charset &my_charset_latin1
-
-#if defined(HAVE_SOLARIS_LARGE_PAGES) && defined(__GNUC__)
-extern "C" int getpagesizes(size_t *, int);
-extern "C" int memcntl(caddr_t, size_t, int, caddr_t, int, int);
-#endif
 
 #ifdef HAVE_FPU_CONTROL_H
 # include <fpu_control.h>
@@ -337,6 +348,7 @@ my_bool locked_in_memory;
 bool opt_using_transactions;
 bool volatile abort_loop;
 ulong opt_tc_log_size;
+bool opt_libcoredumper, opt_corefile= 0;
 
 static enum_server_operational_state server_operational_state= SERVER_BOOTING;
 ulong log_warnings;
@@ -496,7 +508,7 @@ ulonglong slave_rows_search_algorithms_options;
 my_bool opt_slave_preserve_commit_order;
 #endif
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 uint slave_rows_last_search_algorithm_used;
 #endif
 ulong mts_parallel_option;
@@ -689,6 +701,8 @@ char* utility_user= NULL;
 char* utility_user_password= NULL;
 char* utility_user_schema_access= NULL;
 
+char* opt_libcoredumper_path= NULL;
+
 /* Plucking this from sql/sql_acl.cc for an array of privilege names */
 extern TYPELIB utility_user_privileges_typelib;
 ulonglong utility_user_privileges= 0;
@@ -792,7 +806,6 @@ char *opt_general_logname, *opt_slow_logname, *opt_bin_logname;
 
 static volatile sig_atomic_t kill_in_progress;
 
-
 static my_bool opt_myisam_log;
 static int cleanup_done;
 static ulong opt_specialflag;
@@ -819,7 +832,7 @@ static char **remaining_argv;
 int orig_argc;
 char **orig_argv;
 
-#if defined(HAVE_OPENSSL) && !defined(HAVE_YASSL)
+#if defined(HAVE_OPENSSL)
 bool init_rsa_keys(void);
 void deinit_rsa_keys(void);
 int show_rsa_public_key(THD *thd, SHOW_VAR *var, char *buff);
@@ -935,7 +948,7 @@ bool mysqld_embedded=1;
 
 static my_bool plugins_are_initialized= FALSE;
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 static const char* default_dbug_option;
 #endif
 ulong query_cache_min_res_unit= QUERY_CACHE_MIN_RESULT_DATA_SIZE;
@@ -1039,8 +1052,8 @@ public:
       }
       DBUG_EXECUTE_IF("Check_dump_thread_is_alive",
                       {
-                        DBUG_ASSERT(killing_thd->get_command() != COM_BINLOG_DUMP &&
-                                    killing_thd->get_command() != COM_BINLOG_DUMP_GTID);
+                        assert(killing_thd->get_command() != COM_BINLOG_DUMP &&
+                               killing_thd->get_command() != COM_BINLOG_DUMP_GTID);
                       };);
     }
     mysql_mutex_lock(&killing_thd->LOCK_thd_data);
@@ -1117,6 +1130,29 @@ private:
 
 #ifdef WITH_WSREP
 /**
+  This class implements callback function used by
+  wsrep_close_client_connections() to set KILL_CONNECTION
+  flag on all client thds and awake the thread.
+*/
+class Set_wsrep_kill_client_conn : public Do_THD_Impl
+{
+ public:
+  Set_wsrep_kill_client_conn()
+  {}
+
+  virtual void operator()(THD *killing_thd)
+  {
+    if (killing_thd->get_protocol()->connection_alive() &&
+        (WSREP(killing_thd) || killing_thd->wsrep_exec_mode == LOCAL_STATE) &&
+        killing_thd != current_thd)
+    {
+      mysql_mutex_lock(&killing_thd->LOCK_thd_data);
+      killing_thd->awake(THD::KILL_CONNECTION);
+      mysql_mutex_unlock(&killing_thd->LOCK_thd_data);
+    }
+  }
+};
+/**
   This class implements callback function used by close_connections()
   to set KILL_CONNECTION flag on all thds in thd list.
   If m_kill_dump_thread_flag is not set it kills all other threads
@@ -1165,8 +1201,8 @@ public:
       }
       DBUG_EXECUTE_IF("Check_dump_thread_is_alive",
                       {
-                        DBUG_ASSERT(killing_thd->get_command() != COM_BINLOG_DUMP &&
-                                    killing_thd->get_command() != COM_BINLOG_DUMP_GTID);
+                        assert(killing_thd->get_command() != COM_BINLOG_DUMP &&
+                               killing_thd->get_command() != COM_BINLOG_DUMP_GTID);
                       };);
     }
     mysql_mutex_lock(&killing_thd->LOCK_thd_data);
@@ -1271,25 +1307,38 @@ public:
 
 enum wsrep_thd_type   {APPLIER, COMMITTING};
 
-class Find_wsrep_thd: public Find_THD_Impl
+class Count_wsrep_thd: public Do_THD_Impl
 {
 public:
-  Find_wsrep_thd(enum wsrep_thd_type type): m_type(type) {}
-  virtual bool operator()(THD *thd)
+  Count_wsrep_thd(enum wsrep_thd_type type)
+    : m_type(type)
+    , m_count(0) 
+  {}
+  virtual void operator()(THD *thd)
   {
-    if (WSREP(thd))
-    { 
-      switch (m_type) 
-        {
-        case APPLIER:    return thd->wsrep_applier;
-        case COMMITTING: return thd->wsrep_query_state == QUERY_COMMITTING;
-        }
+    switch (m_type)
+    {
+      case APPLIER:
+      {
+        if (thd->wsrep_applier)
+          m_count++;
+      }
+      break;
+      case COMMITTING:
+      {
+        if (thd->wsrep_query_state == QUERY_COMMITTING)
+          m_count++;
+      }
+      break;
     }
-    return false;
+  }
+  int get_thd_count() const
+  {
+    return m_count;
   }
 private:
   enum wsrep_thd_type m_type;
-  bool is_server_shutdown;
+  int m_count;
 };
 
 class Count_wsrep_applier_threads : public Do_THD_Impl
@@ -1487,6 +1536,9 @@ extern "C" void unireg_abort(int exit_code)
     WSREP_INFO("Waiting to close threads......");
     sleep(5); /* so give some time to exit for those which can */
     WSREP_INFO("Some threads may fail to exit.");
+    /* Signal possible SE initialization waiters with error. */
+    wsrep_SE_initialized(WSREP_SE_INIT_RESULT_FAILURE);
+    wsrep_deinit();
   }
 #endif /* WITH_WSREP */
   mysql_audit_notify(MYSQL_AUDIT_SERVER_SHUTDOWN_SHUTDOWN,
@@ -1514,8 +1566,8 @@ extern "C" void unireg_abort(int exit_code)
 
 static void mysqld_exit(int exit_code)
 {
-  DBUG_ASSERT(exit_code >= MYSQLD_SUCCESS_EXIT
-              && exit_code <= MYSQLD_FAILURE_EXIT);
+  assert(exit_code >= MYSQLD_SUCCESS_EXIT
+         && exit_code <= MYSQLD_FAILURE_EXIT);
   mysql_audit_finalize();
 #ifndef EMBEDDED_LIBRARY
   Srv_session::module_deinit();
@@ -1670,6 +1722,7 @@ void clean_up(bool print_message)
 #endif
   }
   table_def_start_shutdown();
+  delegates_shutdown();
   plugin_shutdown();
   delete_optimizer_cost_module();
   ha_end();
@@ -1929,7 +1982,7 @@ static void set_proxy()
         bits= 32;
 #ifdef HAVE_IPV6
       else {
-        DBUG_ASSERT(net.family == AF_INET6);
+        assert(net.family == AF_INET6);
         bits= 128;
       }
 #endif
@@ -1980,7 +2033,7 @@ static void set_proxy()
           ? 0xffffffff : ~((0x80000000>>(bits-64-1))-1);
       }
       else if (bits > 96) {
-        DBUG_ASSERT(bits <= 128);
+        assert(bits <= 128);
         net.mask.in6.s6_addr32[0]= 0xffffffff;
         net.mask.in6.s6_addr32[1]= 0xffffffff;
         net.mask.in6.s6_addr32[2]= 0xffffffff;
@@ -2128,7 +2181,7 @@ err:
 static void set_user(const char *user, struct passwd *user_info_arg)
 {
   /* purecov: begin tested */
-  DBUG_ASSERT(user_info_arg != 0);
+  assert(user_info_arg != 0);
 #ifdef HAVE_INITGROUPS
   /*
     We can get a SIGSEGV when calling initgroups() on some systems when NSS
@@ -2156,7 +2209,7 @@ static void set_user(const char *user, struct passwd *user_info_arg)
 
 static void set_effective_user(struct passwd *user_info_arg)
 {
-  DBUG_ASSERT(user_info_arg != 0);
+  assert(user_info_arg != 0);
   if (setregid((gid_t)-1, user_info_arg->pw_gid) == -1)
   {
     sql_print_error("setregid: %s", strerror(errno));
@@ -2226,7 +2279,7 @@ static bool network_init(void)
       report_port= mysqld_port;
 
     if (!opt_disable_networking)
-      DBUG_ASSERT(report_port != 0);
+      assert(report_port != 0);
   }
 #ifdef _WIN32
   // Create named pipe
@@ -2732,7 +2785,7 @@ extern "C" void *signal_hand(void *arg MY_ATTRIBUTE((unused)))
           DBUG_PRINT("info",("Killing socket listener"));
           if (pthread_kill(main_thread_id, SIGUSR1))
           {
-            DBUG_ASSERT(false);
+            assert(false);
             break;
           }
           mysql_cond_wait(&COND_socket_listener_active,
@@ -2815,7 +2868,7 @@ void my_message_sql(uint error, const char *str, myf MyFlags)
   DBUG_ENTER("my_message_sql");
   DBUG_PRINT("error", ("error: %u  message: '%s'", error, str));
 
-  DBUG_ASSERT(str != NULL);
+  assert(str != NULL);
   /*
     An error should have a valid error number (!= 0), so it can be caught
     in stored procedures by SQL exception handlers.
@@ -2823,13 +2876,13 @@ void my_message_sql(uint error, const char *str, myf MyFlags)
     Remaining known places to fix:
     - storage/myisam/mi_create.c, my_printf_error()
     TODO:
-    DBUG_ASSERT(error != 0);
+    assert(error != 0);
   */
 
   if (error == 0)
   {
     /* At least, prevent new abuse ... */
-    DBUG_ASSERT(strncmp(str, "MyISAM table", 12) == 0);
+    assert(strncmp(str, "MyISAM table", 12) == 0);
     error= ER_UNKNOWN_ERROR;
   }
 
@@ -3152,7 +3205,7 @@ static void init_sql_statement_names()
     if ((first_com <= ptr) && (ptr <= last_com))
     {
       com_index= ((int)(ptr - first_com))/record_size;
-      DBUG_ASSERT(com_index < (uint) SQLCOM_END);
+      assert(com_index < (uint) SQLCOM_END);
       sql_statement_names[com_index].str= var->name;
       /* TODO: Change SHOW_VAR::name to a LEX_STRING, to avoid strlen() */
       sql_statement_names[com_index].length= strlen(var->name);
@@ -3160,8 +3213,8 @@ static void init_sql_statement_names()
     var++;
   }
 
-  DBUG_ASSERT(strcmp(sql_statement_names[(uint) SQLCOM_SELECT].str, "select") == 0);
-  DBUG_ASSERT(strcmp(sql_statement_names[(uint) SQLCOM_SIGNAL].str, "signal") == 0);
+  assert(strcmp(sql_statement_names[(uint) SQLCOM_SELECT].str, "select") == 0);
+  assert(strcmp(sql_statement_names[(uint) SQLCOM_SIGNAL].str, "signal") == 0);
 
   sql_statement_names[(uint) SQLCOM_END].str= "error";
 }
@@ -3395,7 +3448,7 @@ int init_common_variables()
   if (add_status_vars(status_vars))
     return 1; // an error was already reported
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   /*
     We have few debug-only commands in com_status_vars, only visible in debug
     builds. for simplicity we enable the assert only in debug builds
@@ -3739,6 +3792,13 @@ int init_common_variables()
 #else
   my_regex_init(&my_charset_latin1, NULL);
 #endif
+
+#ifdef WITH_WSREP
+  /* To be called after initializing the regex engine. */
+  if (wsrep_setup_allowed_sst_methods())
+    return 1;
+#endif
+
   /*
     Process a comma-separated character set list and choose
     the first available character set. This is mostly for
@@ -3854,6 +3914,11 @@ int init_common_variables()
     return 1;
   }
 
+  /* We set the atomic field m_opt_tracking_mode to the value of the sysvar
+     variable m_opt_tracking_mode_value here, as it now has the user given
+     value
+  */
+  set_mysqld_opt_tracking_mode();
   if (global_system_variables.transaction_write_set_extraction == HASH_ALGORITHM_OFF
       && mysql_bin_log.m_dependency_tracker.m_opt_tracking_mode != DEPENDENCY_TRACKING_COMMIT_ORDER)
   {
@@ -3864,6 +3929,11 @@ int init_common_variables()
   else
     mysql_bin_log.m_dependency_tracker.tracking_mode_changed();
 
+  my_atomic_store64(&mysql_bin_log.m_dependency_tracker.get_writeset()->m_opt_max_history_size,
+                    static_cast<int64>(mysql_bin_log.m_dependency_tracker.
+                        get_writeset()->m_opt_max_history_size_base_var));
+
+
 #define FIX_LOG_VAR(VAR, ALT)                                   \
   if (!VAR || !*VAR)                                            \
     VAR= ALT;
@@ -3871,7 +3941,10 @@ int init_common_variables()
   FIX_LOG_VAR(opt_general_logname,
               make_query_log_name(logname_path, QUERY_LOG_GENERAL));
   FIX_LOG_VAR(opt_slow_logname,
-              make_query_log_name(slow_logname_path, QUERY_LOG_SLOW));
+              my_strdup(
+                  key_memory_LOG_name,
+                  make_query_log_name(slow_logname_path, QUERY_LOG_SLOW),
+                  MYF(MY_WME)));
 
 #if defined(ENABLED_DEBUG_SYNC)
   /* Initialize the debug sync facility. See debug_sync.cc. */
@@ -4047,8 +4120,8 @@ static int init_thread_environment()
   pthread_attr_setscope(&connection_attrib, PTHREAD_SCOPE_SYSTEM);
 #endif
 
-  DBUG_ASSERT(! THR_THD_initialized);
-  DBUG_ASSERT(! THR_MALLOC_initialized);
+  assert(! THR_THD_initialized);
+  assert(! THR_MALLOC_initialized);
   if (my_create_thread_local_key(&THR_THD,NULL) ||
       my_create_thread_local_key(&THR_MALLOC,NULL))
   {
@@ -4165,7 +4238,6 @@ int warn_self_signed_ca()
     if (warn_one(opt_ssl_ca))
       return 1;
   }
-#ifndef HAVE_YASSL
   if (opt_ssl_capath && opt_ssl_capath[0])
   {
     /* We have ssl-capath. So search all files in the dir */
@@ -4203,8 +4275,11 @@ int warn_self_signed_ca()
     ca_dir= 0;
     memset(&file_path, 0, sizeof(file_path));
   }
-#endif /* HAVE_YASSL */
   return ret_val;
+}
+
+static void push_deprecated_tls_option_no_replacement(const char *tls_version) {
+  sql_print_warning(ER_DEFAULT(ER_WARN_DEPRECATED_TLS_VERSION), tls_version);
 }
 
 #endif /* EMBEDDED_LIBRARY */
@@ -4212,22 +4287,31 @@ int warn_self_signed_ca()
 static int init_ssl()
 {
 #ifdef HAVE_OPENSSL
-#ifndef HAVE_YASSL
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+  int fips_mode= EVP_default_properties_is_fips_enabled(NULL) &&
+                 OSSL_PROVIDER_available(NULL, "fips");
+#else
   int fips_mode= FIPS_mode();
+#endif
   if (fips_mode != 0)
   {
     /* FIPS is enabled, Log warning and Disable it now */
     sql_print_warning(
-        "Percona XtraDB Cluster cannot operate under OpenSSL FIPS mode."
+        "Percona Server cannot operate under OpenSSL FIPS mode."
         " Disabling FIPS.");
+
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    EVP_default_properties_enable_fips(NULL, 0);
+#else
     FIPS_mode_set(0);
+#endif
   }
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
   CRYPTO_malloc_init();
 #else /* OPENSSL_VERSION_NUMBER < 0x10100000L */
   OPENSSL_malloc_init();
 #endif /* OPENSSL_VERSION_NUMBER < 0x10100000L */
-#endif
   ssl_start();
 #ifndef EMBEDDED_LIBRARY
 
@@ -4239,13 +4323,17 @@ static int init_ssl()
                             "Trying to enable SSL support using them.",
                             DEFAULT_SSL_CA_CERT, DEFAULT_SSL_SERVER_CERT,
                             DEFAULT_SSL_SERVER_KEY);
-#ifndef HAVE_YASSL
     if (do_auto_cert_generation(auto_detection_status) == false)
       return 1;
-#endif
 
     enum enum_ssl_init_error error= SSL_INITERR_NOERROR;
     long ssl_ctx_flags= process_tls_version(opt_tls_version);
+
+    if (!(ssl_ctx_flags & SSL_OP_NO_TLSv1))
+      push_deprecated_tls_option_no_replacement("TLSv1");
+    if (!(ssl_ctx_flags & SSL_OP_NO_TLSv1_1))
+      push_deprecated_tls_option_no_replacement("TLSv1.1");
+
     /* having ssl_acceptor_fd != 0 signals the use of SSL */
     ssl_acceptor_fd= new_VioSSLAcceptorFd(opt_ssl_key, opt_ssl_cert,
 					  opt_ssl_ca, opt_ssl_capath,
@@ -4261,26 +4349,10 @@ static int init_ssl()
         No real need for opt_use_ssl to be enabled in bootstrap mode,
         but we want the SSL materal generation and/or validation (if supplied).
         So we keep it on.
-
-        For yaSSL (since it can't auto-generate the certs from inside the
-        server) we need to hush the warning if in bootstrap mode, as in
-        that mode the server won't be listening for connections and thus
-        the lack of SSL material makes no real difference.
-        However if the user specified any of the --ssl options we keep the
-        warning as it's showing problems with the values supplied.
-
-        For openssl, we don't hush the option since it would indicate a failure
-        in auto-generation, bad key material explicitly specified or
-        auto-generation disabled explcitly while SSL is still on.
       */
-#ifdef HAVE_YASSL
-      if (!opt_bootstrap || SSL_ARTIFACTS_NOT_FOUND != auto_detection_status)
-#endif
-      {
-        sql_print_warning("Failed to set up SSL because of the"
-                          " following SSL library error: %s",
-                          sslGetErrString(error));
-      }
+      sql_print_warning("Failed to set up SSL because of the"
+                        " following SSL library error: %s",
+                        sslGetErrString(error));
       opt_use_ssl = 0;
       have_ssl= SHOW_OPTION_DISABLED;
     }
@@ -4303,10 +4375,8 @@ static int init_ssl()
 #endif /* ! EMBEDDED_LIBRARY */
   if (des_key_file)
     load_des_key_file(des_key_file);
-#ifndef HAVE_YASSL
   if (init_rsa_keys())
     return 1;
-#endif
 #endif /* HAVE_OPENSSL */
   return 0;
 }
@@ -4324,9 +4394,7 @@ static void end_ssl()
     ssl_acceptor_fd= 0;
   }
 #endif /* ! EMBEDDED_LIBRARY */
-#ifndef HAVE_YASSL
   deinit_rsa_keys();
-#endif
 #endif /* HAVE_OPENSSL */
 }
 
@@ -4568,7 +4636,7 @@ initialize_storage_engine(char *se_name, const char *se_kind,
                       se_kind, se_name);
       return true;
     }
-    DBUG_ASSERT(*dest_plugin);
+    assert(*dest_plugin);
   }
   else
   {
@@ -4576,8 +4644,9 @@ initialize_storage_engine(char *se_name, const char *se_kind,
       Need to unlock as global_system_variables.table_plugin
       was acquired during plugin_init()
     */
-    plugin_unlock(0, *dest_plugin);
-    *dest_plugin= plugin;
+    plugin_ref old_dest_plugin = *dest_plugin;
+    *dest_plugin = plugin;
+    plugin_unlock(0, old_dest_plugin);
   }
   return false;
 }
@@ -4609,7 +4678,7 @@ static int init_server_components()
   */
   mdl_init();
   partitioning_init();
-  if (table_def_init() | hostname_cache_init(host_cache_size))
+  if (table_def_init() || hostname_cache_init(host_cache_size))
     unireg_abort(MYSQLD_ABORT_EXIT);
 
   if (my_timer_initialize())
@@ -4674,9 +4743,6 @@ static int init_server_components()
     if (open_error_log(errorlog_filename_buff, false))
       unireg_abort(MYSQLD_ABORT_EXIT);
 
-#ifdef _WIN32
-    FreeConsole();        // Remove window
-#endif
   }
   else
   {
@@ -4717,8 +4783,8 @@ static int init_server_components()
                       "--binlog-format work.");
 
   /* Check that we have not let the format to unspecified at this point */
-  DBUG_ASSERT((uint)global_system_variables.binlog_format <=
-              array_elements(binlog_format_names)-1);
+  assert((uint)global_system_variables.binlog_format <=
+         array_elements(binlog_format_names)-1);
 
 #ifdef HAVE_REPLICATION
   if (opt_log_slave_updates && replicate_same_server_id)
@@ -4797,9 +4863,9 @@ a file name for --log-bin-index option", opt_binlog_index_name);
       opt_bin_logname=my_strdup(key_memory_opt_bin_logname,
                                 buf, MYF(0));
     }
-  }
 
 #ifdef WITH_WSREP /* WSREP BEFORE SE */
+  }
     /*
       Wsrep initialization must happen at this point, because:
       - opt_bin_logname must be known when starting replication
@@ -4906,8 +4972,6 @@ a file name for --log-bin-index option", opt_binlog_index_name);
     }
   }
 #else
-  if (opt_bin_log)
-  {
     /*
       Skip opening the index file if we start with --help. This is necessary
       to avoid creating the file in an otherwise empty datadir, which will
@@ -4984,12 +5048,12 @@ a file name for --log-bin-index option", opt_binlog_index_name);
     sql_print_warning("ignore-builtin-innodb is ignored "
                       "and will be removed in future releases.");
 
-#ifndef WITH_WSREP
+#ifdef WITH_WSREP
   /* Leave the original location if wsrep is not involved otherwise
   we do this before initializing WSREP as wsrep needs access to
   gtid_mode which and for accessing gtid_mode gtid_sid_locks has to be
   initialized which is done by this function. */
-
+#else
   if (gtid_server_init())
   {
     sql_print_error("Failed to initialize GTID structures.");
@@ -5040,6 +5104,23 @@ a file name for --log-bin-index option", opt_binlog_index_name);
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
   plugins_are_initialized= TRUE;  /* Don't separate from init function */
+
+#ifdef WITH_WSREP
+  static const LEX_CSTRING keyring_vault_name= {
+      C_STRING_WITH_LEN("keyring_vault")};
+  static const LEX_CSTRING keyring_name= {C_STRING_WITH_LEN("keyring_file")};
+  if (!pxc_encrypt_cluster_traffic &&
+      (plugin_is_ready(keyring_vault_name, MYSQL_KEYRING_PLUGIN) ||
+       plugin_is_ready(keyring_name, MYSQL_KEYRING_PLUGIN)))
+  {
+    WSREP_WARN(
+        "You have enabled keyring plugin. SST encryption is mandatory. "
+        "Please enable pxc_encrypt_cluster_traffic. Check "
+        "https://www.percona.com/doc/percona-xtradb-cluster/%u.%u/security/"
+        "encrypt-traffic.html#encrypt-sst for more details.",
+        MYSQL_VERSION_MAJOR, MYSQL_VERSION_MINOR);
+  }
+#endif
 
   Session_tracker session_track_system_variables_check;
   LEX_STRING var_list;
@@ -5104,6 +5185,29 @@ a file name for --log-bin-index option", opt_binlog_index_name);
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
 
+  if (opt_libcoredumper)
+  {
+#if HAVE_LIBCOREDUMPER
+    if (opt_corefile)
+    {
+      sql_print_warning(
+          "Started with --core-file and --coredumper. "
+          "--coredumper will take precedence.");
+    }
+    if (opt_libcoredumper_path != NULL)
+    {
+      if (!validate_libcoredumper_path(opt_libcoredumper_path))
+      {
+        unireg_abort(MYSQLD_ABORT_EXIT);
+      }
+    }
+#else
+    sql_print_warning(
+        "This version of MySQL has not been compiled with "
+        "libcoredumper support, ignoring --coredumper argument");
+#endif
+  }
+
   /* We have to initialize the storage engines before CSV logging */
   if (ha_init())
   {
@@ -5138,10 +5242,12 @@ a file name for --log-bin-index option", opt_binlog_index_name);
   query_logger.set_handlers(log_output_options);
 
   // Open slow log file if enabled.
+  query_logger.set_log_file(QUERY_LOG_SLOW);
   if (opt_slow_log && query_logger.reopen_log_file(QUERY_LOG_SLOW))
     opt_slow_log= false;
 
   // Open general log file if enabled.
+  query_logger.set_log_file(QUERY_LOG_GENERAL);
   if (opt_general_log && query_logger.reopen_log_file(QUERY_LOG_GENERAL))
     opt_general_log= false;
 
@@ -5291,9 +5397,6 @@ a file name for --log-bin-index option", opt_binlog_index_name);
     sql_print_error("GTID_MODE = ON requires ENFORCE_GTID_CONSISTENCY = ON.");
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
-#ifdef WITH_WSREP
-  }
-#endif /* WITH_WSREP */
 
 #ifdef WITH_WSREP
   /* Don't spawn a new binlog file during wsrep-recovery. Why ?
@@ -5314,7 +5417,7 @@ a file name for --log-bin-index option", opt_binlog_index_name);
       gtid(s). This is necessary in the MYSQL_BIN_LOG::MYSQL_BIN_LOG to
       corretly compute the set of previous gtids.
     */
-    DBUG_ASSERT(!mysql_bin_log.is_relay_log);
+    assert(!mysql_bin_log.is_relay_log);
     mysql_mutex_t *log_lock= mysql_bin_log.get_log_lock();
     mysql_mutex_lock(log_lock);
 
@@ -5330,37 +5433,9 @@ a file name for --log-bin-index option", opt_binlog_index_name);
     mysql_mutex_unlock(log_lock);
   }
 
-#ifdef HAVE_REPLICATION
-
-#ifdef WITH_WSREP
-  /* In wsrep_recovery mode, PXC avoid creation of new binlog file for
-  the reason mentioned above. In light of the said flow avoid purge
-  action on binlog. */
-  if (!wsrep_recovery)
-  {
-#endif /* WITH_WSREP */
-
-  if (opt_bin_log && expire_logs_days)
-  {
-    time_t purge_time= server_start_time - expire_logs_days*24*60*60;
-    if (purge_time >= 0)
-      mysql_bin_log.purge_logs_before_date(purge_time, true);
-  }
-  if (opt_bin_log && max_binlog_files)
-  {
-    mysql_bin_log.purge_logs_maximum_number(max_binlog_files);
-  }
-  if (opt_bin_log && binlog_space_limit)
-  {
-    mysql_bin_log.purge_logs_by_size(true);
-  }
-
 #ifdef WITH_WSREP
   }
 #endif /* WITH_WSREP */
-
-#endif
-
   if (opt_myisam_log)
     (void) mi_log(1);
 
@@ -5418,9 +5493,9 @@ extern "C" void *handle_shutdown(void *arg)
     my_thread_end();
     my_thread_exit(0);
   }
+#ifdef WITH_WSREP
 #if 0
 // TODO not sure why need to re-init on shutdown.
-#ifdef WITH_WSREP
   mysql_mutex_init(key_LOCK_wsrep_ready,
                    &LOCK_wsrep_ready, MY_MUTEX_INIT_FAST);
   mysql_cond_init(key_COND_wsrep_ready, &COND_wsrep_ready);
@@ -5463,7 +5538,7 @@ static void create_shutdown_thread()
 }
 #endif /* _WIN32 */
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 /*
   Debugging helper function to keep the locale database
   (see sql_locale.cc) and max_month_name_length and
@@ -5493,12 +5568,12 @@ static void test_lc_time_sz()
     {
       DBUG_PRINT("Wrong max day name(or month name) length for locale:",
                  ("%s", (*loc)->name));
-      DBUG_ASSERT(0);
+      assert(0);
     }
   }
   DBUG_VOID_RETURN;
 }
-#endif//DBUG_OFF
+#endif//NDEBUG
 
 /*
   @brief : Set opt_super_readonly to user supplied value before
@@ -5732,7 +5807,7 @@ int mysqld_main(int argc, char **argv)
   size_t guardize= 0;
 #ifndef _WIN32
   int retval= pthread_attr_getguardsize(&connection_attrib, &guardize);
-  DBUG_ASSERT(retval == 0);
+  assert(retval == 0);
   if (retval != 0)
     guardize= my_thread_stack_size;
 #endif
@@ -5766,7 +5841,7 @@ int mysqld_main(int argc, char **argv)
     }
   }
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   test_lc_time_sz();
   srand(static_cast<uint>(time(NULL)));
 #endif
@@ -5823,37 +5898,43 @@ int mysqld_main(int argc, char **argv)
       opt_keyring_migration_destination ||
       migrate_connect_options)
   {
-    Migrate_keyring mk;
-    if (mk.init(remaining_argc, remaining_argv,
-                opt_keyring_migration_source,
-                opt_keyring_migration_destination,
-                opt_keyring_migration_user,
-                opt_keyring_migration_host,
-                opt_keyring_migration_password,
-                opt_keyring_migration_socket,
-                opt_keyring_migration_port))
+    int exit_state = MYSQLD_ABORT_EXIT;
+    while (true)
     {
-      sql_print_error(ER_DEFAULT(ER_KEYRING_MIGRATION_STATUS),
-                      "failed");
+      Migrate_keyring mk;
+      if (mk.init(remaining_argc, remaining_argv,
+                  opt_keyring_migration_source,
+                  opt_keyring_migration_destination,
+                  opt_keyring_migration_user,
+                  opt_keyring_migration_host,
+                  opt_keyring_migration_password,
+                  opt_keyring_migration_socket,
+                  opt_keyring_migration_port))
+      {
+        sql_print_error(ER_DEFAULT(ER_KEYRING_MIGRATION_STATUS),
+                        "failed");
+        log_error_dest= "stderr";
+        flush_error_log_messages();
+        break;
+      }
+
+      if (mk.execute())
+      {
+        sql_print_error(ER_DEFAULT(ER_KEYRING_MIGRATION_STATUS),
+                        "failed");
+        log_error_dest= "stderr";
+        flush_error_log_messages();
+        break;
+      }
+
+      sql_print_information(ER_DEFAULT(ER_KEYRING_MIGRATION_STATUS),
+                            "successful");
       log_error_dest= "stderr";
       flush_error_log_messages();
-      unireg_abort(MYSQLD_ABORT_EXIT);
+      exit_state = MYSQLD_SUCCESS_EXIT;
+      break;
     }
-
-    if (mk.execute())
-    {
-      sql_print_error(ER_DEFAULT(ER_KEYRING_MIGRATION_STATUS),
-                      "failed");
-      log_error_dest= "stderr";
-      flush_error_log_messages();
-      unireg_abort(MYSQLD_ABORT_EXIT);
-    }
-
-    sql_print_information(ER_DEFAULT(ER_KEYRING_MIGRATION_STATUS),
-                          "successful");
-    log_error_dest= "stderr";
-    flush_error_log_messages();
-    unireg_abort(MYSQLD_SUCCESS_EXIT);
+    unireg_abort(exit_state);
   }
 
   /*
@@ -5874,6 +5955,11 @@ int mysqld_main(int argc, char **argv)
     unireg_abort(MYSQLD_ABORT_EXIT);
   }
 
+#ifdef WITH_WSREP
+  // Initialize wsrep_provider_set before anything else wsrep related
+  wsrep_provider_set = wsrep_provider != NULL && strcmp(wsrep_provider, WSREP_NONE) != 0;
+#endif
+
   /* 
    The subsequent calls may take a long time : e.g. innodb log read.
    Thus set the long running service control manager timeout
@@ -5882,6 +5968,15 @@ int mysqld_main(int argc, char **argv)
   Service.SetSlowStarting(slow_start_timeout);
 #endif
 
+#ifdef WITH_WSREP
+  /*
+    Make sure that SSL library gets initialized before WSREP provider
+    is loaded. This is to ensure that possible server side initialization
+    does not have any side effects while the provider is already running
+    with open SSL sessions.
+  */
+  ssl_start();
+#endif /* */
   if (init_server_components())
     unireg_abort(MYSQLD_ABORT_EXIT);
 
@@ -6018,7 +6113,7 @@ int mysqld_main(int argc, char **argv)
                    (gtids_in_binlog - purged_gtids_from_binlog)
                  = gtids_only_in_table + purged_gtids_from_binlog;
     */
-    DBUG_ASSERT(lost_gtids->is_empty());
+    assert(lost_gtids->is_empty());
     if (lost_gtids->add_gtid_set(gtids_only_in_table) != RETURN_STATUS_OK ||
         lost_gtids->add_gtid_set(&purged_gtids_from_binlog) !=
         RETURN_STATUS_OK)
@@ -6064,6 +6159,33 @@ int mysqld_main(int argc, char **argv)
         mysql_file_sync(mysql_bin_log.get_log_file()->file, MYF(MY_WME)))
       unireg_abort(MYSQLD_ABORT_EXIT);
     mysql_bin_log.update_binlog_end_pos();
+
+#ifdef HAVE_REPLICATION
+#ifdef WITH_WSREP
+  /* In wsrep_recovery mode, PXC avoid creation of new binlog file for
+  the reason mentioned above. In light of the said flow avoid purge
+  action on binlog. */
+  if (!wsrep_recovery)
+  {
+#endif /* WITH_WSREP */
+    if (opt_bin_log && expire_logs_days)
+    {
+      time_t purge_time= server_start_time - expire_logs_days * 24 * 60 * 60;
+      DBUG_EXECUTE_IF("expire_logs_always_at_start",
+                      { purge_time= my_time(0); });
+      if (purge_time >= 0)
+        mysql_bin_log.purge_logs_before_date(purge_time, true);
+    }
+
+    if (opt_bin_log && max_binlog_files)
+      mysql_bin_log.purge_logs_maximum_number(max_binlog_files);
+
+    if (opt_bin_log && binlog_space_limit)
+      mysql_bin_log.purge_logs_by_size(true);
+#ifdef WITH_WSREP
+  }
+#endif /* WITH_WSREP */
+#endif
 
     (void) RUN_HOOK(server_state, after_engine_recovery, (NULL));
   }
@@ -6194,13 +6316,10 @@ int mysqld_main(int argc, char **argv)
   }
   else
   {
-    wsrep_SE_initialized();
+    wsrep_SE_initialized(WSREP_SE_INIT_RESULT_SUCCESS);
 
     if (wsrep_before_SE())
     {
-      /*! in case of no SST wsrep waits in view handler callback */
-      wsrep_SE_init_grab();
-      wsrep_SE_init_done();
       /*! in case of SST wsrep waits for wsrep->sst_received */
       wsrep_sst_continue();
     }
@@ -6793,7 +6912,7 @@ void adjust_table_def_size()
 
   default_value= min<ulong> (400 + table_cache_size / 2, 2000);
   var= intern_find_sys_var(STRING_WITH_LEN("table_definition_cache"));
-  DBUG_ASSERT(var != NULL);
+  assert(var != NULL);
   var->update_default(default_value);
 
   if (! table_definition_cache_specified)
@@ -6880,6 +6999,11 @@ struct my_option my_long_early_options[]=
   {"core-file", OPT_WANT_CORE,
    "Write core on errors.",
    0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0},
+   {"coredumper", OPT_COREDUMPER,
+    "Use coredumper library to generate coredumps. Specify a path for coredump "
+    "otherwise it will be generated on datadir",
+    &opt_libcoredumper_path, &opt_libcoredumper_path, 0, GET_STR,
+    OPT_ARG, 0, 0, 0, 0, 0, 0},
   {"skip-stack-trace", OPT_SKIP_STACK_TRACE,
    "Don't print a stack trace on failure.", 0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0,
    0, 0, 0, 0},
@@ -7531,6 +7655,7 @@ extern "C" void *start_wsrep_THD(void *arg)
   return(NULL);
 }
 
+#if 0
 /**/
 static inline bool is_client_connection(THD *thd)
 {
@@ -7559,19 +7684,18 @@ static inline bool is_committing_connection(THD *thd)
   return ret;
 }
 
-#if 0
 /*
    returns the number of wsrep appliers running.
    However, the caller (thd parameter) is not taken in account
  */
+MY_ATTRIBUTE((noinline))
 static int have_wsrep_appliers(THD *thd)
 {
-  Find_wsrep_thd find_wsrep_thd(APPLIER);
-  //Find_thd_with_bid find_thd_applier(10);
+  Global_THD_manager *thd_manager= Global_THD_manager::get_instance();
+  Count_wsrep_thd count_wsrep_applier_thd(APPLIER);
 
-  THD* tmp= Global_THD_manager::get_instance()->find_thd(&find_wsrep_thd);
-  if (tmp) return true;
-  return false;
+  thd_manager->do_for_all_thd(&count_wsrep_applier_thd);
+  return count_wsrep_applier_thd.get_thd_count();
 }
 #endif /* 0 */
 
@@ -7589,14 +7713,14 @@ static void wsrep_close_thread(THD *thd)
   mysql_mutex_unlock(&thd->LOCK_thd_data);
 }
 
+MY_ATTRIBUTE((noinline))
 static my_bool have_committing_connections()
 {
-  //Find_thd_committing find_thd_committing();
-  Find_wsrep_thd find_thd_committing(COMMITTING);
-
-  THD* tmp= Global_THD_manager::get_instance()->find_thd(&find_thd_committing);
-  if (tmp) return true;
-  return false;
+  Count_wsrep_thd count_thd_committing(COMMITTING);
+  Global_THD_manager *thd_manager= Global_THD_manager::get_instance();
+  
+  thd_manager->do_for_all_thd(&count_thd_committing);
+  return (count_thd_committing.get_thd_count() != 0);
 }
 
 int wsrep_wait_committing_connections_close(int wait_time)
@@ -7621,19 +7745,24 @@ void wsrep_close_client_connections(my_bool wait_to_end, bool server_shutdown)
 
   Global_THD_manager *thd_manager= Global_THD_manager::get_instance();
   /*
-    First signal all threads that it's time to die
-    This will give the threads some time to gracefully abort their
-    statements and inform their clients that the server is about to die.
-  */
+   * wsrep_close_client_connections can be used when there is a cluster
+   * reconfiguration or when we set wsrep_reject_queries=ALL_KILL
+   * on those cases if we are using thread pooling,
+   * we cannot close the connections abruptly otherwise the thread pool workers
+   * won't get signaled and will hang forever when we shutdown the server.
+   * Sending a kill signal and awaking the thread.
+   */
 
   sql_print_information("Giving %d client threads a chance to die gracefully",
                         static_cast<int>(thd_manager->get_thd_count()));
+  Set_wsrep_kill_client_conn set_wsrep_kill_client_conn;
+  thd_manager->do_for_all_thd(&set_wsrep_kill_client_conn);
+  if (thd_manager->get_thd_count() > 0)
+    sleep(2);  // Give threads time to die
 
   Call_wsrep_close_client_conn call_wsrep_close_client_conn(server_shutdown);
   thd_manager->do_for_all_thd(&call_wsrep_close_client_conn);
 
-  if (thd_manager->get_thd_count() > 0)
-    sleep(2);         // Give threads time to die
 
 }
 
@@ -7651,7 +7780,7 @@ static void wsrep_close_threads(THD *thd)
   thd_manager->do_for_all_thd(&call_wsrep_close_wsrep_threads);
 }
 
-void wsrep_close_applier_threads(int count)
+void wsrep_close_applier_threads()
 {
   Global_THD_manager *thd_manager= Global_THD_manager::get_instance();
 
@@ -7886,7 +8015,7 @@ static int show_heartbeat_period(THD *thd, SHOW_VAR *var, char *buff)
   return 0;
 }
 
-#ifndef DBUG_OFF
+#ifndef NDEBUG
 static int show_slave_rows_last_search_algorithm_used(THD *thd, SHOW_VAR *var, char *buff)
 {
   uint res= slave_rows_last_search_algorithm_used;
@@ -8230,16 +8359,6 @@ static int show_ssl_get_cipher_list(THD *thd, SHOW_VAR *var, char *buff)
 }
 
 
-#ifdef HAVE_YASSL
-
-static char *
-my_asn1_time_to_string(ASN1_TIME *time, char *buf, size_t len)
-{
-  return yaSSL_ASN1_TIME_to_string(time, buf, len);
-}
-
-#else /* openssl */
-
 static char *
 my_asn1_time_to_string(ASN1_TIME *time, char *buf, size_t len)
 {
@@ -8265,8 +8384,6 @@ end:
   BIO_free(bio);
   return res;
 }
-
-#endif
 
 
 /**
@@ -8351,7 +8468,8 @@ show_ssl_get_server_not_after(THD *thd, SHOW_VAR *var, char *buff)
 #endif /* HAVE_OPENSSL && !EMBEDDED_LIBRARY */
 
 #ifdef HAVE_POOL_OF_THREADS
-int show_threadpool_idle_threads(THD *thd, SHOW_VAR *var, char *buff)
+static int
+show_threadpool_idle_threads(THD *thd, SHOW_VAR *var, char *buff)
 {
   var->type= SHOW_INT;
   var->value= buff;
@@ -8367,7 +8485,65 @@ static int show_slave_open_temp_tables(THD *thd, SHOW_VAR *var, char *buf)
   *((int *) buf)= slave_open_temp_tables.atomic_get();
   return 0;
 }
+bool validate_libcoredumper_path(char *libcoredumper_path)
+{
+  /* validate path */
+  if (!is_valid_log_name(libcoredumper_path, strlen(libcoredumper_path)))
+  {  //filename contain .cnf or .ini on it
+    sql_print_error("Variable --coredumper cannot be set to value %s",
+                    libcoredumper_path);
+    return false;
+  }
+  char   libcoredumper_dir[FN_REFLEN];
+  size_t libcoredumper_dir_length;
+  size_t opt_libcoredumper_path_length= strlen(libcoredumper_path);
+  (void)dirname_part(libcoredumper_dir, libcoredumper_path,
+                     &libcoredumper_dir_length);
 
+  if (!libcoredumper_dir_length)
+  {
+    sql_print_error("Error processing --coredumper path: %s",
+                    libcoredumper_path);
+    return false;
+  }
+  size_t libcoredumper_file_length=
+      opt_libcoredumper_path_length - libcoredumper_dir_length;
+  if (libcoredumper_file_length == 0)  //path is a directory
+  {
+    libcoredumper_file_length= 19;  //file is set to core.yyyymmddhhmmss
+  }
+  else
+  {
+    libcoredumper_file_length+= 15;  //file gets .yyyymmddhhmmss appended
+  }
+  if (opt_libcoredumper_path_length > FN_REFLEN)
+  {  // path is too long
+    sql_print_error("Variable --coredumper set to a too long path");
+    return false;
+  }
+  if (libcoredumper_file_length > FN_LEN)
+  {  // filename is too long
+    sql_print_error("Variable --coredumper set to a too long filename");
+    return false;
+  }
+  if (my_access(libcoredumper_dir, F_OK))
+  {
+    sql_print_error("Directory specified at --coredumper: %s does not exist",
+                    libcoredumper_dir);
+    return false;
+  }
+  if (my_access(libcoredumper_dir, (F_OK | W_OK)))
+  {
+    sql_print_error("Directory specified at --coredumper: %s is not writable",
+                    libcoredumper_dir);
+    return false;
+  }
+  if (libcoredumper_dir_length == strlen(libcoredumper_path))
+  {  //only dirname was specified, append core to libcoredumper_path
+    strcat(libcoredumper_path, "core");
+  }
+  return true;
+}
 /*
   Variables shown by SHOW STATUS in alphabetical order
 */
@@ -8378,13 +8554,13 @@ SHOW_VAR status_vars[]= {
   {"Aborted_connects",         (char*) &show_aborted_connects,                        SHOW_FUNC,               SHOW_SCOPE_GLOBAL},
 #endif
 #ifdef HAVE_REPLICATION
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   {"Ongoing_anonymous_gtid_violating_transaction_count",(char*) &show_ongoing_anonymous_gtid_violating_transaction_count, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
-#endif//!DBUG_OFF
+#endif//!NDEBUG
   {"Ongoing_anonymous_transaction_count",(char*) &show_ongoing_anonymous_transaction_count, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   {"Ongoing_automatic_gtid_violating_transaction_count",(char*) &show_ongoing_automatic_gtid_violating_transaction_count, SHOW_FUNC, SHOW_SCOPE_GLOBAL},
-#endif//!DBUG_OFF
+#endif//!NDEBUG
 #endif//HAVE_REPLICATION
   {"Binlog_cache_disk_use",    (char*) &binlog_cache_disk_use,                        SHOW_LONG,               SHOW_SCOPE_GLOBAL},
   {"Binlog_cache_use",         (char*) &binlog_cache_use,                             SHOW_LONG,               SHOW_SCOPE_GLOBAL},
@@ -8476,7 +8652,7 @@ SHOW_VAR status_vars[]= {
   {"Slave_heartbeat_period",   (char*) &show_heartbeat_period,                         SHOW_FUNC,              SHOW_SCOPE_GLOBAL},
   {"Slave_received_heartbeats",(char*) &show_slave_received_heartbeats,                SHOW_FUNC,              SHOW_SCOPE_GLOBAL},
   {"Slave_last_heartbeat",     (char*) &show_slave_last_heartbeat,                     SHOW_FUNC,              SHOW_SCOPE_GLOBAL},
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   {"Slave_rows_last_search_algorithm_used",(char*) &show_slave_rows_last_search_algorithm_used, SHOW_FUNC,     SHOW_SCOPE_GLOBAL},
 #endif
   {"Slave_running",            (char*) &show_slave_running,                            SHOW_FUNC,              SHOW_SCOPE_GLOBAL},
@@ -8516,9 +8692,7 @@ SHOW_VAR status_vars[]= {
   {"Ssl_version",              (char*) &show_ssl_get_version,                          SHOW_FUNC,              SHOW_SCOPE_ALL},
   {"Ssl_server_not_before",    (char*) &show_ssl_get_server_not_before,                SHOW_FUNC,              SHOW_SCOPE_ALL},
   {"Ssl_server_not_after",     (char*) &show_ssl_get_server_not_after,                 SHOW_FUNC,              SHOW_SCOPE_ALL},
-#ifndef HAVE_YASSL
   {"Rsa_public_key",           (char*) &show_rsa_public_key,                           SHOW_FUNC,              SHOW_SCOPE_GLOBAL},
-#endif
 #endif
 #endif /* HAVE_OPENSSL */
   {"Table_locks_immediate",    (char*) &locks_immediate,                               SHOW_LONG,              SHOW_SCOPE_GLOBAL},
@@ -8598,7 +8772,7 @@ static bool operator<(const my_option &a, const my_option &b)
         return false;
     }
   }
-  DBUG_ASSERT(a.name == b.name);
+  assert(a.name == b.name);
   return false;
 }
 
@@ -8782,9 +8956,11 @@ static int mysql_init_variables(void)
   character_set_filesystem_name= (char*) "binary";
   lc_messages= (char*) "en_US";
   lc_time_names_name= (char*) "en_US";
+  opt_replication_optimize_for_static_plugin_config= 0;
+  opt_replication_sender_observe_commit_only= 0;
 
   /* Variables that depends on compile options */
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   default_dbug_option=IF_WIN("d:t:i:O,\\mysqld.trace",
            "d:t:i:o,/tmp/mysqld.trace");
 #endif
@@ -8876,7 +9052,7 @@ mysqld_get_one_option(int optid,
 {
   switch(optid) {
   case '#':
-#ifndef DBUG_OFF
+#ifndef NDEBUG
     DBUG_SET_INITIAL(argument ? argument : default_dbug_option);
 #endif
     opt_endinfo=1;        /* unireg: memory allocation */
@@ -8932,11 +9108,6 @@ mysqld_get_one_option(int optid,
       One can disable SSL later by using --skip-ssl or --ssl=0.
     */
     opt_use_ssl= true;
-#ifdef HAVE_YASSL
-    /* crl has no effect in yaSSL. */
-    opt_ssl_crl= NULL;
-    opt_ssl_crlpath= NULL;
-#endif /* HAVE_YASSL */   
     break;
 #endif /* HAVE_OPENSSL */
 #ifndef EMBEDDED_LIBRARY
@@ -9074,6 +9245,11 @@ mysqld_get_one_option(int optid,
     break;
   case (int) OPT_WANT_CORE:
     test_flags |= TEST_CORE_ON_SIGNAL;
+    opt_corefile= MY_TEST(argument != disabled_my_option);
+    break;
+  case (int) OPT_COREDUMPER:
+    test_flags |= TEST_CORE_ON_SIGNAL;
+    opt_libcoredumper= MY_TEST(argument != disabled_my_option);
     break;
   case (int) OPT_SKIP_STACK_TRACE:
     test_flags|=TEST_NO_STACKTRACE;
@@ -9384,11 +9560,6 @@ mysql_getopt_value(const char *keyname, size_t key_length,
 
 C_MODE_END
 
-/* defined in sys_vars.cc */
-extern void init_log_slow_verbosity();
-extern void init_slow_query_log_use_global_control();
-extern void init_log_slow_sp_statements();
-
 /**
   Ensure all the deprecared options with 1 possible value are
   within acceptable range.
@@ -9654,7 +9825,7 @@ static void set_server_version(void)
 #ifdef EMBEDDED_LIBRARY
   end= my_stpcpy(end, "-embedded");
 #endif
-#ifndef DBUG_OFF
+#ifndef NDEBUG
   if (!strstr(MYSQL_SERVER_SUFFIX_STR, "-debug"))
     end= my_stpcpy(end, "-debug");
 #endif
@@ -9671,7 +9842,7 @@ static void set_server_version(void)
     end= my_stpcpy(end, "-asan");
 #endif
 
-  DBUG_ASSERT(end < server_version + SERVER_VERSION_LENGTH);
+  assert(end < server_version + SERVER_VERSION_LENGTH);
   my_stpcpy(server_version_suffix, server_version + strlen(MYSQL_SERVER_VERSION));
 }
 
@@ -10399,6 +10570,7 @@ static PSI_mutex_info all_server_mutexes[]=
   { &key_RELAYLOG_LOCK_xids, "MYSQL_RELAY_LOG::LOCK_xids", 0},
   { &key_hash_filo_lock, "hash_filo::lock", 0},
   { &Gtid_set::key_gtid_executed_free_intervals_mutex, "Gtid_set::gtid_executed::free_intervals_mutex", 0 },
+  { &key_LOCK_bloom_filter, "Bloom_filter", 0},
   { &key_LOCK_crypt, "LOCK_crypt", PSI_FLAG_GLOBAL},
   { &key_LOCK_error_log, "LOCK_error_log", PSI_FLAG_GLOBAL},
   { &key_LOCK_global_user_client_stats,
@@ -10638,9 +10810,8 @@ static PSI_thread_info all_server_threads[]=
   { &key_thread_one_connection, "one_connection", 0},
   { &key_thread_signal_hand, "signal_handler", PSI_FLAG_GLOBAL},
   { &key_thread_compress_gtid_table, "compress_gtid_table", PSI_FLAG_GLOBAL},
-  { &key_thread_parser_service, "parser_service", PSI_FLAG_GLOBAL}
+  { &key_thread_parser_service, "parser_service", PSI_FLAG_GLOBAL},
 #ifdef WITH_WSREP
-  ,
   { &key_THREAD_wsrep_sst_joiner, "THREAD_wsrep_sst_joiner", 0},
   { &key_THREAD_wsrep_sst_donor, "THREAD_wsrep_sst_donor", 0},
   { &key_THREAD_wsrep_applier, "THREAD_wsrep_applier", 0},
@@ -11418,3 +11589,8 @@ bool update_named_pipe_full_access_group(const char *new_group_name)
 #endif  /* _WIN32 && !EMBEDDED_LIBRARY */
 
 
+void set_mysqld_opt_tracking_mode()
+{
+  my_atomic_store64(&mysql_bin_log.m_dependency_tracker.m_opt_tracking_mode,
+          static_cast<int64>(mysql_bin_log.m_dependency_tracker.m_opt_tracking_mode_value));
+}

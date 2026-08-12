@@ -1,14 +1,22 @@
 /*****************************************************************************
 
-Copyright (c) 1996, 2018, Oracle and/or its affiliates. All Rights Reserved.
+Copyright (c) 1996, 2023, Oracle and/or its affiliates.
 
-This program is free software; you can redistribute it and/or modify it under
-the terms of the GNU General Public License as published by the Free Software
-Foundation; version 2 of the License.
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License, version 2.0,
+as published by the Free Software Foundation.
 
-This program is distributed in the hope that it will be useful, but WITHOUT
-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+This program is also distributed with certain software (including
+but not limited to OpenSSL) that is licensed under separate terms,
+as designated in a particular file or component or in included license
+documentation.  The authors of MySQL hereby grant you an additional
+permission to link the program and your derivative works with the
+separately licensed software that they have included with MySQL.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License, version 2.0, for more details.
 
 You should have received a copy of the GNU General Public License along with
 this program; if not, write to the Free Software Foundation, Inc.,
@@ -1023,7 +1031,8 @@ the equal ordering fields. NOTE: we compare the fields as binary strings!
 @param[in]	heap		memory heap from which allocated
 @param[in]	mysql_table	NULL, or mysql table object when
 				user thread invokes dml
-@param[in]	prebuilt	compress_heap must be taken from here
+@param[in]	prebuilt	provides pointer to blob_heap (used for decompression)
+                        and compress_heap (used for compression)
 @param[out]	error		error number in case of failure
 @return own: update vector of differing fields, excluding roll ptr and
 trx id,if error is not equal to DB_SUCCESS, return NULL */
@@ -1353,7 +1362,11 @@ row_upd_index_replace_new_col_vals_index_pos(
 
 		field = dict_index_get_nth_field(index, i);
 		col = dict_field_get_col(field);
-		if (dict_col_is_virtual(col)) {
+		/* An update vector for a secondary index on virtual column
+		is always created based on the field_no not virtual column
+	        positions. See row_upd_build_sec_rec_difference_binary(). */
+		bool is_virtual = dict_col_is_virtual(col);
+		if (is_virtual && dict_index_is_clust(index)) {
 			const dict_v_col_t*	vcol = reinterpret_cast<
 							const dict_v_col_t*>(
 								col);
@@ -1362,7 +1375,7 @@ row_upd_index_replace_new_col_vals_index_pos(
 				update, vcol->v_pos, true);
 		} else {
 			uf = upd_get_field_by_field_no(
-				update, i, false);
+				update, i, is_virtual);
 		}
 
 		if (uf) {
@@ -2094,9 +2107,26 @@ row_upd_eval_new_vals(
 	}
 }
 
+/** Copies the data pointed to by the new values for virtual fields to update
+@param[in,out]	update		an update vector */
+static
+void
+row_upd_dup_v_new_vals(
+	const upd_t*	update)
+{
+	ut_ad(update != NULL);
+
+	for (ulint j = 0; j < upd_get_n_fields(update); j++) {
+		upd_field_t *upd_field = upd_get_nth_field(update, j);
+		if (upd_field->new_val.type.prtype & DATA_VIRTUAL) {
+			dfield_dup(&upd_field->new_val, update->heap);
+		}
+	}
+}
+
 /** Stores to the heap the virtual columns that need for any indexes
 @param[in,out]	node		row update node
-@param[in]	update		an update vector if it is update
+@param[in,out]	update		an update vector if it is update
 @param[in]	thd		mysql thread handle
 @param[in,out]	prebuilt	NULL, or a prebuilt object: used to extract
 				mysql table object when user thread invokes
@@ -2113,6 +2143,8 @@ row_upd_store_v_row(
 	dict_index_t*	index = dict_table_get_first_index(node->table);
 	TABLE*		mysql_table =
 		prebuilt ? prebuilt->m_mysql_table : NULL;
+	bool		new_val_v_cols_dup = false;
+	const ulint	n_upd = update ? upd_get_n_fields(update) : 0;
 
 	for (ulint col_no = 0; col_no < dict_table_get_n_v_cols(node->table);
 	     col_no++) {
@@ -2123,8 +2155,6 @@ row_upd_store_v_row(
 		if (col->m_col.ord_part) {
 			dfield_t*	dfield
 				= dtuple_get_nth_v_field(node->row, col_no);
-			ulint		n_upd
-				= update ? upd_get_n_fields(update) : 0;
 			ulint		i = 0;
 
 			/* Check if the value is already in update vector */
@@ -2160,6 +2190,18 @@ row_upd_store_v_row(
 								col_no);
 						dfield_copy_data(dfield, vfield);
 						dfield_dup(dfield, node->heap);
+						if (dfield_is_null(dfield)) {
+						  if (!new_val_v_cols_dup) {
+						    row_upd_dup_v_new_vals(
+						      update);
+						    new_val_v_cols_dup = true;
+						  }
+						  innobase_get_computed_value(
+							node->row, col, index,
+							&heap, node->heap, NULL,
+							thd, mysql_table, NULL,
+							NULL, NULL, prebuilt);
+						}
 					}
 				} else {
 					/* Need to compute, this happens when
@@ -2488,6 +2530,16 @@ row_upd_sec_index_entry(
 				case DB_NO_REFERENCED_ROW:
 					err = DB_SUCCESS;
 					break;
+				/* We can expect DB_LOCK_WAIT when the transaction that blocked
+				our lock was rolled back or committed while we were waiting
+				for the lock. In such cases, we can retry the operation.
+
+				See row_mysql_handle_errors() and
+				row_update_for_mysql_using_upd_graph()
+				for more details.*/
+
+				case DB_LOCK_WAIT:
+					break;
 				case DB_DEADLOCK:
 					if (wsrep_debug) {
 						ib::warn() << "WSREP: sec index FK check fail for deadlock"
@@ -2496,7 +2548,6 @@ row_upd_sec_index_entry(
 					}
 					break;
 				case DB_LOCK_WAIT_TIMEOUT:
-				case DB_LOCK_WAIT:
 					err = DB_LOCK_WAIT_TIMEOUT;
 					break;
 				default:
@@ -2828,7 +2879,7 @@ check_fk:
 
 	err = row_ins_clust_index_entry(
 		index, entry, thr,
-		node->upd_ext ? node->upd_ext->n_ext : 0, false);
+		entry->get_n_ext(), false);
 	node->state = UPD_NODE_INSERT_CLUSTERED;
 
 	mem_heap_free(heap);
@@ -2860,6 +2911,7 @@ row_upd_clust_rec(
 	btr_cur_t*	btr_cur;
 	dberr_t		err;
 	const dtuple_t*	rebuilt_old_pk	= NULL;
+	bool is_old_or_new_rec_extern = false;
 
 	ut_ad(node);
 	ut_ad(dict_index_is_clust(index));
@@ -2874,6 +2926,7 @@ row_upd_clust_rec(
 	ut_ad(rec_offs_validate(btr_cur_get_rec(btr_cur), index, offsets));
 
 	if (dict_index_is_online_ddl(index)) {
+		is_old_or_new_rec_extern = rec_offs_any_extern(offsets);
 		rebuilt_old_pk = row_log_table_get_pk(
 			btr_cur_get_rec(btr_cur), index, offsets, NULL, &heap);
 	}
@@ -2960,9 +3013,19 @@ success:
 			dtuple_t*	new_v_row = NULL;
 			dtuple_t*	old_v_row = NULL;
 
+			/* In case UPDATE modifies extern BLOB and makes it fit within record
+			after above update, we still need old virtual col */
+			is_old_or_new_rec_extern |= rec_offs_any_extern(offsets);
+
 			if (!(node->cmpl_info & UPD_NODE_NO_ORD_CHANGE)) {
 				new_v_row = node->upd_row;
 				old_v_row = node->update->old_vrow;
+			} else if (is_old_or_new_rec_extern) {
+				/* Row log treats UPDATE on extern BLOB as DELETE + INSERT.
+				This requires virtual col info. Since no change in virtual
+				col, new value is same as old */
+				old_v_row = node->update->old_vrow;
+				new_v_row = old_v_row;
 			}
 
 			row_log_table_update(

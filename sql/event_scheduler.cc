@@ -1,13 +1,20 @@
-/* Copyright (c) 2006, 2017, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2006, 2023, Oracle and/or its affiliates.
 
    This program is free software; you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation; version 2 of the License.
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -24,7 +31,9 @@
 #include "mysqld_thd_manager.h"      // Global_THD_manager
 #include "sql_error.h"               // Sql_condition
 #include "sql_class.h"               // THD
+#ifdef WITH_WSREP
 #include "debug_sync.h"
+#endif /* WITH_WSREP */
 
 /**
   @addtogroup Event_Scheduler
@@ -110,7 +119,7 @@ Event_worker_thread::print_warnings(THD *thd, Event_job_data *et)
       sql_print_information("%*s", static_cast<int>(err_msg.length()), err_msg.c_ptr());
       break;
     default:
-      DBUG_ASSERT(false);
+      assert(false);
     }
   }
   DBUG_VOID_RETURN;
@@ -234,6 +243,18 @@ extern "C" void *event_scheduler_thread(void *arg)
 
   mysql_thread_set_psi_id(thd->thread_id());
 
+#ifdef HAVE_PSI_THREAD_INTERFACE
+  /* Update the thread instrumentation. */
+  PSI_THREAD_CALL(set_thread_account)
+    (thd->security_context()->user().str,
+     thd->security_context()->user().length,
+     thd->security_context()->host_or_ip().str,
+     thd->security_context()->host_or_ip().length);
+  PSI_THREAD_CALL(set_thread_command)(thd->get_command());
+  PSI_THREAD_CALL(set_thread_start_time)(thd->query_start());
+  PSI_THREAD_CALL(set_thread_start_time_usec)(thd->query_start_usec());
+#endif /* HAVE_PSI_THREAD_INTERFACE */
+
   res= post_init_event_thread(thd);
 
   DBUG_ENTER("event_scheduler_thread");
@@ -280,6 +301,18 @@ extern "C" void *event_worker_thread(void *arg)
 
   mysql_thread_set_psi_id(thd->thread_id());
 
+#ifdef HAVE_PSI_THREAD_INTERFACE
+  /* Update the thread instrumentation. */
+  PSI_THREAD_CALL(set_thread_account)
+    (thd->security_context()->user().str,
+     thd->security_context()->user().length,
+     thd->security_context()->host_or_ip().str,
+     thd->security_context()->host_or_ip().length);
+  PSI_THREAD_CALL(set_thread_command)(thd->get_command());
+  PSI_THREAD_CALL(set_thread_start_time)(thd->query_start());
+  PSI_THREAD_CALL(set_thread_start_time_usec)(thd->query_start_usec());
+#endif /* HAVE_PSI_THREAD_INTERFACE */
+
   Event_worker_thread worker_thread;
   worker_thread.run(thd, event);
 
@@ -306,11 +339,11 @@ Event_worker_thread::run(THD *thd, Event_queue_element_for_exec *event)
   Event_job_data job_data;
   bool res;
 
-  DBUG_ASSERT(thd->m_digest == NULL);
+  assert(thd->m_digest == NULL);
 
 #ifdef HAVE_PSI_STATEMENT_INTERFACE
   PSI_statement_locker_state state;
-  DBUG_ASSERT(thd->m_statement_psi == NULL);
+  assert(thd->m_statement_psi == NULL);
   thd->m_statement_psi= MYSQL_START_STATEMENT(& state,
                                               event->get_psi_info()->m_key,
                                               event->dbname.str,
@@ -356,7 +389,7 @@ Event_worker_thread::run(THD *thd, Event_queue_element_for_exec *event)
     mysql_mutex_lock(&thd->LOCK_wsrep_thd);
 
     thd->wsrep_exec_mode= LOCAL_STATE;
-    thd->wsrep_query_state= QUERY_EXEC;
+    wsrep_thd_set_query_state(thd, QUERY_EXEC);
 
     thd->variables.wsrep_on= TRUE;
 
@@ -374,9 +407,9 @@ Event_worker_thread::run(THD *thd, Event_queue_element_for_exec *event)
                           job_data.definer.str,
                           job_data.dbname.str, job_data.name.str);
 
+#ifdef WITH_WSREP
   DEBUG_SYNC(thd, "event_worker_thread_end");
 
-#ifdef WITH_WSREP
   if (WSREP(thd))
   {
     mysql_mutex_lock(&thd->LOCK_wsrep_thd);
@@ -394,7 +427,7 @@ end:
   thd->m_statement_psi= NULL;
 #endif
 
-  DBUG_ASSERT(thd->m_digest == NULL);
+  assert(thd->m_digest == NULL);
 
   DBUG_PRINT("info", ("Done with Event %s.%s", event->dbname.str,
              event->name.str));
@@ -577,10 +610,11 @@ Event_scheduler::run(THD *thd)
     }
     else
     {
-      DBUG_ASSERT(thd->killed);
+      assert(thd->killed);
       DBUG_PRINT("info", ("job_data is NULL, the thread was killed"));
     }
     DBUG_PRINT("info", ("state=%s", scheduler_states_names[state].str));
+    free_root(thd->mem_root, MYF(0));
   }
 
   LOCK_DATA();

@@ -1,14 +1,20 @@
-/* Copyright (c) 2011, 2018, Oracle and/or its affiliates. All rights reserved.
+/* Copyright (c) 2011, 2023, Oracle and/or its affiliates.
 
-   This program is free software; you can redistribute it and/or
-   modify it under the terms of the GNU General Public License
-   as published by the Free Software Foundation; version 2 of
-   the License.
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License, version 2.0,
+   as published by the Free Software Foundation.
+
+   This program is also distributed with certain software (including
+   but not limited to OpenSSL) that is licensed under separate terms,
+   as designated in a particular file or component or in included license
+   documentation.  The authors of MySQL hereby grant you an additional
+   permission to link the program and your derivative works with the
+   separately licensed software that they have included with MySQL.
 
    This program is distributed in the hope that it will be useful,
    but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-   GNU General Public License for more details.
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License, version 2.0, for more details.
 
    You should have received a copy of the GNU General Public License
    along with this program; if not, write to the Free Software
@@ -269,7 +275,11 @@ void mysql_rewrite_grant(THD *thd, String *rlb)
   if (proxy_grant)
   {
     tmp_user_name= user_list++;
+#ifdef WITH_WSREP
+    user_name= get_current_user(thd, tmp_user_name, true);
+#else
     user_name= get_current_user(thd, tmp_user_name);
+#endif
     if (user_name)
       append_user_new(thd, rlb, user_name, comma);
   }
@@ -305,7 +315,11 @@ void mysql_rewrite_grant(THD *thd, String *rlb)
   {
     while ((tmp_user_name= user_list++))
     {
+#ifdef WITH_WSREP
+      if ((user_name= get_current_user(thd, tmp_user_name, true)))
+#else
       if ((user_name= get_current_user(thd, tmp_user_name)))
+#endif
       {
         if (opt_log_builtin_as_identified_by_password)
           append_user(thd, rlb, user_name, comma, true);
@@ -379,7 +393,11 @@ void mysql_rewrite_create_alter_user(THD *thd, String *rlb,
 
   while ((tmp_user_name= user_list++))
   {
+#ifdef WITH_WSREP
+    if ((user_name= get_current_user(thd, tmp_user_name, true)))
+#else
     if ((user_name= get_current_user(thd, tmp_user_name)))
+#endif
     {
       if (opt_log_builtin_as_identified_by_password &&
           thd->lex->sql_command != SQLCOM_ALTER_USER)
@@ -796,31 +814,39 @@ static void mysql_rewrite_prepare(THD *thd, String *rlb)
 /**
    Rewrite a query (to obfuscate passwords etc.)
 
-   Side-effects: thd->rewritten_query will contain a rewritten query,
-   or be cleared if no rewriting took place.
+   Side-effects:
+
+   - thd->m_rewritten_query will contain a rewritten query,
+     or be cleared if no rewriting took place.
+     LOCK_thd_query will be temporarily acquired to make that change.
+
+   @note Keep in mind that these side-effects will only happen when
+         calling this top-level function, but not when calling
+         individual sub-functions directly!
 
    @param thd     The THD to rewrite for.
 */
 
 void mysql_rewrite_query(THD *thd)
 {
-  String *rlb= &thd->rewritten_query;
+  String rlb;
 
-  rlb->mem_free();
+  // We should not come through here twice for the same query.
+  assert(thd->rewritten_query().length() == 0);
 
   if (thd->lex->contains_plaintext_password)
   {
     switch(thd->lex->sql_command)
     {
-    case SQLCOM_GRANT:         mysql_rewrite_grant(thd, rlb);         break;
-    case SQLCOM_SET_OPTION:    mysql_rewrite_set(thd, rlb);           break;
+    case SQLCOM_GRANT:         mysql_rewrite_grant(thd, &rlb);         break;
+    case SQLCOM_SET_OPTION:    mysql_rewrite_set(thd, &rlb);           break;
     case SQLCOM_CREATE_USER:
     case SQLCOM_ALTER_USER:
-                        mysql_rewrite_create_alter_user(thd, rlb);    break;
-    case SQLCOM_CHANGE_MASTER: mysql_rewrite_change_master(thd, rlb); break;
-    case SQLCOM_SLAVE_START:   mysql_rewrite_start_slave(thd, rlb);   break;
-    case SQLCOM_CREATE_SERVER: mysql_rewrite_create_server(thd, rlb); break;
-    case SQLCOM_ALTER_SERVER:  mysql_rewrite_alter_server(thd, rlb);  break;
+                        mysql_rewrite_create_alter_user(thd, &rlb);    break;
+    case SQLCOM_CHANGE_MASTER: mysql_rewrite_change_master(thd, &rlb); break;
+    case SQLCOM_SLAVE_START:   mysql_rewrite_start_slave(thd, &rlb);   break;
+    case SQLCOM_CREATE_SERVER: mysql_rewrite_create_server(thd, &rlb); break;
+    case SQLCOM_ALTER_SERVER:  mysql_rewrite_alter_server(thd, &rlb);  break;
 
     /*
       PREPARE stmt FROM <string> is rewritten so that <string> is
@@ -835,8 +861,12 @@ void mysql_rewrite_query(THD *thd)
       prepare function calls the logger (and comes by here with
       sql_command set to the command being prepared).
     */
-    case SQLCOM_PREPARE:       mysql_rewrite_prepare(thd, rlb);       break;
-    default:                   /* unhandled query types are legal. */ break;
+    case SQLCOM_PREPARE:       mysql_rewrite_prepare(thd, &rlb);       break;
+    default:                   /* unhandled query types are legal. */  break;
     }
   }
+
+  // Note that we succeeded in rewriting (where applicable).
+  if (rlb.length() > 0)
+    thd->swap_rewritten_query(rlb);
 }
